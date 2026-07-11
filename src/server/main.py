@@ -132,7 +132,7 @@ def main():
 
     def startup():
         # Create the Pyramid WSGI app (web UI + admin/publish API only now -- the sync RPCs
-        # are handled natively below, no WSGI/sonora bridge involved for those anymore)
+        # are handled natively below, no WSGI bridge involved for those anymore)
         pyramid_app = create_pyramid_app(repository, args.data_dir)
 
         # Wrap Pyramid with the same CORS behavior the whole server used to get from the

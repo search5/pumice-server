@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 # ─── gRPC-Web wire framing ──────────────────────────────────────────────────
 # Each message on the wire is: 1 flag byte (bit 0x80 = this is the trailer
 # frame) + 4-byte big-endian length + payload. In "grpc-web-text" mode the
-# whole frame is additionally base64-encoded. See sonora's protocol.py / the
-# gRPC-Web spec for the reference implementation this mirrors.
+# whole frame is additionally base64-encoded. See the gRPC-Web spec for the
+# reference protocol this mirrors.
 
 _HEADER_FORMAT = ">BI"
 _HEADER_LENGTH = struct.calcsize(_HEADER_FORMAT)
@@ -106,9 +106,9 @@ class NativeServicerContext:
 
 class SyncServiceResource(Resource):
     """Serves the SyncService gRPC-Web methods directly on top of Twisted, with
-    no WSGI/sonora/thread-pool bridge in between -- SyncServiceServicer's async
-    methods are driven straight off the reactor's event loop via
-    Deferred.fromCoroutine."""
+    no WSGI/thread-pool bridge in between -- SyncServiceServicer's async
+    methods are driven straight off the reactor's event loop as asyncio Tasks
+    (see render() below for why not Deferred.fromCoroutine)."""
 
     isLeaf = True
     _PATH_PREFIX = "/obsidian.sync.v1.SyncService/"
