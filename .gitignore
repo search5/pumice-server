@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local environment config (real secrets: DB creds, ADMIN_PASSWORD) -- never commit this
+.env
+*.env.local
+
+# Runtime data (tokens/DB/synced vault originals) -- secrets and generated-at-runtime content
+data/

@@ -1,0 +1,32 @@
+[project]
+name = "server"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Ji-ho Lee", email = "search5@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "grpcio>=1.81.1",
+    "grpcio-tools>=1.81.1",
+    "markdown>=3.10.2",
+    "protobuf>=6.33.6",
+    "psycopg2-binary>=2.9",
+    "pymysql>=1.1",
+    "sqlalchemy>=2.0",
+    "pyramid>=2.1",
+    "python-dotenv>=1.2.2",
+    "twisted>=26.4.0",
+    "sqlalchemy-cubrid",
+]
+
+[project.scripts]
+server = "server.main:main"
+
+[build-system]
+requires = ["uv_build>=0.9.21,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+sqlalchemy-cubrid = { git = "https://github.com/search5/sqlalchemy_cubrid" }
