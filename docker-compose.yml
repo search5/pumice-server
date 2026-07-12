@@ -1,0 +1,35 @@
+services:
+  pumice-server:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      # Inside this compose network, the CUBRID container is reachable by its service name
+      # ("cubrid") -- not 127.0.0.1, which from in here would mean this container itself.
+      # This overrides whatever .env has for local (non-Docker) use.
+      - DB_TYPE=cubrid
+      - DB_HOST=cubrid
+      - DB_PORT=33000
+    volumes:
+      - pumice-data:/data
+    depends_on:
+      - cubrid
+
+  cubrid:
+    image: cubrid/cubrid:11.2-latest
+    environment:
+      - CUBRID_DBNAME=cubdb
+    # Not published to the host on purpose -- pumice-server reaches it over the compose network
+    # by service name. Uncomment if you also want to connect to it directly (e.g. a DB client).
+    # ports:
+    #   - "33000:33000"
+    volumes:
+      - cubrid_data:/var/lib/cubrid
+      - cubrid_logs:/var/log/cubrid
+
+volumes:
+  pumice-data:
+  cubrid_data:
+  cubrid_logs:

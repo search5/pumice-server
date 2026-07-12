@@ -1,0 +1,12 @@
+.venv
+.git
+.env
+*.env.local
+data/
+logs/
+__pycache__/
+*.py[oc]
+.python-version
+Dockerfile
+.dockerignore
+README.ko.md

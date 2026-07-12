@@ -20,6 +20,21 @@ uv run server
 `ADMIN_USER`와 `ADMIN_PASSWORD`는 서버가 시작되기 전에 `.env`에 반드시 설정되어 있어야 합니다 --
 그 외에는 최초 계정을 만들 방법이 없습니다. 서버는 첫 시작 시 이 관리자 계정을 생성합니다.
 
+### Docker
+
+```bash
+docker build -t pumice-server .
+docker run -d --name pumice-server -p 8080:8080 \
+  --env-file .env \
+  -v pumice-data:/data \
+  pumice-server
+```
+
+이미지 안에서 `DATA_DIR`은 기본값이 `/data`입니다 (위 `-v pumice-data:/data` 볼륨과 대응) --
+재시작 후에도 남아있어야 하는 것들(DB(`DB_TYPE=sqlite`일 때), 동기화된 vault 내용, 버전 히스토리
+백업, 퍼블리시된 사이트)이 전부 여기 저장됩니다. 그 외 설정은 전부 `.env`/`--env-file`에서
+오며, 이미지에 미리 박아넣지 않습니다.
+
 ## 설정 (`.env`)
 
 전체 목록은 `.env.example`을 참고하세요. 중요한 항목들:
