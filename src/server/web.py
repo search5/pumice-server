@@ -121,7 +121,7 @@ def clear_session_cookie(request) -> None:
 from pyramid.authorization import Allow, Authenticated, Everyone, ACLHelper
 from pyramid.security import NO_PERMISSION_REQUIRED
 from pyramid.view import forbidden_view_config
-from pyramid.httpexceptions import HTTPForbidden
+from pyramid.httpexceptions import HTTPForbidden, HTTPFound
 
 class DeviceTokenSecurityPolicy:
     def identity(self, request):
@@ -255,6 +255,15 @@ def save_publish_meta(data_dir: str, owner_username: str, vault_id: str, filenam
     path = os.path.join(meta_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+@view_config(route_name='root', permission=NO_PERMISSION_REQUIRED)
+def root_view(request):
+    # A cheap redirect dispatcher, not a real auth check -- just "is there a session cookie at
+    # all". If it's stale/invalid, /dashboard's own JS already bounces to /login on the first
+    # failed API call (see fetchAPI there), so this never needs to be more than a presence check.
+    if request.cookies.get(SESSION_COOKIE_NAME):
+        return HTTPFound(location="/dashboard")
+    return HTTPFound(location="/login")
 
 @view_config(route_name='ping', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def ping_view(request):
@@ -3465,6 +3474,7 @@ def create_pyramid_app(repository, data_dir):
     # which resolves vault_id (from matchdict/params/obs-id header/JSON body, whichever that
     # endpoint uses) and builds its ACL from ownership -- paired with permission='vault-access'
     # on the view itself.
+    config.add_route('root', '/')
     config.add_route('ping', '/api/ping')
     config.add_route('login_page', '/login')
     config.add_route('dashboard_page', '/dashboard')
