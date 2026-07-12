@@ -22,6 +22,18 @@ uv run server
 
 ### Docker
 
+GHCR에 미리 빌드된 이미지를 받아서 바로 실행할 수 있습니다 (멀티 아키텍처: `linux/amd64`,
+`linux/arm64`):
+
+```bash
+docker run -d --name pumice-server -p 8080:8080 \
+  --env-file .env \
+  -v pumice-data:/data \
+  ghcr.io/search5/pumice-server:latest
+```
+
+또는 직접 소스에서 빌드할 수도 있습니다:
+
 ```bash
 docker build -t pumice-server .
 docker run -d --name pumice-server -p 8080:8080 \

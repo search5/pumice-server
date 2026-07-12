@@ -23,6 +23,17 @@ other way to provision the first account. The server creates that admin account 
 
 ### Docker
 
+Pull the pre-built image from GHCR (multi-arch: `linux/amd64` and `linux/arm64`):
+
+```bash
+docker run -d --name pumice-server -p 8080:8080 \
+  --env-file .env \
+  -v pumice-data:/data \
+  ghcr.io/search5/pumice-server:latest
+```
+
+Or build it yourself from source:
+
 ```bash
 docker build -t pumice-server .
 docker run -d --name pumice-server -p 8080:8080 \
