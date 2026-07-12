@@ -35,6 +35,25 @@ docker run -d --name pumice-server -p 8080:8080 \
 백업, 퍼블리시된 사이트)이 전부 여기 저장됩니다. 그 외 설정은 전부 `.env`/`--env-file`에서
 오며, 이미지에 미리 박아넣지 않습니다.
 
+#### Docker Compose
+
+`docker-compose.yml`은 `pumice-server`와 CUBRID 서비스를 같은 컴포즈 네트워크에 묶어놓은
+구성입니다:
+
+```bash
+docker compose up -d --build
+```
+
+이건 기존에 떠 있는 DB를 가리키는 설정이 아니라, pumice-server 자체가 컨테이너로 뜰 때 외부
+DB를 올바르게 연결하는 방법을 보여주는 템플릿입니다. 컨테이너 안에서 `127.0.0.1`은(호스트에서
+직접 실행할 때는 적절한 `DB_HOST` 값이지만) 그 컨테이너 자기 자신의 loopback을 가리킵니다 --
+옆에 있는 다른 컨테이너도, 호스트도 아닙니다. `docker-compose.yml`은 `DB_HOST`를 CUBRID
+서비스의 이름(`cubrid`)으로 덮어써서, 컴포즈 네트워크 안의 내장 DNS로 정상적으로 해석되도록
+합니다. 나머지 `DB_*`/`ADMIN_*` 값들은 여전히 `env_file:`을 통해 `.env`에서 옵니다. 여기 있는
+CUBRID 서비스는 비어있는 상태로 시작합니다 -- 기존에 이미 있는 외부 DB를 가리키고 싶다면
+`cubrid` 서비스를 지우고 `DB_HOST`/`DB_PORT`를 `.env`(또는 `environment:`)에 그 DB의 실제
+주소로 설정하면 됩니다.
+
 ## 설정 (`.env`)
 
 전체 목록은 `.env.example`을 참고하세요. 중요한 항목들:

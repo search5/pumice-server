@@ -36,6 +36,23 @@ everything that needs to survive a restart lives there: the DB (when `DB_TYPE=sq
 vault content, version-history backups, and published sites. All other settings still come from
 `.env`/`--env-file`, never baked into the image.
 
+#### Docker Compose
+
+`docker-compose.yml` pairs `pumice-server` with a CUBRID service on the same compose network:
+
+```bash
+docker compose up -d --build
+```
+
+This is a template for wiring an external DB correctly when pumice-server itself runs in a
+container, not a pointer at any existing database. Inside a container, `127.0.0.1` (a sensible
+`DB_HOST` when running directly on the host) means that container's own loopback -- not a sibling
+container, and not the host. `docker-compose.yml` overrides `DB_HOST` to the CUBRID service's name
+(`cubrid`), which resolves correctly over the compose network via Docker's built-in DNS. The rest
+of `DB_*`/`ADMIN_*` still comes from `.env` via `env_file:`. The CUBRID service here starts out
+empty -- to point at an existing external database instead, delete the `cubrid` service and set
+`DB_HOST`/`DB_PORT` in `.env` (or `environment:`) to that database's actual address.
+
 ## Configuration (`.env`)
 
 See `.env.example` for the full list. The important ones:
