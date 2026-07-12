@@ -26,7 +26,6 @@ See `.env.example` for the full list. The important ones:
 - `ADMIN_USER` / `ADMIN_PASSWORD` — required. Seeds the first (admin) account on first startup.
 - `DB_TYPE`:
   - `sqlite` (default) — zero setup, a local file.
-  - `json` — a flat JSON metadata store, no DB server needed.
   - `mysql` / `mariadb` / `postgresql` / `cubrid` — point `DB_HOST`/`DB_PORT`/`DB_USER`/
     `DB_PASSWORD`/`DB_NAME` at an external database server.
 
@@ -96,10 +95,12 @@ Translation strings live in `src/server/locale/{ko,en}.json`, not inline in `web
 
 ## What it does
 
+- `/` — redirects to `/dashboard` or `/login` depending on whether a session cookie is present.
 - `Delta` / `UploadFiles` / `DownloadFiles` (gRPC-Web) — the core file sync protocol.
 - `GetFileHistory` / `DownloadHistoryVersion` / `RestoreHistoryVersion` (gRPC-Web) — per-file
   version history, backed by a physical backup (hard-linked where possible) on every change.
-- `/api/*` (HTTP, Pyramid) — publish (upload/list/remove/download), version history REST mirrors,
-  user accounts, and the admin dashboard.
+- `/api/*` (HTTP, Pyramid) — publish (upload/list/remove/download), publish sharing (invite by
+  email, accept via invite code), version history REST mirrors, user accounts, device management,
+  and the admin dashboard.
 - `/publish/{username}/{vault}/...` — the actual published site, rendering markdown on the fly
   (wikilinks resolved, YAML frontmatter stripped).

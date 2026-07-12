@@ -78,7 +78,7 @@ def build_connection_url(db_type: str, data_dir: str) -> str:
 
 def main():
     import argparse
-    from server.repository import SqlAlchemyMetadataRepository, JsonFileMetadataRepository
+    from server.repository import SqlAlchemyMetadataRepository
 
     env_http_port = int(os.getenv("HTTP_PORT", "8080"))
     env_data_dir = os.path.expanduser(os.getenv("DATA_DIR", "~/.obsidian-sync-server"))
@@ -88,18 +88,14 @@ def main():
     parser.add_argument("--http-port", type=int, default=env_http_port, help="HTTP/Pyramid server port")
     parser.add_argument("--data-dir", type=str, default=env_data_dir, help="Data directory")
     parser.add_argument("--db-type", type=str, default=env_db_type,
-                        choices=["sqlite", "json", "mysql", "mariadb", "postgresql", "cubrid"],
+                        choices=["sqlite", "mysql", "mariadb", "postgresql", "cubrid"],
                         help="Database backend type")
     args = parser.parse_args()
 
     db_type = args.db_type.lower()
-    if db_type == "json":
-        repository = JsonFileMetadataRepository(args.data_dir)
-        logger.info("Using JSON file metadata repository.")
-    else:
-        url = build_connection_url(db_type, args.data_dir)
-        repository = SqlAlchemyMetadataRepository(url)
-        logger.info(f"Using SQLAlchemy metadata repository ({db_type}).")
+    url = build_connection_url(db_type, args.data_dir)
+    repository = SqlAlchemyMetadataRepository(url)
+    logger.info(f"Using SQLAlchemy metadata repository ({db_type}).")
 
     # An admin account must exist from the moment the server is deployed -- there's no
     # self-service signup (accounts are only ever created by an admin, via
