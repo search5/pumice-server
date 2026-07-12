@@ -116,8 +116,9 @@ def clear_session_cookie(request) -> None:
 # centralized into a real Pyramid security policy + ACLs, so views just declare
 # `permission='authenticated' | 'admin' | 'vault-access'` on @view_config and never see an
 # unauthorized caller at all -- Pyramid raises HTTPForbidden before the view body runs, and
-# forbidden_view() below turns that into the same 401 (no identity) / 403 (wrong identity)
-# JSON shape the manual checks used to produce.
+# forbidden_view_api()/forbidden_view_page() below split on path_info to reproduce the old
+# 401 (no identity) / 403 (wrong identity) JSON shape for /api/* while redirecting browser
+# page navigation to /login instead.
 from pyramid.authorization import Allow, Authenticated, Everyone, ACLHelper
 from pyramid.security import NO_PERMISSION_REQUIRED
 from pyramid.view import forbidden_view_config
@@ -201,14 +202,23 @@ class VaultContext:
         self.owner = identity["username"] if identity else None
         self.__acl__ = [(Allow, f"user:{self.owner}", "vault-access")] if self.owner else []
 
-@forbidden_view_config(renderer="json")
-def forbidden_view(request):
+@forbidden_view_config(path_info=r'^/api/', renderer="json")
+def forbidden_view_api(request):
     # Same 401-vs-403 distinction the manual per-view checks used to make: no identity at all
     # is "you need to log in" (401), a real identity that just isn't allowed here is "you're
-    # logged in as the wrong person" (403).
+    # logged in as the wrong person" (403). Every /api/* caller (Obsidian plugin and the
+    # dashboard's own fetch() calls alike) expects JSON here, never a redirect -- fetch()
+    # follows redirects transparently and would hand the caller /login's HTML instead of an
+    # error it can act on.
     status = 401 if request.identity is None else 403
     request.response.status = status
     return {"error": "Unauthorized" if status == 401 else "Forbidden"}
+
+@forbidden_view_config()
+def forbidden_view_page(request):
+    # Catch-all for everything outside /api/* -- real browser navigation, which can just be
+    # redirected to the login page instead of being handed a JSON error body.
+    return HTTPFound(location="/login")
 
 def get_authenticated_user(request):
     token = extract_token(request)
@@ -256,14 +266,11 @@ def save_publish_meta(data_dir: str, owner_username: str, vault_id: str, filenam
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-@view_config(route_name='root', permission=NO_PERMISSION_REQUIRED)
+@view_config(route_name='root', permission='authenticated')
 def root_view(request):
-    # A cheap redirect dispatcher, not a real auth check -- just "is there a session cookie at
-    # all". If it's stale/invalid, /dashboard's own JS already bounces to /login on the first
-    # failed API call (see fetchAPI there), so this never needs to be more than a presence check.
-    if request.cookies.get(SESSION_COOKIE_NAME):
-        return HTTPFound(location="/dashboard")
-    return HTTPFound(location="/login")
+    # Only ever reached with a real, valid identity -- an unauthenticated caller never gets
+    # here at all, forbidden_view_page redirects them to /login before this view body runs.
+    return HTTPFound(location="/dashboard")
 
 @view_config(route_name='ping', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def ping_view(request):
