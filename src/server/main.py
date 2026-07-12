@@ -21,7 +21,6 @@ asyncioreactor.install()
 from twisted.internet import reactor
 
 from server.service import SyncServiceServicer
-from server.auth import generate_token
 from server.grpc_web_resource import SyncServiceResource, RootResource
 from twisted.web.wsgi import WSGIResource
 from twisted.web.server import Site
@@ -123,7 +122,6 @@ def main():
         repository.create_user(
             username=admin_user,
             password_hash=pw_hash,
-            token=generate_token(),
             name="System Admin",
             email=admin_user,
             is_admin=True

@@ -172,6 +172,15 @@ wheels = [
 ]
 
 [[package]]
+name = "i18nice"
+version = "0.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/bf/c4d9528786ac0177e86290f53e67e1365840959edb10cbc7575d149e3f8d/i18nice-0.16.0.tar.gz", hash = "sha256:8e90d042436f4bf0cdf9ab6869eb70946eba094f58121020c350996e45b0be89", size = 22371, upload-time = "2025-05-29T17:32:08.547Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7a/b7/633dcdb800b54501f717b80776f9541d2b3fcffea1c11339fc0074acef5e/i18nice-0.16.0-py3-none-any.whl", hash = "sha256:a8d4c70e8c1b28f867b8a901226fa8c67ab3075b29744e6274cfa2c208fe34fe", size = 19753, upload-time = "2025-05-29T17:32:06.941Z" },
+]
+
+[[package]]
 name = "idna"
 version = "3.18"
 source = { registry = "https://pypi.org/simple" }
@@ -349,6 +358,7 @@ source = { editable = "." }
 dependencies = [
     { name = "grpcio" },
     { name = "grpcio-tools" },
+    { name = "i18nice" },
     { name = "markdown" },
     { name = "protobuf" },
     { name = "psycopg2-binary" },
@@ -364,6 +374,7 @@ dependencies = [
 requires-dist = [
     { name = "grpcio", specifier = ">=1.81.1" },
     { name = "grpcio-tools", specifier = ">=1.81.1" },
+    { name = "i18nice", specifier = ">=0.16.0" },
     { name = "markdown", specifier = ">=3.10.2" },
     { name = "protobuf", specifier = ">=6.33.6" },
     { name = "psycopg2-binary", specifier = ">=2.9" },

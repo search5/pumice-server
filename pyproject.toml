@@ -19,6 +19,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "twisted>=26.4.0",
     "sqlalchemy-cubrid",
+    "i18nice>=0.16.0",
 ]
 
 [project.scripts]

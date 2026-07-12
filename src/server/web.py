@@ -5,12 +5,51 @@ import re
 import os
 import shutil
 import uuid
+import i18n
 from urllib.parse import quote, unquote
 from pyramid.config import Configurator
 from pyramid.response import Response
 from pyramid.view import view_config
 
 logger = logging.getLogger("server.web")
+
+# ─── i18n ────────────────────────────────────────────────────────────────
+# Locale is negotiated per-request from the browser's Accept-Language header --
+# no client-side language detection needed. Translation text lives entirely in
+# locale/{lang}.json (not in this file); i18n.t() is called with an explicit
+# `locale=` on every lookup rather than i18n.set('locale', ...), since that's
+# global mutable state and this server handles requests concurrently (Twisted
+# + asyncio) -- a per-call locale avoids any cross-request race.
+_LOCALE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locale")
+i18n.load_path.append(_LOCALE_DIR)
+i18n.set("file_format", "json")
+i18n.set("filename_format", "{locale}.{format}")
+i18n.set("fallback", "ko")
+
+_SUPPORTED_LOCALES = ["ko", "en"]
+_I18N_PARAM_RE = re.compile(r"\{\{\s*([\w-]+)\s*\}\}")
+
+# Raw locale dicts, loaded once and cached, for embedding a fully-resolved
+# translation blob into a page's <script> for the handful of strings that JS
+# generates at runtime (toasts, confirm dialogs, fetch-rendered table rows) --
+# separate from i18n.t()'s own internal loading, so this doesn't depend on that
+# library's private cache structure.
+_LOCALE_DATA_CACHE: dict = {}
+
+def get_locale_dict(lang: str) -> dict:
+    if lang not in _LOCALE_DATA_CACHE:
+        with open(os.path.join(_LOCALE_DIR, f"{lang}.json"), "r", encoding="utf-8") as f:
+            _LOCALE_DATA_CACHE[lang] = json.load(f)[lang]
+    return _LOCALE_DATA_CACHE[lang]
+
+def detect_lang(request) -> str:
+    return request.accept_language.best_match(_SUPPORTED_LOCALES, default_match="ko")
+
+def t(key: str, lang: str, **params) -> str:
+    text = i18n.t(key, locale=lang)
+    if params:
+        text = _I18N_PARAM_RE.sub(lambda m: str(params.get(m.group(1), "")), text)
+    return text
 
 # Pyramid tween that allows CORS
 def cors_tween_factory(handler, registry):
@@ -32,110 +71,176 @@ def cors_tween_factory(handler, registry):
     return cors_tween
 
 # Pyramid tween (middleware) that verifies the Authorization Bearer token
-def token_auth_tween_factory(handler, registry):
-    def token_auth_tween(request):
-        # /api/ping, /publish/, and the publish API paths are exempt from the token check
-        # (allows the ad-hoc obs-token issued at official account login to bypass it)
-        bypass_paths = [
-            "/api/ping", "/api/list", "/api/upload", "/api/remove",
-            "/api/slugs", "/api/site", "/api/customurl", "/api/slug", "/api/password",
-            "/api/download", "/user/login", "/login", "/dashboard"
-        ]
-        if request.path in bypass_paths or request.path.startswith("/publish/"):
-            return handler(request)
+# There's exactly one kind of credential in the whole system: a device_tokens row (see
+# repository.py). It authenticates gRPC sync calls (checked directly in service.py) *and* every
+# HTTP request here -- the browser dashboard included, via a session cookie of the same token
+# rather than a copy-pasted "web token" (which used to be a separate users.token column/concept;
+# removed, since nothing but the dashboard itself ever consumed it and cookies are the natural
+# fit for a browser session anyway).
+SESSION_COOKIE_NAME = "session_token"
 
-        auth_header = request.headers.get("Authorization", "")
-        obs_token = request.headers.get("obs-token", "")
-
-        token = ""
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-        elif obs_token:
-            token = obs_token
-
-        # There's no separate master/bypass token anymore -- every caller authenticates as a
-        # real user via their web-dashboard token (users.token).
-        user = request.repository.get_user_by_token(token) if request.repository else None
-
-        if not user:
-            logger.warning(f"Unauthorized HTTP access attempt: {request.method} {request.path}")
-            return Response(
-                body=json.dumps({"error": "Unauthorized"}).encode("utf-8"),
-                status=401,
-                content_type="application/json"
-            )
-            
-        return handler(request)
-    return token_auth_tween
-
-def get_authenticated_user(request):
+def extract_token(request) -> str:
     auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:].strip()
     obs_token = request.headers.get("obs-token", "")
-    
-    # Extract a body token for APIs that take the token in the JSON body (e.g. unpublish)
-    body_token = ""
+    if obs_token:
+        return obs_token.strip()
+    # A body token for APIs that take it in the JSON body (e.g. unpublish)
+    try:
+        if request.body:
+            body_token = request.json_body.get("token")
+            if body_token:
+                return body_token.strip()
+    except Exception:
+        pass
+    return request.cookies.get(SESSION_COOKIE_NAME, "")
+
+def set_session_cookie(request, token: str) -> None:
+    request.response.set_cookie(
+        SESSION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="Lax",
+        secure=(request.scheme == "https"),
+        path="/",
+        max_age=60 * 60 * 24 * 365,  # individual sessions are revoked via device management, not expiry
+    )
+
+def clear_session_cookie(request) -> None:
+    request.response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+
+# ─── Authorization (Pyramid ACL) ────────────────────────────────────────────
+# Permission checking used to be ad hoc: every view called get_authenticated_user()/
+# verify_vault_ownership() by hand and returned its own 401/403 Response. That's now
+# centralized into a real Pyramid security policy + ACLs, so views just declare
+# `permission='authenticated' | 'admin' | 'vault-access'` on @view_config and never see an
+# unauthorized caller at all -- Pyramid raises HTTPForbidden before the view body runs, and
+# forbidden_view() below turns that into the same 401 (no identity) / 403 (wrong identity)
+# JSON shape the manual checks used to produce.
+from pyramid.authorization import Allow, Authenticated, Everyone, ACLHelper
+from pyramid.security import NO_PERMISSION_REQUIRED
+from pyramid.view import forbidden_view_config
+from pyramid.httpexceptions import HTTPForbidden
+
+class DeviceTokenSecurityPolicy:
+    def identity(self, request):
+        token = extract_token(request)
+        if not token or not request.repository:
+            return None
+        device = request.repository.get_device_token(token)
+        if not device:
+            return None
+        admin_user = os.getenv("ADMIN_USER")
+        is_admin = (device["username"] == admin_user) if admin_user else False
+        return {"username": device["username"], "is_admin": is_admin}
+
+    def authenticated_userid(self, request):
+        identity = request.identity
+        return identity["username"] if identity else None
+
+    def forget(self, request, **kw):
+        return []
+
+    def remember(self, request, userid, **kw):
+        return []
+
+    def permits(self, request, context, permission):
+        identity = request.identity
+        principals = [Everyone]
+        if identity is not None:
+            principals.append(Authenticated)
+            principals.append(f"user:{identity['username']}")
+            if identity["is_admin"]:
+                principals.append("role:admin")
+        acl = getattr(context, "__acl__", [])
+        return ACLHelper().permits(context, principals, permission)
+
+class RootFactory:
+    __acl__ = [
+        (Allow, Authenticated, "authenticated"),
+        (Allow, "role:admin", "admin"),
+    ]
+    def __init__(self, request):
+        pass
+
+def _extract_vault_id(request) -> str:
+    if request.matchdict:
+        vault_id = request.matchdict.get("vault_id")
+        if vault_id:
+            return vault_id
+    vault_id = request.params.get("vault_id")
+    if vault_id:
+        return vault_id
+    vault_id = request.headers.get("obs-id")
+    if vault_id:
+        return vault_id
     try:
         if request.body:
             body = request.json_body
-            body_token = body.get("token")
+            return body.get("vault_id") or body.get("id") or body.get("site_uid") or ""
     except Exception:
         pass
+    return ""
 
-    token = ""
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:].strip()
-    elif obs_token:
-        token = obs_token.strip()
-    elif body_token:
-        token = body_token.strip()
-        
+class VaultContext:
+    """Route factory for every endpoint scoped to a single vault. Resolves the vault_id from
+    whichever of matchdict/params/obs-id header/JSON body the calling convention uses (see
+    _extract_vault_id). A vault's true identity is (owner_username, vault_id), and
+    owner_username always comes from the caller's own authenticated identity, never from client
+    input -- so there's no cross-account vault access to check: a caller can only ever address
+    their own vaults. (An earlier version of this checked vault_id against a global
+    vault_id -> owner registry and let the first caller "claim" an unclaimed vault_id -- removed,
+    because vault_id alone isn't globally unique: "Obsidian Vault" is Obsidian's own default vault
+    name, so two different accounts' same-named vaults collided and whichever synced first
+    permanently locked the other out.)"""
+
+    def __init__(self, request):
+        self.vault_id = _extract_vault_id(request)
+        identity = request.identity
+        self.owner = identity["username"] if identity else None
+        self.__acl__ = [(Allow, f"user:{self.owner}", "vault-access")] if self.owner else []
+
+@forbidden_view_config(renderer="json")
+def forbidden_view(request):
+    # Same 401-vs-403 distinction the manual per-view checks used to make: no identity at all
+    # is "you need to log in" (401), a real identity that just isn't allowed here is "you're
+    # logged in as the wrong person" (403).
+    status = 401 if request.identity is None else 403
+    request.response.status = status
+    return {"error": "Unauthorized" if status == 401 else "Forbidden"}
+
+def get_authenticated_user(request):
+    token = extract_token(request)
     if not token:
         return None
 
-    # There's no separate master/bypass token anymore -- every caller authenticates as a real
-    # user via their web-dashboard token (users.token). Whichever account's username matches
-    # ADMIN_USER is treated as admin.
-    user = request.repository.get_user_by_token(token) if request.repository else None
-    if user:
+    device = request.repository.get_device_token(token) if request.repository else None
+    if device:
         admin_user = os.getenv("ADMIN_USER")
-        is_admin = (user["username"] == admin_user) if admin_user else False
-        return {"username": user["username"], "is_admin": is_admin}
-        
+        is_admin = (device["username"] == admin_user) if admin_user else False
+        return {"username": device["username"], "is_admin": is_admin}
+
     return None
 
-def verify_vault_ownership(request, vault_id):
-    if not vault_id:
-        return None
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return None  # Unauthorized
-    # No admin bypass, intentionally: vault content is private to its owner. Being admin grants
-    # account-management capabilities, not access to other people's notes.
-    owner = request.repository.get_vault_owner(vault_id)
-    if not owner:
-        request.repository.set_vault_owner(vault_id, user_info["username"])
-        logger.info(f"Set owner of vault '{vault_id}' to '{user_info['username']}'")
-        return user_info
-    if owner != user_info["username"]:
-        return False  # Forbidden
-    return user_info
-
-# Helper that resolves a vault's absolute physical storage path
-def get_vault_path(data_dir: str, vault_id: str) -> str:
-    vaults_dir = os.path.join(data_dir, "vaults")
+# Helper that resolves a vault's absolute physical storage path. Nested under owner_username for
+# the same reason the DB tables are keyed by (owner_username, vault_id) now -- vault_id alone
+# ("Obsidian Vault" being Obsidian's own default name) isn't unique across accounts.
+def get_vault_path(data_dir: str, owner_username: str, vault_id: str) -> str:
+    vaults_dir = os.path.join(data_dir, "vaults", owner_username)
     vault_path = os.path.abspath(os.path.join(vaults_dir, vault_id))
     if not vault_path.startswith(os.path.abspath(vaults_dir)):
         raise ValueError("Invalid vault ID")
     return vault_path
 
 # Helper that resolves the publish metadata directory
-def get_publish_meta_dir(data_dir: str, vault_id: str) -> str:
-    d = os.path.join(data_dir, "publish_meta", vault_id)
+def get_publish_meta_dir(data_dir: str, owner_username: str, vault_id: str) -> str:
+    d = os.path.join(data_dir, "publish_meta", owner_username, vault_id)
     os.makedirs(d, exist_ok=True)
     return d
 
-def load_publish_meta(data_dir: str, vault_id: str, filename: str, default=None):
-    meta_dir = get_publish_meta_dir(data_dir, vault_id)
+def load_publish_meta(data_dir: str, owner_username: str, vault_id: str, filename: str, default=None):
+    meta_dir = get_publish_meta_dir(data_dir, owner_username, vault_id)
     path = os.path.join(meta_dir, filename)
     if os.path.exists(path):
         try:
@@ -145,13 +250,13 @@ def load_publish_meta(data_dir: str, vault_id: str, filename: str, default=None)
             pass
     return default if default is not None else {}
 
-def save_publish_meta(data_dir: str, vault_id: str, filename: str, data):
-    meta_dir = get_publish_meta_dir(data_dir, vault_id)
+def save_publish_meta(data_dir: str, owner_username: str, vault_id: str, filename: str, data):
+    meta_dir = get_publish_meta_dir(data_dir, owner_username, vault_id)
     path = os.path.join(meta_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-@view_config(route_name='ping', renderer='json')
+@view_config(route_name='ping', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def ping_view(request):
     return {
         "status": "ok",
@@ -159,14 +264,15 @@ def ping_view(request):
         "timestamp_ms": int(time.time() * 1000)
     }
 
-@view_config(route_name='login_page')
+@view_config(route_name='login_page', permission=NO_PERMISSION_REQUIRED)
 def login_page_view(request):
-    html = """<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
+    lang = detect_lang(request)
+    parts = []
+    parts.append('<!DOCTYPE html>\n<html lang="' + lang + '">\n<head>\n')
+    parts.append("""    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Obsidian Sync - Login</title>
+    <title>""" + t('login.page_title', lang) + """</title>""")
+    parts.append("""
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -363,50 +469,86 @@ def login_page_view(request):
 </head>
 <body>
     <button class="theme-fab" id="themeToggleBtn">
-        <span id="themeToggleIcon">☀️</span> <span id="themeToggleText">라이트 모드</span>
+        <span id="themeToggleIcon">☀️</span> <span id="themeToggleText">""")
+    parts.append(t('common.theme_light', lang))
+    parts.append("""</span>
     </button>
 
     <div class="login-card">
         <div class="header">
             <div class="logo">Obsidian Sync</div>
-            <div class="subtitle" id="cardSubtitle">계정 로그인 및 토큰 발급</div>
+            <div class="subtitle" id="cardSubtitle">""")
+    parts.append(t('login.subtitle', lang))
+    parts.append("""</div>
         </div>
         <div id="alert" class="alert alert-error"></div>
         <form id="loginForm">
             <div class="form-group">
-                <label for="username">아이디 (Username)</label>
-                <input type="text" id="username" required placeholder="아이디를 입력하세요">
-            </div>
-            <div class="form-group">
-                <label for="password">비밀번호</label>
+                <label for="username">""")
+    parts.append(t('login.label_username', lang))
+    parts.append('</label>\n                <input type="text" id="username" required placeholder="')
+    parts.append(t('login.placeholder_username', lang))
+    parts.append('">\n            </div>\n            <div class="form-group">\n                <label for="password">')
+    parts.append(t('login.label_password', lang))
+    parts.append("""</label>
                 <input type="password" id="password" required placeholder="••••••••">
             </div>
 
-            <button type="submit" class="btn" id="submitBtn">로그인</button>
+            <button type="submit" class="btn" id="submitBtn">""")
+    parts.append(t('login.button_submit', lang))
+    parts.append("""</button>
         </form>
 
         <div style="text-align: center; margin-top: 20px; font-size: 13px; color: var(--md-sys-color-on-surface-variant);">
-            계정이 없으신가요? 관리자에게 문의해 계정을 발급받으세요.
+            """)
+    parts.append(t('login.no_account', lang))
+    parts.append("""
         </div>
 
         <div id="resultBox" class="result-box">
-            <div class="result-title">🎉 인증 토큰이 발급되었습니다!</div>
-            <p style="font-size: 12px; margin-bottom: 12px; color: var(--md-sys-color-on-surface-variant);">아래 토큰을 옵시디언 플러그인 설정창의 '인증 토큰' 필드에 붙여넣어 주세요.</p>
+            <div class="result-title">""")
+    parts.append(t('login.result_title', lang))
+    parts.append("""</div>
+            <p style="font-size: 12px; margin-bottom: 12px; color: var(--md-sys-color-on-surface-variant);">""")
+    parts.append(t('login.result_desc', lang))
+    parts.append("""</p>
             <div class="token-display" id="tokenDisplay"></div>
-            <div class="copy-hint">대시보드로 자동 이동 중...</div>
+            <div class="copy-hint">""")
+    parts.append(t('login.result_redirecting', lang))
+    parts.append("""</div>
         </div>
 
         <!-- 로그인이 obsidian://<action> 콜백으로 끝나는 경우 전용. 브라우저(특히 모바일)는 실제
              탭/클릭 없이 스크립트가 커스텀 스킴으로 이동시키는 걸 아무 표시 없이 막는 경우가 많아서,
              자동 리다이렉트 대신 사용자가 직접 눌러야 하는 링크로 보여준다. -->
         <div id="deviceReturnBox" class="result-box">
-            <div class="result-title">✅ 로그인 완료</div>
-            <p style="font-size: 12px; margin-bottom: 16px; color: var(--md-sys-color-on-surface-variant);">아래 버튼을 눌러 Obsidian으로 돌아가세요. 자동으로 넘어가지 않으면 반드시 직접 눌러야 합니다.</p>
-            <a id="deviceReturnLink" class="btn" style="display: inline-block; text-decoration: none; text-align: center;" href="#">Obsidian으로 돌아가기</a>
+            <div class="result-title">""")
+    parts.append(t('login.device_return_title', lang))
+    parts.append("""</div>
+            <p style="font-size: 12px; margin-bottom: 16px; color: var(--md-sys-color-on-surface-variant);">""")
+    parts.append(t('login.device_return_desc', lang))
+    parts.append("""</p>
+            <a id="deviceReturnLink" class="btn" style="display: inline-block; text-decoration: none; text-align: center;" href="#">""")
+    parts.append(t('login.device_return_button', lang))
+    parts.append("""</a>
         </div>
     </div>
 
     <script>
+        const I18N = """ + json.dumps(get_locale_dict(lang), ensure_ascii=False) + """;
+        function t(key, params) {
+            let node = I18N;
+            for (const part of key.split(".")) {
+                if (node == null) break;
+                node = node[part];
+            }
+            let text = (typeof node === "string") ? node : key;
+            if (params) {
+                text = text.replace(/\\{\\{\\s*([\\w-]+)\\s*\\}\\}/g, (_m, name) => (params[name] !== undefined ? String(params[name]) : ""));
+            }
+            return text;
+        }
+
         const form = document.getElementById("loginForm");
         const alertEl = document.getElementById("alert");
         const resultBox = document.getElementById("resultBox");
@@ -425,14 +567,14 @@ def login_page_view(request):
             if (theme === "light") {
                 document.body.classList.add("light-theme");
                 themeToggleIcon.innerText = "🌙";
-                themeToggleText.innerText = "다크 모드";
+                themeToggleText.innerText = t("common.theme_dark");
             } else {
                 document.body.classList.remove("light-theme");
                 themeToggleIcon.innerText = "☀️";
-                themeToggleText.innerText = "라이트 모드";
+                themeToggleText.innerText = t("common.theme_light");
             }
         }
-        
+
         // 브라우저 저장 테마 로드
         const savedTheme = localStorage.getItem("theme") || "dark";
         applyTheme(savedTheme);
@@ -446,17 +588,15 @@ def login_page_view(request):
 
         // A client plugin (e.g. the Obsidian "Log in" button) opens this page with
         // ?redirect=obsidian://pumice-auth&device_name=... -- on success we hand back a
-        // device_token via that custom URI instead of going to /dashboard. Skip the
-        // already-logged-in shortcut in that case: the visit means a device wants its own
-        // fresh token, not to reuse whatever's already sitting in this browser's localStorage.
+        // device_token via that custom URI instead of going to /dashboard. A device-pairing
+        // visit always wants its own fresh token, so it never takes the already-logged-in
+        // shortcut below even if this browser also has a valid session cookie.
         const params = new URLSearchParams(window.location.search);
         const deviceRedirect = params.get("redirect");
         const deviceName = params.get("device_name");
 
         if (deviceRedirect) {
-            cardSubtitle.innerText = "디바이스 로그인 승인";
-        } else if (localStorage.getItem("sync_token")) {
-            window.location.href = "/dashboard";
+            cardSubtitle.innerText = t("login.subtitle_device");
         }
 
         form.addEventListener("submit", async (e) => {
@@ -464,7 +604,7 @@ def login_page_view(request):
             alertEl.style.display = "none";
             resultBox.style.display = "none";
             submitBtn.disabled = true;
-            submitBtn.innerText = "로그인 중...";
+            submitBtn.innerText = t("login.button_submitting");
 
             const username = document.getElementById("username").value;
             const password = document.getElementById("password").value;
@@ -499,41 +639,45 @@ def login_page_view(request):
                     }
 
                     alertEl.className = "alert alert-success";
-                    alertEl.innerText = "로그인 성공! 대시보드로 이동합니다...";
+                    alertEl.innerText = t("login.msg_success");
                     alertEl.style.display = "block";
 
-                    localStorage.setItem("sync_token", data.token);
+                    // The actual credential is an HttpOnly session cookie the server just set on
+                    // this response -- not readable (or needed) here. Only non-secret display
+                    // state goes into localStorage.
                     localStorage.setItem("sync_username", data.username || data.email);
                     localStorage.setItem("sync_is_admin", data.is_admin);
 
                     window.location.href = "/dashboard";
                 } else {
                     alertEl.className = "alert alert-error";
-                    alertEl.innerText = data.error || "로그인에 실패했습니다.";
+                    alertEl.innerText = data.error || t("login.msg_fail");
                     alertEl.style.display = "block";
                 }
             } catch (err) {
                 alertEl.className = "alert alert-error";
-                alertEl.innerText = "서버와 통신하는 데 실패했습니다.";
+                alertEl.innerText = t("login.msg_network_error");
                 alertEl.style.display = "block";
             } finally {
                 submitBtn.disabled = false;
-                submitBtn.innerText = "로그인";
+                submitBtn.innerText = t("login.button_submit");
             }
         });
     </script>
 </body>
-</html>"""
+</html>""")
+    html = "".join(parts)
     return Response(html, content_type="text/html")
 
-@view_config(route_name='dashboard_page')
+@view_config(route_name='dashboard_page', permission=NO_PERMISSION_REQUIRED)
 def dashboard_page_view(request):
-    html = """<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
+    lang = detect_lang(request)
+    parts = []
+    parts.append('<!DOCTYPE html>\n<html lang="' + lang + '">\n<head>\n')
+    parts.append("""    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Obsidian Sync - Dashboard</title>
+    <title>""" + t('dashboard.page_title', lang) + """</title>""")
+    parts.append("""
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -1023,17 +1167,29 @@ def dashboard_page_view(request):
     <div class="sidebar">
         <div class="brand">Obsidian Sync</div>
         <ul class="nav-menu" id="sidebarMenu">
-            <li class="nav-item active" onclick="switchTab('dashboard')">대시보드 홈</li>
-            <li class="nav-item" onclick="switchTab('mypage')">내 정보 관리</li>
-            <li class="nav-item" onclick="switchTab('sync')">Vault 동기화 관리</li>
-            <li class="nav-item" onclick="switchTab('publish')">퍼블리시(Publish) 관리</li>
+            <li class="nav-item active" onclick="switchTab('dashboard')">""")
+    parts.append(t('nav.dashboard', lang))
+    parts.append("""</li>
+            <li class="nav-item" onclick="switchTab('mypage')">""")
+    parts.append(t('nav.mypage', lang))
+    parts.append("""</li>
+            <li class="nav-item" onclick="switchTab('sync')">""")
+    parts.append(t('nav.sync', lang))
+    parts.append("""</li>
+            <li class="nav-item" onclick="switchTab('publish')">""")
+    parts.append(t('nav.publish', lang))
+    parts.append("""</li>
         </ul>
         <div class="user-info">
             <div class="username" id="sidebarUsername">User Name</div>
-            <a class="logout" onclick="logout()">로그아웃</a>
+            <a class="logout" onclick="logout()">""")
+    parts.append(t('nav.logout', lang))
+    parts.append("""</a>
             <div class="theme-toggle-container">
                 <button class="theme-toggle-btn" id="themeToggleBtn">
-                    <span id="themeToggleIcon">☀️</span> <span id="themeToggleText">라이트 모드</span>
+                    <span id="themeToggleIcon">☀️</span> <span id="themeToggleText">""")
+    parts.append(t('common.theme_light', lang))
+    parts.append("""</span>
                 </button>
             </div>
         </div>
@@ -1043,83 +1199,133 @@ def dashboard_page_view(request):
         <!-- 탭 1: 대시보드 홈 -->
         <div id="tab-dashboard" class="tab-content active">
             <div class="header">
-                <h1>대시보드 개요</h1>
-                <p>로컬 동기화 및 퍼블리싱 상태를 모니터링합니다.</p>
+                <h1>""")
+    parts.append(t('dashboard.title', lang))
+    parts.append("""</h1>
+                <p>""")
+    parts.append(t('dashboard.desc', lang))
+    parts.append("""</p>
             </div>
-            
+
             <div class="widget-grid">
                 <div class="card">
-                    <div class="card-desc">연동된 Vault 수</div>
+                    <div class="card-desc">""")
+    parts.append(t('dashboard.card_vault_count', lang))
+    parts.append("""</div>
                     <div class="card-val" id="widgetVaultCount">0</div>
-                    <div class="card-desc">동기화 완료된 저장소</div>
+                    <div class="card-desc">""")
+    parts.append(t('dashboard.card_vault_count_desc', lang))
+    parts.append("""</div>
                 </div>
                 <div class="card">
-                    <div class="card-desc">퍼블리시 사이트 수</div>
+                    <div class="card-desc">""")
+    parts.append(t('dashboard.card_site_count', lang))
+    parts.append("""</div>
                     <div class="card-val" id="widgetSiteCount">0</div>
-                    <div class="card-desc">배포된 문서 사이트</div>
+                    <div class="card-desc">""")
+    parts.append(t('dashboard.card_site_count_desc', lang))
+    parts.append("""</div>
                 </div>
 
             </div>
         </div>
-
+""")
+    parts.append("""
         <!-- 탭 5: 내 정보 관리 (마이페이지) -->
         <div id="tab-mypage" class="tab-content">
             <div class="header">
-                <h1>내 정보 관리</h1>
-                <p>개인 정보를 확인하고 수정할 수 있습니다.</p>
+                <h1>""")
+    parts.append(t('mypage.title', lang))
+    parts.append("""</h1>
+                <p>""")
+    parts.append(t('mypage.desc', lang))
+    parts.append("""</p>
             </div>
-            
+
             <div class="card" style="max-width: 600px; background: var(--md-sys-color-surface-container);">
-                <div style="font-weight: 600; font-size: 16px; margin-bottom: 20px; color: var(--text-primary);">프로필 정보 변경</div>
+                <div style="font-weight: 600; font-size: 16px; margin-bottom: 20px; color: var(--text-primary);">""")
+    parts.append(t('mypage.profile_heading', lang))
+    parts.append("""</div>
                 <div id="mypageAlert" class="alert alert-error" style="display: none; margin-bottom: 15px;"></div>
-                
+
                 <div style="margin-bottom: 18px;">
-                    <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">아이디 (Username)</label>
+                    <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">""")
+    parts.append(t('login.label_username', lang))
+    parts.append("""</label>
                     <input type="text" id="mypageUsername" disabled style="width: 100%; background: rgba(0,0,0,0.1); border: 1px solid var(--md-sys-color-outline); color: var(--text-muted); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none; cursor: not-allowed;">
                 </div>
                 <div style="margin-bottom: 18px;">
-                    <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">이름 (Name)</label>
-                    <input type="text" id="mypageName" placeholder="이름을 입력하세요" style="width: 100%; background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+                    <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">""")
+    parts.append(t('mypage.label_name', lang))
+    parts.append('</label>\n                    <input type="text" id="mypageName" placeholder="')
+    parts.append(t('mypage.placeholder_name', lang))
+    parts.append("""" style="width: 100%; background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
                 </div>
                 <div style="margin-bottom: 18px;">
-                    <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">이메일 주소 (Email)</label>
+                    <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">""")
+    parts.append(t('mypage.label_email', lang))
+    parts.append("""</label>
                     <input type="email" id="mypageEmail" placeholder="example@example.com" style="width: 100%; background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
                 </div>
                 <div style="margin-bottom: 25px;">
-                    <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">새 비밀번호 (변경 시에만 입력)</label>
+                    <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">""")
+    parts.append(t('mypage.label_password', lang))
+    parts.append("""</label>
                     <input type="password" id="mypagePassword" placeholder="••••••••" style="width: 100%; background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
                 </div>
-                <div style="margin-bottom: 25px;">
-                    <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">나의 인증 토큰</label>
-                    <div style="display: flex; gap: 8px; align-items: center;">
-                        <input type="text" id="mypageToken" readonly style="flex-grow: 1; background: rgba(0,0,0,0.1); border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 13px; font-family: monospace; outline: none; height: 44px;">
-                        <button class="btn-sm" onclick="copyMyPageToken()" title="토큰 복사" style="display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; padding: 0; border-radius: 50%; border: 1px solid var(--accent-blue); color: var(--accent-blue); background: transparent; cursor: pointer; transition: all 0.2s ease;">
-                            <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="currentColor">
-                                <path d="M360-240q-33 0-56.5-23.5T280-320v-480q0-33 23.5-56.5T360-880h360q33 0 56.5 23.5T800-800v480q0-33-23.5 56.5T720-240H360Zm0-80h360v-480H360v480ZM200-80q-33 0-56.5-23.5T120-160v-560h80v560h440v80H200Zm160-240v-480 480Z"/>
-                            </svg>
-                        </button>
-                        <button class="btn-sm" onclick="resetMyPageToken()" style="white-space: nowrap; height: 44px; border-color: var(--error-red); color: var(--error-red); background: transparent; border-radius: 100px; padding: 0 16px;">재발급</button>
-                    </div>
-                    <small style="display: block; font-size: 11px; color: var(--text-muted); margin-top: 6px;">
-                        ※ 토큰 재발급 시 기존 클라이언트의 동기화 세션이 끊어지므로 새 토큰으로 다시 설정해야 합니다.
-                    </small>
-                </div>
                 <div style="display: flex; justify-content: flex-end;">
-                    <button class="btn" onclick="updateMyProfile()" style="width: auto;">저장하기</button>
+                    <button class="btn" onclick="updateMyProfile()" style="width: auto;">""")
+    parts.append(t('mypage.button_save', lang))
+    parts.append("""</button>
+                </div>
+            </div>
+
+            <div class="card" style="max-width: 600px; background: var(--md-sys-color-surface-container); margin-top: 20px;">
+                <div style="font-weight: 600; font-size: 16px; margin-bottom: 20px; color: var(--text-primary);">""")
+    parts.append(t('mypage.devices_heading', lang))
+    parts.append("""</div>
+                <div class="table-container">
+                    <table id="myDevicesTable">
+                        <thead>
+                            <tr>
+                                <th>""")
+    parts.append(t('devices.col_name', lang))
+    parts.append("""</th>
+                                <th>""")
+    parts.append(t('devices.col_created', lang))
+    parts.append("""</th>
+                                <th>""")
+    parts.append(t('common.col_actions', lang))
+    parts.append("""</th>
+                            </tr>
+                        </thead>
+                        <tbody id="myDevicesTableBody">
+                            <tr><td colspan="3" class="empty-state">""")
+    parts.append(t('common.loading', lang))
+    parts.append("""</td></tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
 
-        <!-- 탭 2: Vault 동기화 관리 -->
+        <!-- 탭 2: Vault 동기화 관리 -->""")
+    parts.append("""
         <div id="tab-sync" class="tab-content">
             <div class="header">
-                <h1>Vault 동기화 파일 내역</h1>
-                <p>각 Vault 별 동기화된 메타데이터 및 삭제 Tombstone 현황을 조회합니다.</p>
+                <h1>""")
+    parts.append(t('sync.title', lang))
+    parts.append("""</h1>
+                <p>""")
+    parts.append(t('sync.desc', lang))
+    parts.append("""</p>
             </div>
-            
+
             <div class="selector-bar">
                 <select id="vaultSelect" onchange="loadVaultFiles()">
-                    <option value="">Vault 선택...</option>
+                    <option value="">""")
+    parts.append(t('sync.select_vault', lang))
+    parts.append("""</option>
                 </select>
             </div>
 
@@ -1127,16 +1333,28 @@ def dashboard_page_view(request):
                 <table id="filesTable">
                     <thead>
                         <tr>
-                            <th>파일 경로</th>
-                            <th>크기 (Bytes)</th>
-                            <th>최종 수정 일자</th>
-                            <th>해시값 (SHA-256)</th>
-                            <th>상태</th>
+                            <th>""")
+    parts.append(t('sync.col_path', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('common.col_size', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('sync.col_modified', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('sync.col_hash', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('common.col_status', lang))
+    parts.append("""</th>
                         </tr>
                     </thead>
                     <tbody id="filesTableBody">
                         <tr>
-                            <td colspan="5" class="empty-state">Vault를 먼저 선택해 주세요.</td>
+                            <td colspan="5" class="empty-state">""")
+    parts.append(t('sync.empty_select_vault', lang))
+    parts.append("""</td>
                         </tr>
                     </tbody>
                 </table>
@@ -1146,13 +1364,19 @@ def dashboard_page_view(request):
         <!-- 탭 3: 퍼블리시 관리 -->
         <div id="tab-publish" class="tab-content">
             <div class="header">
-                <h1>퍼블리시(Publish) 페이지 관리</h1>
-                <p>웹에 배포된 노트를 확인하고 퍼블리시를 제어합니다.</p>
+                <h1>""")
+    parts.append(t('publish.title', lang))
+    parts.append("""</h1>
+                <p>""")
+    parts.append(t('publish.desc', lang))
+    parts.append("""</p>
             </div>
 
             <div class="selector-bar">
                 <select id="siteSelect" onchange="loadSiteFiles()">
-                    <option value="">배포된 사이트 선택...</option>
+                    <option value="">""")
+    parts.append(t('publish.select_site', lang))
+    parts.append("""</option>
                 </select>
             </div>
 
@@ -1160,16 +1384,28 @@ def dashboard_page_view(request):
                 <table id="publishTable">
                     <thead>
                         <tr>
-                            <th>노트 경로</th>
-                            <th>크기 (Bytes)</th>
-                            <th>최종 배포 일자</th>
-                            <th>공개 링크</th>
-                            <th>관리</th>
+                            <th>""")
+    parts.append(t('publish.col_path', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('common.col_size', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('publish.col_published', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('publish.col_link', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('common.col_actions', lang))
+    parts.append("""</th>
                         </tr>
                     </thead>
                     <tbody id="publishTableBody">
                         <tr>
-                            <td colspan="5" class="empty-state">사이트를 먼저 선택해 주세요.</td>
+                            <td colspan="5" class="empty-state">""")
+    parts.append(t('publish.empty_select_site', lang))
+    parts.append("""</td>
                         </tr>
                     </tbody>
                 </table>
@@ -1179,37 +1415,59 @@ def dashboard_page_view(request):
         <!-- 탭 4: 사용자 관리 (관리자 전용) -->
         <div id="tab-users" class="tab-content">
             <div class="header">
-                <h1>사용자 계정 관리</h1>
-                <p>시스템에 등록된 사용자 목록을 조회하고 제어합니다. (관리자 권한)</p>
+                <h1>""")
+    parts.append(t('users.title', lang))
+    parts.append("""</h1>
+                <p>""")
+    parts.append(t('users.desc', lang))
+    parts.append("""</p>
             </div>
 
             <!-- 신규 사용자 추가 폼 -->
             <div class="card" style="margin-bottom: 25px; background: var(--md-sys-color-surface-container);">
-                <div style="font-weight: 600; font-size: 15px; margin-bottom: 15px; color: var(--text-primary);">신규 사용자 생성</div>
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 15px;">
-                    <input type="text" id="newUsername" placeholder="아이디 (Username)" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
-                    <input type="password" id="newPassword" placeholder="비밀번호" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
-                    <input type="text" id="newName" placeholder="이름 (Name)" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
-                    <input type="email" id="newEmail" placeholder="이메일 주소 (Email)" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+                <div style="font-weight: 600; font-size: 15px; margin-bottom: 15px; color: var(--text-primary);">""")
+    parts.append(t('users.create_heading', lang))
+    parts.append('</div>\n                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 15px;">\n                    <input type="text" id="newUsername" placeholder="')
+    parts.append(t('users.placeholder_username', lang))
+    parts.append('" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">\n                    <input type="password" id="newPassword" placeholder="')
+    parts.append(t('users.placeholder_password', lang))
+    parts.append('" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">\n                    <input type="text" id="newName" placeholder="')
+    parts.append(t('users.placeholder_name', lang))
+    parts.append('" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">\n                    <input type="email" id="newEmail" placeholder="')
+    parts.append(t('users.placeholder_email', lang))
+    parts.append("""" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
                 </div>
                 <div style="display: flex; justify-content: flex-end;">
-                    <button class="btn" onclick="createUser()" style="width: auto;">계정 생성</button>
+                    <button class="btn" onclick="createUser()" style="width: auto;">""")
+    parts.append(t('users.button_create', lang))
+    parts.append("""</button>
                 </div>
             </div>
-            
+
             <div class="table-container">
-                <table id="usersTable">
+                <table id="usersTable">""")
+    parts.append("""
                     <thead>
                         <tr>
-                            <th>아이디 (ID)</th>
-                            <th>이름 (Name)</th>
-                            <th>이메일 주소</th>
-                            <th>관리</th>
+                            <th>""")
+    parts.append(t('users.col_id', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('users.col_name', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('users.col_email', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('common.col_actions', lang))
+    parts.append("""</th>
                         </tr>
                     </thead>
                     <tbody id="usersTableBody">
                         <tr>
-                            <td colspan="4" class="empty-state">로딩 중...</td>
+                            <td colspan="4" class="empty-state">""")
+    parts.append(t('common.loading', lang))
+    parts.append("""</td>
                         </tr>
                     </tbody>
                 </table>
@@ -1219,7 +1477,20 @@ def dashboard_page_view(request):
     </div>
 
     <script>
-        const authToken = localStorage.getItem("sync_token");
+        const I18N = """ + json.dumps(get_locale_dict(lang), ensure_ascii=False) + """;
+        function t(key, params) {
+            let node = I18N;
+            for (const part of key.split(".")) {
+                if (node == null) break;
+                node = node[part];
+            }
+            let text = (typeof node === "string") ? node : key;
+            if (params) {
+                text = text.replace(/\\{\\{\\s*([\\w-]+)\\s*\\}\\}/g, (_m, name) => (params[name] !== undefined ? String(params[name]) : ""));
+            }
+            return text;
+        }
+
         const username = localStorage.getItem("sync_username");
         const isAdmin = localStorage.getItem("sync_is_admin") === "true";
         let currentUsersPage = 1;
@@ -1228,16 +1499,16 @@ def dashboard_page_view(request):
         const themeToggleBtn = document.getElementById("themeToggleBtn");
         const themeToggleIcon = document.getElementById("themeToggleIcon");
         const themeToggleText = document.getElementById("themeToggleText");
-        
+
         function applyTheme(theme) {
             if (theme === "light") {
                 document.body.classList.add("light-theme");
                 themeToggleIcon.innerText = "🌙";
-                themeToggleText.innerText = "다크 모드";
+                themeToggleText.innerText = t("common.theme_dark");
             } else {
                 document.body.classList.remove("light-theme");
                 themeToggleIcon.innerText = "☀️";
-                themeToggleText.innerText = "라이트 모드";
+                themeToggleText.innerText = t("common.theme_light");
             }
         }
         
@@ -1251,10 +1522,9 @@ def dashboard_page_view(request):
             applyTheme(nextTheme);
         });
         
-        if (!authToken) {
-            window.location.href = "/login";
-        }
-        
+        // No client-readable way to check for a valid session (the cookie is HttpOnly by
+        // design) -- an absent/invalid session just surfaces as the first fetchAPI() call
+        // getting a 401, which already redirects to /login (see fetchAPI below).
         document.getElementById("sidebarUsername").innerText = username || "Obsidian User";
 
         // 관리자인 경우 사이드바에 사용자 관리 메뉴 추가
@@ -1263,7 +1533,7 @@ def dashboard_page_view(request):
             const li = document.createElement("li");
             li.className = "nav-item";
             li.setAttribute("onclick", "switchTab('users')");
-            li.innerText = "사용자 관리";
+            li.innerText = t("nav.users");
             menu.appendChild(li);
         }
 
@@ -1286,6 +1556,7 @@ def dashboard_page_view(request):
                 loadDashboardStats();
             } else if (tabId === 'mypage') {
                 loadMyProfile();
+                loadMyDevices();
             } else if (tabId === 'sync') {
                 refreshVaultList();
             } else if (tabId === 'publish') {
@@ -1297,24 +1568,16 @@ def dashboard_page_view(request):
 
         async function logout() {
             try {
-                await fetch("/user/logout", {
-                    method: "POST",
-                    headers: {
-                        "Authorization": "Bearer " + authToken
-                    }
-                });
+                await fetch("/user/logout", { method: "POST" });
             } catch (err) {
                 console.error("Logout API failed:", err);
             }
-            localStorage.removeItem("sync_token");
             localStorage.removeItem("sync_username");
             localStorage.removeItem("sync_is_admin");
             window.location.href = "/login";
         }
 
         async function fetchAPI(url, options = {}) {
-            options.headers = options.headers || {};
-            options.headers["Authorization"] = "Bearer " + authToken;
             try {
                 const response = await fetch(url, options);
                 if (response.status === 401) {
@@ -1339,16 +1602,15 @@ def dashboard_page_view(request):
                     document.getElementById("mypageName").value = data.name || "";
                     document.getElementById("mypageEmail").value = data.email || "";
                     document.getElementById("mypagePassword").value = "";
-                    document.getElementById("mypageToken").value = data.token || "토큰 없음";
                 } else {
                     alertEl.className = "alert alert-error";
-                    alertEl.innerText = (data && data.error) ? data.error : "프로필을 불러오지 못했습니다.";
+                    alertEl.innerText = (data && data.error) ? data.error : t("mypage.msg_load_failed");
                     alertEl.style.display = "block";
                 }
             } catch (err) {
                 console.error("loadMyProfile error:", err);
                 alertEl.className = "alert alert-error";
-                alertEl.innerText = "프로필 정보 로드 중 오류가 발생했습니다: " + err.message;
+                alertEl.innerText = t("mypage.msg_load_error_prefix") + err.message;
                 alertEl.style.display = "block";
             }
         }
@@ -1373,84 +1635,39 @@ def dashboard_page_view(request):
             }, 3000);
         }
 
-        function copyMyPageToken() {
-            const tokenInput = document.getElementById("mypageToken");
-            if (tokenInput.value && tokenInput.value !== "토큰 없음") {
-                navigator.clipboard.writeText(tokenInput.value);
-                showToast("토큰이 클립보드에 복사되었습니다.");
-            } else {
-                showToast("복사할 토큰이 없습니다.");
-            }
-        }
-
-        async function resetMyPageToken() {
-            const confirmed = await showM3Confirm(
-                "인증 토큰 재발급",
-                `정말로 인증 토큰을 재발급하시겠습니까?\n재발급 시 기존 클라이언트의 동기화 세션이 만료되어 새로운 토큰으로 다시 설정해야 합니다.`,
-                "재발급",
-                true
-            );
-            if (!confirmed) return;
-            
-            const alertEl = document.getElementById("mypageAlert");
-            alertEl.style.display = "none";
-            
-            const res = await fetchAPI("/api/user/profile/reset-token", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" }
-            });
-            
-            if (res && res.token) {
-                alertEl.className = "alert alert-success";
-                alertEl.innerText = "토큰이 성공적으로 재발급되었습니다.";
-                alertEl.style.display = "block";
-                
-                document.getElementById("mypageToken").value = res.token;
-                localStorage.setItem("sync_token", res.token);
-                // 세션 유지를 위해 페이지를 부드럽게 새로고침합니다.
-                setTimeout(() => {
-                    window.location.reload();
-                }, 1000);
-            } else {
-                alertEl.className = "alert alert-error";
-                alertEl.innerText = res ? res.error : "토큰 재발급에 실패했습니다.";
-                alertEl.style.display = "block";
-            }
-        }
-
         async function updateMyProfile() {
             const alertEl = document.getElementById("mypageAlert");
             alertEl.style.display = "none";
-            
+
             const name = document.getElementById("mypageName").value.trim();
             const email = document.getElementById("mypageEmail").value.trim();
             const password = document.getElementById("mypagePassword").value;
-            
+
             if (!name || !email) {
                 alertEl.className = "alert alert-error";
-                alertEl.innerText = "이름과 이메일은 필수 입력 사항입니다.";
+                alertEl.innerText = t("mypage.msg_name_email_required");
                 alertEl.style.display = "block";
                 return;
             }
-            
+
             const res = await fetchAPI("/api/user/profile/update", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ name, email, password })
             });
-            
+
             if (res && res.ok) {
                 alertEl.className = "alert alert-success";
-                alertEl.innerText = "정보가 성공적으로 수정되었습니다.";
+                alertEl.innerText = t("mypage.msg_update_success");
                 alertEl.style.display = "block";
-                
+
                 // 로컬 정보 갱신 및 UI 업데이트
                 localStorage.setItem("sync_username", name);
                 document.getElementById("sidebarUsername").innerText = name;
                 document.getElementById("mypagePassword").value = "";
             } else {
                 alertEl.className = "alert alert-error";
-                alertEl.innerText = res ? res.error : "수정에 실패했습니다.";
+                alertEl.innerText = res ? res.error : t("mypage.msg_update_failed");
                 alertEl.style.display = "block";
             }
         }
@@ -1470,7 +1687,7 @@ def dashboard_page_view(request):
         async function refreshVaultList() {
             const data = await fetchAPI("/api/admin/vaults");
             const select = document.getElementById("vaultSelect");
-            select.innerHTML = '<option value="">Vault 선택...</option>';
+            select.innerHTML = `<option value="">${t("sync.select_vault")}</option>`;
             if (data && data.vaults) {
                 data.vaults.forEach(v => {
                     const opt = document.createElement("option");
@@ -1485,10 +1702,10 @@ def dashboard_page_view(request):
             const vaultId = document.getElementById("vaultSelect").value;
             const tbody = document.getElementById("filesTableBody");
             if (!vaultId) {
-                tbody.innerHTML = '<tr><td colspan="5" class="empty-state">Vault를 먼저 선택해 주세요.</td></tr>';
+                tbody.innerHTML = `<tr><td colspan="5" class="empty-state">${t("sync.empty_select_vault")}</td></tr>`;
                 return;
             }
-            tbody.innerHTML = '<tr><td colspan="5" class="empty-state">로딩 중...</td></tr>';
+            tbody.innerHTML = `<tr><td colspan="5" class="empty-state">${t("common.loading")}</td></tr>`;
 
             const data = await fetchAPI("/api/admin/vaults/" + vaultId);
             tbody.innerHTML = "";
@@ -1498,10 +1715,10 @@ def dashboard_page_view(request):
                     const tr = document.createElement("tr");
                     
                     const timeStr = new Date(f.modified_at_ms).toLocaleString();
-                    const stateBadge = f.is_deleted 
-                        ? '<span class="badge badge-deleted">삭제됨 (Tombstone)</span>' 
-                        : '<span class="badge badge-active">동기화 활성</span>';
-                    
+                    const stateBadge = f.is_deleted
+                        ? `<span class="badge badge-deleted">${t("sync.badge_deleted")}</span>`
+                        : `<span class="badge badge-active">${t("sync.badge_active")}</span>`;
+
                     tr.innerHTML = `
                         <td>${f.path}</td>
                         <td>${f.size_bytes.toLocaleString()}</td>
@@ -1512,14 +1729,14 @@ def dashboard_page_view(request):
                     tbody.appendChild(tr);
                 });
             } else {
-                tbody.innerHTML = '<tr><td colspan="5" class="empty-state">동기화된 파일이 없습니다.</td></tr>';
+                tbody.innerHTML = `<tr><td colspan="5" class="empty-state">${t("sync.empty_no_files")}</td></tr>`;
             }
         }
 
         async function refreshSiteList() {
             const data = await fetchAPI("/api/admin/published");
             const select = document.getElementById("siteSelect");
-            select.innerHTML = '<option value="">배포된 사이트 선택...</option>';
+            select.innerHTML = `<option value="">${t("publish.select_site")}</option>`;
             if (data && data.published_sites) {
                 data.published_sites.forEach(s => {
                     const opt = document.createElement("option");
@@ -1536,16 +1753,16 @@ def dashboard_page_view(request):
             const siteId = select.value;
             const tbody = document.getElementById("publishTableBody");
             if (!siteId) {
-                tbody.innerHTML = '<tr><td colspan="5" class="empty-state">사이트를 먼저 선택해 주세요.</td></tr>';
+                tbody.innerHTML = `<tr><td colspan="5" class="empty-state">${t("publish.empty_select_site")}</td></tr>`;
                 return;
             }
-            tbody.innerHTML = '<tr><td colspan="5" class="empty-state">로딩 중...</td></tr>';
+            tbody.innerHTML = `<tr><td colspan="5" class="empty-state">${t("common.loading")}</td></tr>`;
 
             const data = await fetchAPI("/api/list", {
                 method: "POST",
                 headers: { "Content-Type": "application/json", "obs-id": siteId }
             });
-            
+
             tbody.innerHTML = "";
             if (data && data.files && data.files.length > 0) {
                 data.files.forEach(f => {
@@ -1554,42 +1771,42 @@ def dashboard_page_view(request):
                     const selectedOpt = select.options[select.selectedIndex];
                     const username = selectedOpt ? selectedOpt.getAttribute("data-username") : "default_user";
                     const pubLink = `/publish/${username}/${siteId}/${f.path}`;
-                    
+
                     tr.innerHTML = `
                         <td>${f.path}</td>
                         <td>${f.size.toLocaleString()}</td>
                         <td>${timeStr}</td>
-                        <td><a href="${pubLink}" target="_blank" style="color: var(--accent-blue); text-decoration: none;">링크 열기 ↗</a></td>
-                        <td><button class="btn-sm" onclick="unpublishPage('${siteId}', '${f.path}')">퍼블리시 해제</button></td>
+                        <td><a href="${pubLink}" target="_blank" style="color: var(--accent-blue); text-decoration: none;">${t("publish.link_open")}</a></td>
+                        <td><button class="btn-sm" onclick="unpublishPage('${siteId}', '${f.path}')">${t("publish.button_unpublish")}</button></td>
                     `;
                     tbody.appendChild(tr);
                 });
             } else {
-                tbody.innerHTML = '<tr><td colspan="5" class="empty-state">게시된 페이지가 없습니다.</td></tr>';
+                tbody.innerHTML = `<tr><td colspan="5" class="empty-state">${t("publish.empty_no_pages")}</td></tr>`;
             }
         }
 
         async function unpublishPage(siteId, path) {
             const confirmed = await showM3Confirm(
-                "퍼블리시 해제",
-                `'${path}' 파일을 정말로 퍼블리시 해제하시겠습니까?`,
-                "해제",
+                t("publish.confirm_title"),
+                t("publish.confirm_content", { path }),
+                t("publish.confirm_button"),
                 true,
                 "warning"
             );
             if (!confirmed) return;
-            
+
             const res = await fetchAPI("/api/remove", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ id: siteId, path: path, token: authToken })
+                body: JSON.stringify({ id: siteId, path: path })
             });
 
             if (res && res.ok) {
-                showToast("성공적으로 제거되었습니다.");
+                showToast(t("publish.msg_remove_success"));
                 loadSiteFiles();
             } else {
-                showToast("제거 실패: " + (res ? res.error : "알 수 없는 오류"));
+                showToast(t("publish.msg_remove_failed_prefix") + (res ? res.error : t("common.unknown_error")));
             }
         }
 
@@ -1598,7 +1815,7 @@ def dashboard_page_view(request):
             currentUsersPage = page;
             const tbody = document.getElementById("usersTableBody");
             const paginationDiv = document.getElementById("usersPagination");
-            tbody.innerHTML = '<tr><td colspan="4" class="empty-state">로딩 중...</td></tr>';
+            tbody.innerHTML = `<tr><td colspan="4" class="empty-state">${t("common.loading")}</td></tr>`;
             if (paginationDiv) paginationDiv.innerHTML = "";
             
             const limit = 10;
@@ -1611,13 +1828,13 @@ def dashboard_page_view(request):
                     
                     // 본인 계정은 삭제 불가능하게 방지
                     const isSelf = u.username === username;
-                    const deleteBtnHtml = isSelf 
-                        ? '<span class="badge badge-active">본인 계정</span>' 
-                        : `<button class="btn-sm" onclick="deleteUser('${u.username}')" style="margin-right: 8px;">삭제</button>`;
-                    
-                    const resetPwBtnHtml = `<button class="btn-sm" onclick="resetUserPassword('${u.username}')" style="border-color: var(--accent-blue); color: var(--accent-blue); background: transparent; margin-right: 8px;">비밀번호 변경</button>`;
-                    const resetTokenBtnHtml = `<button class="btn-sm" onclick="resetUserToken('${u.username}')" style="border-color: var(--accent-purple); color: var(--accent-purple); background: transparent;">토큰 재발급</button>`;
-                    
+                    const deleteBtnHtml = isSelf
+                        ? `<span class="badge badge-active">${t("users.badge_self")}</span>`
+                        : `<button class="btn-sm" onclick="deleteUser('${u.username}')" style="margin-right: 8px;">${t("common.button_delete")}</button>`;
+
+                    const resetPwBtnHtml = `<button class="btn-sm" onclick="resetUserPassword('${u.username}')" style="border-color: var(--accent-blue); color: var(--accent-blue); background: transparent; margin-right: 8px;">${t("users.button_reset_password")}</button>`;
+                    const devicesBtnHtml = `<button class="btn-sm" onclick="openDeviceModal('${u.username}')" style="border-color: var(--accent-green); color: var(--accent-green); background: transparent;">${t("devices.button_manage")}</button>`;
+
                     tr.innerHTML = `
                         <td>${u.username}</td>
                         <td>${u.name || '-'}</td>
@@ -1625,7 +1842,7 @@ def dashboard_page_view(request):
                         <td>
                             ${deleteBtnHtml}
                             ${resetPwBtnHtml}
-                            ${resetTokenBtnHtml}
+                            ${devicesBtnHtml}
                         </td>
                     `;
                     tbody.appendChild(tr);
@@ -1636,7 +1853,7 @@ def dashboard_page_view(request):
                     renderPagination(totalPages, page);
                 }
             } else {
-                tbody.innerHTML = '<tr><td colspan="4" class="empty-state">사용자가 존재하지 않습니다.</td></tr>';
+                tbody.innerHTML = `<tr><td colspan="4" class="empty-state">${t("users.empty_no_users")}</td></tr>`;
             }
         }
 
@@ -1648,7 +1865,7 @@ def dashboard_page_view(request):
             // 이전 버튼
             const prevBtn = document.createElement("button");
             prevBtn.className = "pagination-btn";
-            prevBtn.innerText = "이전";
+            prevBtn.innerText = t("common.button_prev");
             prevBtn.disabled = currentPage === 1;
             prevBtn.onclick = () => loadUsersList(currentPage - 1);
             paginationDiv.appendChild(prevBtn);
@@ -1665,13 +1882,13 @@ def dashboard_page_view(request):
             // 다음 버튼
             const nextBtn = document.createElement("button");
             nextBtn.className = "pagination-btn";
-            nextBtn.innerText = "다음";
+            nextBtn.innerText = t("common.button_next");
             nextBtn.disabled = currentPage === totalPages;
             nextBtn.onclick = () => loadUsersList(currentPage + 1);
             paginationDiv.appendChild(nextBtn);
         }
 
-        function showM3Confirm(title, content, confirmText = "삭제", isDestructive = true) {
+        function showM3Confirm(title, content, confirmText = t("common.button_delete"), isDestructive = true) {
             return new Promise((resolve) => {
                 const overlay = document.getElementById("m3DialogOverlay");
                 const titleEl = document.getElementById("dialogTitle");
@@ -1718,7 +1935,7 @@ def dashboard_page_view(request):
             });
         }
 
-        function showM3Prompt(title, content, placeholder = "입력하세요") {
+        function showM3Prompt(title, content, placeholder = "") {
             return new Promise((resolve) => {
                 const overlay = document.getElementById("m3DialogOverlay");
                 const titleEl = document.getElementById("dialogTitle");
@@ -1734,7 +1951,7 @@ def dashboard_page_view(request):
                 inputEl.value = "";
 
                 inputContainer.style.display = "block";
-                confirmBtn.innerText = "변경";
+                confirmBtn.innerText = t("common.button_change");
                 confirmBtn.className = "dialog-btn dialog-btn-primary";
 
                 overlay.style.display = "flex";
@@ -1778,49 +1995,49 @@ def dashboard_page_view(request):
 
         async function deleteUser(targetUsername) {
             const confirmed = await showM3Confirm(
-                "사용자 계정 삭제",
-                `정말로 사용자 '${targetUsername}'을(를) 삭제하시겠습니까?\n이 작업은 되돌릴 수 없으며 소유한 Vault 및 동기화 이력 소유권이 영구 소멸됩니다.`,
-                "삭제",
+                t("users.confirm_delete_title"),
+                t("users.confirm_delete_content", { username: targetUsername }),
+                t("common.button_delete"),
                 true
             );
             if (!confirmed) return;
-            
+
             const res = await fetchAPI("/api/admin/users/delete", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ username: targetUsername })
             });
-            
+
             if (res && res.ok) {
-                showToast("사용자가 성공적으로 삭제되었습니다.");
+                showToast(t("users.msg_delete_success"));
                 loadUsersList(currentUsersPage);
             } else {
-                showToast("삭제 실패: " + (res ? res.error : "알 수 없는 오류"));
+                showToast(t("users.msg_delete_failed_prefix") + (res ? res.error : t("common.unknown_error")));
             }
         }
 
         async function resetUserPassword(targetUsername) {
             const newPassword = await showM3Prompt(
-                "비밀번호 변경",
-                `사용자 '${targetUsername}'의 새 비밀번호를 입력하세요:`,
-                "새 비밀번호 입력"
+                t("users.prompt_reset_password_title"),
+                t("users.prompt_reset_password_content", { username: targetUsername }),
+                t("users.placeholder_new_password")
             );
             if (newPassword === null) return; // 취소
             if (!newPassword.trim()) {
-                showToast("비밀번호는 공백일 수 없습니다.");
+                showToast(t("users.msg_password_empty"));
                 return;
             }
-            
+
             const res = await fetchAPI("/api/admin/users/reset-password", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ username: targetUsername, password: newPassword })
             });
-            
+
             if (res && res.ok) {
-                showToast("비밀번호가 성공적으로 변경되었습니다.");
+                showToast(t("users.msg_password_changed"));
             } else {
-                showToast("비밀번호 변경 실패: " + (res ? res.error : "알 수 없는 오류"));
+                showToast(t("users.msg_password_change_failed_prefix") + (res ? res.error : t("common.unknown_error")));
             }
         }
 
@@ -1829,17 +2046,17 @@ def dashboard_page_view(request):
             const passwordInput = document.getElementById("newPassword");
             const nameInput = document.getElementById("newName");
             const emailInput = document.getElementById("newEmail");
-            
+
             const newUsername = usernameInput.value.trim();
             const newPassword = passwordInput.value.trim();
             const newName = nameInput.value.trim();
             const newEmail = emailInput.value.trim();
-            
+
             if (!newUsername || !newPassword) {
-                showToast("아이디와 비밀번호를 모두 입력해 주세요.");
+                showToast(t("users.msg_create_missing_fields"));
                 return;
             }
-            
+
             const res = await fetchAPI("/api/admin/users/create", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -1852,82 +2069,162 @@ def dashboard_page_view(request):
             });
             
             if (res && res.ok) {
-                showToast(`사용자 '${newUsername}'이(가) 성공적으로 생성되었습니다.`);
+                showToast(t("users.msg_create_success", { username: newUsername }));
                 usernameInput.value = "";
                 passwordInput.value = "";
                 nameInput.value = "";
                 emailInput.value = "";
                 loadUsersList(1);
             } else {
-                showToast("사용자 생성 실패: " + (res ? res.error : "알 수 없는 오류"));
+                showToast(t("users.msg_create_failed_prefix") + (res ? res.error : t("common.unknown_error")));
             }
         }
 
-        async function resetUserToken(targetUsername) {
+        // 디바이스(gRPC 동기화 토큰) 관리 -- 마이페이지의 "내 디바이스" 목록과 관리자의 사용자별
+        // 디바이스 관리 모달이 동일한 로직을 공유한다 (조회 URL/폐기 URL만 다름).
+        async function loadDeviceList(tbodyId, apiUrl, revokeUrl) {
+            const tbody = document.getElementById(tbodyId);
+            tbody.innerHTML = `<tr><td colspan="3" class="empty-state">${t("common.loading")}</td></tr>`;
+
+            const data = await fetchAPI(apiUrl);
+            tbody.innerHTML = "";
+
+            if (data && data.devices && data.devices.length > 0) {
+                data.devices.forEach(d => {
+                    const tr = document.createElement("tr");
+                    const created = d.created_at_ms ? new Date(d.created_at_ms).toLocaleString() : "-";
+                    tr.innerHTML = `
+                        <td>${d.device_name || t("devices.unnamed")}</td>
+                        <td>${created}</td>
+                        <td><button class="btn-sm" onclick="revokeDevice('${revokeUrl}', '${d.token}', '${tbodyId}', '${apiUrl}')" style="border-color: var(--error-red); color: var(--error-red); background: transparent;">${t("devices.button_revoke")}</button></td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } else {
+                tbody.innerHTML = `<tr><td colspan="3" class="empty-state">${t("devices.empty")}</td></tr>`;
+            }
+        }
+
+        async function revokeDevice(revokeUrl, token, tbodyId, apiUrl) {
             const confirmed = await showM3Confirm(
-                "인증 토큰 강제 재발급",
-                `사용자 '${targetUsername}'의 인증 토큰을 정말로 강제 재발급하시겠습니까?\n재발급 시 기존 클라이언트의 동기화 세션이 만료되어 새 토큰으로 다시 설정해야 합니다.`,
-                "재발급",
+                t("devices.confirm_title"),
+                t("devices.confirm_content"),
+                t("devices.button_revoke"),
                 true
             );
             if (!confirmed) return;
-            
-            const res = await fetchAPI("/api/admin/users/reset-token", {
+
+            const res = await fetchAPI(revokeUrl, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ username: targetUsername })
+                body: JSON.stringify({ token })
             });
-            
+
             if (res && res.ok) {
-                showToast(`토큰이 성공적으로 재발급되었습니다.\n새 토큰: ${res.token}`);
-                loadUsersList(currentUsersPage);
+                showToast(t("devices.msg_revoke_success"));
+                loadDeviceList(tbodyId, apiUrl, revokeUrl);
             } else {
-                showToast("토큰 재발급 실패: " + (res ? res.error : "알 수 없는 오류"));
+                showToast(t("devices.msg_revoke_failed_prefix") + (res ? res.error : t("common.unknown_error")));
             }
+        }
+
+        function loadMyDevices() {
+            loadDeviceList("myDevicesTableBody", "/api/user/devices", "/api/user/devices/delete");
+        }
+
+        function openDeviceModal(targetUsername) {
+            document.getElementById("deviceModalUsername").innerText = targetUsername;
+            const overlay = document.getElementById("deviceModalOverlay");
+            overlay.style.display = "flex";
+            setTimeout(() => overlay.classList.add("show"), 10);
+            loadDeviceList(
+                "deviceModalTableBody",
+                `/api/admin/users/${encodeURIComponent(targetUsername)}/devices`,
+                `/api/admin/users/${encodeURIComponent(targetUsername)}/devices/delete`
+            );
+        }
+
+        function closeDeviceModal() {
+            const overlay = document.getElementById("deviceModalOverlay");
+            overlay.classList.remove("show");
+            setTimeout(() => { overlay.style.display = "none"; }, 250);
         }
 
         // 초기 로드
         loadDashboardStats();
     </script>
-    <div id="m3DialogOverlay" class="dialog-overlay" style="display: none;">
-        <div class="dialog-card">
-            <h2 class="dialog-title" id="dialogTitle">삭제 확인</h2>
-            <div class="dialog-content" id="dialogContent">정말로 삭제하시겠습니까?</div>
-            <div id="dialogInputContainer" class="dialog-input-container" style="display: none;">
-                <input type="password" id="dialogInput" class="dialog-input" placeholder="새 비밀번호 입력">
+    <div id="deviceModalOverlay" class="dialog-overlay" style="display: none;">
+        <div class="dialog-card" style="width: 640px;">
+            <h2 class="dialog-title">""")
+    parts.append(t('devices.button_manage', lang))
+    parts.append(""" (<span id="deviceModalUsername"></span>)</h2>
+            <div class="dialog-content" style="max-height: 360px; overflow-y: auto;">
+                <table id="deviceModalTable">
+                    <thead>
+                        <tr>
+                            <th>""")
+    parts.append(t('devices.col_name', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('devices.col_created', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('common.col_actions', lang))
+    parts.append("""</th>
+                        </tr>
+                    </thead>
+                    <tbody id="deviceModalTableBody">
+                        <tr><td colspan="3" class="empty-state">""")
+    parts.append(t('common.loading', lang))
+    parts.append("""</td></tr>
+                    </tbody>
+                </table>
             </div>
             <div class="dialog-actions">
-                <button class="dialog-btn dialog-btn-text" id="dialogCancelBtn">취소</button>
-                <button class="dialog-btn dialog-btn-filled" id="dialogConfirmBtn">확인</button>
+                <button class="dialog-btn dialog-btn-text" onclick="closeDeviceModal()">""")
+    parts.append(t('common.button_close', lang))
+    parts.append("""</button>
+            </div>
+        </div>
+    </div>
+    <div id="m3DialogOverlay" class="dialog-overlay" style="display: none;">
+        <div class="dialog-card">
+            <h2 class="dialog-title" id="dialogTitle">""")
+    parts.append(t('common.dialog_title_default', lang))
+    parts.append("""</h2>
+            <div class="dialog-content" id="dialogContent">""")
+    parts.append(t('common.dialog_content_default', lang))
+    parts.append('</div>\n            <div id="dialogInputContainer" class="dialog-input-container" style="display: none;">\n                <input type="password" id="dialogInput" class="dialog-input" placeholder="')
+    parts.append(t('users.placeholder_new_password', lang))
+    parts.append("""">
+            </div>
+            <div class="dialog-actions">
+                <button class="dialog-btn dialog-btn-text" id="dialogCancelBtn">""")
+    parts.append(t('common.button_cancel', lang))
+    parts.append("""</button>
+                <button class="dialog-btn dialog-btn-filled" id="dialogConfirmBtn">""")
+    parts.append(t('common.button_confirm', lang))
+    parts.append("""</button>
             </div>
         </div>
     </div>
     <div id="toastContainer" class="toast-container"></div>
 </body>
-</html>"""
+</html>""")
+    html = "".join(parts)
     return Response(html, content_type="text/html")
 
-@view_config(route_name='admin_vaults', renderer='json')
+@view_config(route_name='admin_vaults', renderer='json', permission='authenticated')
 def admin_vaults_view(request):
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-
     # No admin bypass, intentionally: even the existence/name of another user's vault isn't
     # admin's to see, only their own.
-    vaults = request.repository.get_vaults_by_owner(user_info["username"])
+    vaults = request.repository.get_vaults_by_owner(request.identity["username"])
     return {"vaults": vaults}
 
-@view_config(route_name='admin_vault_files', renderer='json')
+@view_config(route_name='admin_vault_files', renderer='json', permission='vault-access')
 def admin_vault_files_view(request):
-    vault_id = request.matchdict.get("vault_id")
-    auth_res = verify_vault_ownership(request, vault_id)
-    if auth_res is None:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-    if auth_res is False:
-        return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
-
-    files_meta = request.repository.load_all(vault_id)
+    vault_id = request.context.vault_id
+    files_meta = request.repository.load_all(request.context.owner, vault_id)
     files_list = []
     for path, meta in files_meta.items():
         files_list.append({
@@ -1939,12 +2236,9 @@ def admin_vault_files_view(request):
         })
     return {"files": files_list}
 
-@view_config(route_name='admin_published', renderer='json')
+@view_config(route_name='admin_published', renderer='json', permission='authenticated')
 def admin_published_view(request):
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-
+    user_info = request.identity
     data_dir = request.registry.settings.get("data_dir")
     pub_dir = os.path.join(data_dir, "published")
     sites = []
@@ -1956,13 +2250,11 @@ def admin_published_view(request):
                     if os.path.isdir(os.path.join(user_path, item)):
                         # Admin sees every published site here -- unlike private vault content,
                         # published sites are already publicly viewable on the web, so there's
-                        # nothing extra being exposed by this listing.
-                        if user_info["is_admin"]:
+                        # nothing extra being exposed by this listing. The directory layout
+                        # (published/{owner}/{vault_id}) already encodes ownership, so no extra
+                        # lookup is needed for the non-admin case either.
+                        if user_info["is_admin"] or user_dir == user_info["username"]:
                             sites.append({"id": item, "username": user_dir})
-                        else:
-                            owner = request.repository.get_vault_owner(item)
-                            if user_dir == user_info["username"] or owner == user_info["username"]:
-                                sites.append({"id": item, "username": user_dir})
     return {"published_sites": sites}
 
 import hashlib
@@ -1983,7 +2275,7 @@ def verify_password(password: str, stored: str) -> bool:
     except Exception:
         return False
 
-@view_config(route_name='user_login', renderer='json')
+@view_config(route_name='user_login', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def user_login_view(request):
     try:
         body = request.json_body
@@ -2000,20 +2292,18 @@ def user_login_view(request):
         admin_password = os.getenv("ADMIN_PASSWORD")
         if admin_user and admin_password and username == admin_user:
             if password == admin_password:
-                # "token" is this account's web-dashboard token (users.token); "device_token" is a
-                # freshly minted, independent gRPC sync credential for whichever client just logged
-                # in -- logging in again from a different device doesn't invalidate earlier ones.
-                admin_row = request.repository.get_user_by_username(admin_user)
-                web_token = admin_row["token"] if admin_row else None
-                if not web_token:
-                    web_token = secrets.token_hex(32)
-                    request.repository.update_user_token(admin_user, web_token)
-                device_token = secrets.token_hex(32)
-                request.repository.create_device_token(device_token, admin_user, device_name, int(time.time() * 1000))
+                # One device_tokens row per login -- it's the only credential in the system now.
+                # The browser gets it as an HttpOnly cookie; it's also returned in the JSON body
+                # so the Obsidian "Log in" deep-link flow can hand it off via the
+                # obsidian://pumice-auth redirect. Logging in again from another
+                # device/browser doesn't invalidate earlier sessions -- each is its own row,
+                # individually revocable from the device management UI.
+                session_token = secrets.token_hex(32)
+                request.repository.create_device_token(session_token, admin_user, device_name, int(time.time() * 1000))
+                set_session_cookie(request, session_token)
                 logger.info(f"Successful admin login for user '{username}' via environment variables.")
                 return {
-                    "token": web_token,
-                    "device_token": device_token,
+                    "device_token": session_token,
                     "email": admin_user,
                     "name": "Administrator",
                     "username": admin_user,
@@ -2022,7 +2312,7 @@ def user_login_view(request):
             else:
                 logger.warning(f"Failed admin login attempt for user '{username}': password mismatch.")
                 return Response(body=json.dumps({"error": "Invalid email or password"}).encode("utf-8"), status=401, content_type="application/json")
-            
+
         # Look up the user in the DB -- accounts are provisioned by an admin only
         # (POST /api/admin/users/create), no self-service signup here.
         user = request.repository.get_user_by_username(username)
@@ -2036,23 +2326,14 @@ def user_login_view(request):
             logger.warning(f"Failed login attempt for user '{username}': password mismatch.")
             return Response(body=json.dumps({"error": "Invalid email or password"}).encode("utf-8"), status=401, content_type="application/json")
 
-        token = user["token"]
-        # Regenerate and assign a new token if it's empty
-        if not token:
-            token = secrets.token_hex(32)
-            request.repository.update_user_token(username, token)
-
         logger.info(f"Successful login for user '{username}'.")
 
-        # "token" above is this account's web-dashboard token (users.token); "device_token" is a
-        # freshly minted, independent gRPC sync credential for whichever client just logged in --
-        # logging in again from a different device doesn't invalidate earlier ones.
-        device_token = secrets.token_hex(32)
-        request.repository.create_device_token(device_token, username, device_name, int(time.time() * 1000))
+        session_token = secrets.token_hex(32)
+        request.repository.create_device_token(session_token, username, device_name, int(time.time() * 1000))
+        set_session_cookie(request, session_token)
 
         return {
-            "token": token,
-            "device_token": device_token,
+            "device_token": session_token,
             "username": user.get("username"),
             "email": user.get("email") or user.get("username"),
             "name": user.get("name") or user.get("username").split("@")[0],
@@ -2062,15 +2343,15 @@ def user_login_view(request):
         logger.error(f"User login process failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='get_token_info', renderer='json')
+@view_config(route_name='get_token_info', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def get_token_info(request):
-    # This route isn't in token_auth_tween's bypass list, so reaching this point means the token is
-    # already valid — when the client builds the publish site URL (/publish/{username}/{vault}/...),
-    # it needs to use the username the server actually recognizes, not the userName setting (a
-    # free-text display label the user can type anything into), or the path won't line up. With the
-    # master admin token, this resolves to the ADMIN_USER env var (or "admin" if unset), which can
-    # differ from the client's display name.
-    user_info = get_authenticated_user(request)
+    # Deliberately public/tolerant of a missing or invalid token -- callers use this to probe
+    # whether their current credential is still good (authorized: false is a normal response,
+    # not an error). When it IS valid, the client builds the publish site URL
+    # (/publish/{username}/{vault}/...) using the username the server actually recognizes, not
+    # the userName setting (a free-text display label the user can type anything into), or the
+    # path won't line up.
+    user_info = request.identity
     return {
         "authorized": user_info is not None,
         "username": user_info["username"] if user_info else None,
@@ -2079,21 +2360,15 @@ def get_token_info(request):
     }
 
 # 1. API for looking up a file's backup version history
-@view_config(route_name='get_history', renderer='json')
+@view_config(route_name='get_history', renderer='json', permission='vault-access')
 def get_history_view(request):
-    vault_id = request.params.get("vault_id")
+    vault_id = request.context.vault_id
     path = request.params.get("path")
-    if not vault_id or not path:
+    if not path:
         return Response(body=json.dumps({"error": "Missing vault_id or path"}).encode("utf-8"), status=400, content_type="application/json")
-        
-    auth_res = verify_vault_ownership(request, vault_id)
-    if auth_res is None:
-        return Response(body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), status=401, content_type="application/json")
-    if auth_res is False:
-        return Response(body=json.dumps({"error": "Forbidden"}).encode("utf-8"), status=403, content_type="application/json")
 
     try:
-        history_rows = request.repository.get_history(vault_id, path)
+        history_rows = request.repository.get_history(request.context.owner, vault_id, path)
         versions = []
         for row in history_rows:
             versions.append({
@@ -2112,22 +2387,15 @@ def get_history_view(request):
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
 # 2. API for downloading a specific version's file (binary response)
-@view_config(route_name='download_history')
+@view_config(route_name='download_history', permission='vault-access')
 def download_history_view(request):
-    vault_id = request.params.get("vault_id")
     history_id_str = request.params.get("history_id")
-    if not vault_id or not history_id_str:
+    if not history_id_str:
         return Response("Missing vault_id or history_id", status=400)
-        
-    auth_res = verify_vault_ownership(request, vault_id)
-    if auth_res is None:
-        return Response("Unauthorized", status=401)
-    if auth_res is False:
-        return Response("Forbidden", status=403)
 
     try:
         history_id = int(history_id_str)
-        row = request.repository.get_history_by_id(history_id)
+        row = request.repository.get_history_by_id(request.context.owner, history_id)
         if not row:
             return Response("History version not found", status=404)
             
@@ -2148,35 +2416,29 @@ def download_history_view(request):
         return Response(str(e), status=500)
 
 # 3. API for restoring a server-side file to a specific version (POST)
-@view_config(route_name='restore_history', renderer='json')
+@view_config(route_name='restore_history', renderer='json', permission='vault-access')
 def restore_history_view(request):
     try:
+        vault_id = request.context.vault_id
         body = request.json_body
-        vault_id = body.get("vault_id")
         history_id = body.get("history_id")
         req_path = body.get("path", "")
-        
-        if not vault_id or history_id is None:
-            return Response(body=json.dumps({"error": "Missing vault_id or history_id"}).encode("utf-8"), status=400, content_type="application/json")
-            
-        auth_res = verify_vault_ownership(request, vault_id)
-        if auth_res is None:
-            return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-        if auth_res is False:
-            return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
 
-        row = request.repository.get_history_by_id(history_id)
+        if history_id is None:
+            return Response(body=json.dumps({"error": "Missing vault_id or history_id"}).encode("utf-8"), status=400, content_type="application/json")
+
+        row = request.repository.get_history_by_id(request.context.owner, history_id)
         if not row:
             return {"ok": False, "error": "History version not found"}
-            
+
         backup_file_path = row["backup_file_path"]
         if not os.path.exists(backup_file_path):
             return {"ok": False, "error": "Backup file not found on disk"}
-            
+
         target_path = req_path if req_path else row["path"]
-        
+
         data_dir = request.registry.settings.get("data_dir")
-        vault_path = get_vault_path(data_dir, vault_id)
+        vault_path = get_vault_path(data_dir, request.context.owner, vault_id)
         dest_file_path = os.path.join(vault_path, target_path)
         
         if not dest_file_path.startswith(os.path.abspath(vault_path)):
@@ -2198,13 +2460,14 @@ def restore_history_view(request):
             "content_hash": row["content_hash"],
             "is_deleted": False
         }
-        request.repository.save_one(vault_id, target_path, meta)
-        
+        request.repository.save_one(request.context.owner, vault_id, target_path, meta)
+
         try:
             device_name = unquote(request.headers.get("X-Device-Name", "Unknown Device"))
             user_name = unquote(request.headers.get("X-User-Name", "Unknown User"))
-            
+
             request.repository.add_history(
+                owner_username=request.context.owner,
                 vault_id=vault_id,
                 path=target_path,
                 modified_at_ms=current_mtime_ms,
@@ -2559,32 +2822,14 @@ def get_beautiful_html(username: str, vault_id: str, path: str, html_content: st
 </html>
 """
 
-@view_config(route_name='publish_list', renderer='json')
+@view_config(route_name='publish_list', renderer='json', permission='vault-access')
 def publish_list_view(request):
     try:
-        vault_id = None
-        try:
-            body = request.json_body
-            vault_id = body.get("id") or body.get("obs-id")
-        except Exception:
-            pass
-
-        if not vault_id:
-            vault_id = request.headers.get("obs-id")
-
-        if not vault_id:
-            return Response(body=json.dumps({"error": "Missing obs-id header"}).encode("utf-8"), status=400, content_type="application/json")
-
-        auth_res = verify_vault_ownership(request, vault_id)
-        if auth_res is None:
-            return Response(body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), status=401, content_type="application/json")
-        if auth_res is False:
-            return Response(body=json.dumps({"error": "Forbidden"}).encode("utf-8"), status=403, content_type="application/json")
-
-        files = request.repository.get_published_files(vault_id)
+        vault_id = request.context.vault_id
+        files = request.repository.get_published_files(request.context.owner, vault_id)
 
         data_dir = request.registry.settings.get("data_dir")
-        published_base = os.path.join(data_dir, "published", vault_id)
+        published_base = os.path.join(data_dir, "published", request.context.owner, vault_id)
 
         enriched_files = []
         for f in files:
@@ -2612,27 +2857,21 @@ def publish_list_view(request):
         logger.error(f"HTTP publish_list failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_upload', renderer='json')
+@view_config(route_name='publish_upload', renderer='json', permission='vault-access')
 def publish_upload_view(request):
     try:
-        vault_id = request.headers.get("obs-id")
+        vault_id = request.context.vault_id
         obs_path_enc = request.headers.get("obs-path")
         obs_hash = request.headers.get("obs-hash")
-        
-        if not vault_id or not obs_path_enc or not obs_hash:
+
+        if not obs_path_enc or not obs_hash:
             return Response(body=json.dumps({"error": "Missing obs-id, obs-path or obs-hash header"}).encode("utf-8"), status=400, content_type="application/json")
-            
-        auth_res = verify_vault_ownership(request, vault_id)
-        if auth_res is None:
-            return Response(body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), status=401, content_type="application/json")
-        if auth_res is False:
-            return Response(body=json.dumps({"error": "Forbidden"}).encode("utf-8"), status=403, content_type="application/json")
 
         path = unquote(obs_path_enc)
-        
+
         # File storage location: data_dir/published/username/vault_id/path
         data_dir = request.registry.settings.get("data_dir")
-        username = auth_res["username"]
+        username = request.context.owner
         published_base = os.path.abspath(os.path.join(data_dir, "published", username, vault_id))
         dest_file_path = os.path.abspath(os.path.join(published_base, path))
         
@@ -2645,7 +2884,7 @@ def publish_upload_view(request):
         with open(dest_file_path, "wb") as f:
             f.write(body_data)
             
-        request.repository.add_published_file(vault_id, path, obs_hash)
+        request.repository.add_published_file(request.context.owner, vault_id, path, obs_hash)
         logger.info(f"Published file saved: vault={vault_id}, path={path}, hash={obs_hash}")
         
         return {"ok": True}
@@ -2653,26 +2892,18 @@ def publish_upload_view(request):
         logger.error(f"HTTP publish_upload failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_remove', renderer='json')
+@view_config(route_name='publish_remove', renderer='json', permission='vault-access')
 def publish_remove_view(request):
     try:
         # Obsidian Publish format: JSON body {path, id, token}
         body = request.json_body
         path = body.get("path")
-        vault_id = body.get("id") or request.headers.get("obs-id")
-        if not vault_id:
-            return Response(body=json.dumps({"error": "Missing id in body"}).encode("utf-8"), status=400, content_type="application/json")
+        vault_id = request.context.vault_id
         if not path:
             return Response(body=json.dumps({"error": "Missing path in body"}).encode("utf-8"), status=400, content_type="application/json")
-            
-        auth_res = verify_vault_ownership(request, vault_id)
-        if auth_res is None:
-            return Response(body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), status=401, content_type="application/json")
-        if auth_res is False:
-            return Response(body=json.dumps({"error": "Forbidden"}).encode("utf-8"), status=403, content_type="application/json")
 
         data_dir = request.registry.settings.get("data_dir")
-        username = auth_res["username"]
+        username = request.context.owner
         published_base = os.path.abspath(os.path.join(data_dir, "published", username, vault_id))
         dest_file_path = os.path.abspath(os.path.join(published_base, path))
         
@@ -2689,7 +2920,7 @@ def publish_remove_view(request):
             except Exception:
                 pass
                 
-        request.repository.remove_published_file(vault_id, path)
+        request.repository.remove_published_file(request.context.owner, vault_id, path)
         logger.info(f"Published file removed: vault={vault_id}, path={path}")
         
         return {"ok": True}
@@ -2697,23 +2928,17 @@ def publish_remove_view(request):
         logger.error(f"HTTP publish_remove failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_download')
+@view_config(route_name='publish_download', permission='vault-access')
 def publish_download_view(request):
     try:
         body = request.json_body
-        vault_id = body.get("id")
+        vault_id = request.context.vault_id
         file_path = body.get("path")
-        if not vault_id or not file_path:
+        if not file_path:
             return Response("Missing id or path", status=400)
 
-        auth_res = verify_vault_ownership(request, vault_id)
-        if auth_res is None:
-            return Response("Unauthorized", status=401)
-        if auth_res is False:
-            return Response("Forbidden", status=403)
-
         data_dir = request.registry.settings.get("data_dir")
-        username = auth_res["username"]
+        username = request.context.owner
         published_base = os.path.abspath(os.path.join(data_dir, "published", username, vault_id))
         dest_file_path = os.path.abspath(os.path.join(published_base, file_path))
 
@@ -2738,7 +2963,7 @@ def get_index_html(username: str, vault_id: str, files: list) -> str:
     )
     return get_beautiful_html(username, vault_id, "", f"<h1>{vault_id}</h1><ul>{items}</ul>" if items else f"<h1>{vault_id}</h1><p>게시된 파일이 없습니다.</p>")
 
-@view_config(route_name='publish_view')
+@view_config(route_name='publish_view', permission=NO_PERMISSION_REQUIRED)
 def publish_view(request):
     username = request.matchdict.get("username")
     vault_id = request.matchdict.get("vault_id")
@@ -2807,25 +3032,23 @@ def publish_view(request):
     return Response(full_html, content_type="text/html")
 
 
-@view_config(route_name='publish_slugs', renderer='json')
+@view_config(route_name='publish_slugs', renderer='json', permission='authenticated')
 def publish_slugs_view(request):
     try:
         body = request.json_body
         ids = body.get("ids", [])
+        owner = request.identity["username"]
         data_dir = request.registry.settings.get("data_dir")
         result = {}
         for vault_id in ids:
-            auth_res = verify_vault_ownership(request, vault_id)
-            if not auth_res:
-                continue
-            site = load_publish_meta(data_dir, vault_id, "site.json", {})
+            site = load_publish_meta(data_dir, owner, vault_id, "site.json", {})
             result[vault_id] = site.get("slug", vault_id)
         return result
     except Exception as e:
         logger.error(f"HTTP publish_slugs failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_site', renderer='json')
+@view_config(route_name='publish_site', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def publish_site_view(request):
     try:
         body = {}
@@ -2839,66 +3062,58 @@ def publish_site_view(request):
 
         data_dir = request.registry.settings.get("data_dir")
         meta_root = os.path.join(data_dir, "publish_meta")
+        # A public lookup by slug, with no owner known in advance -- has to walk both levels of
+        # publish_meta/{owner}/{vault_id}/.
         if os.path.isdir(meta_root):
-            for vault_id in os.listdir(meta_root):
-                vault_meta_dir = os.path.join(meta_root, vault_id)
-                if not os.path.isdir(vault_meta_dir):
+            for owner in os.listdir(meta_root):
+                owner_meta_dir = os.path.join(meta_root, owner)
+                if not os.path.isdir(owner_meta_dir):
                     continue
-                site = load_publish_meta(data_dir, vault_id, "site.json", {})
-                if site.get("slug") == slug:
-                    return {"id": vault_id, "slug": slug, "host": site.get("host", "")}
+                for vault_id in os.listdir(owner_meta_dir):
+                    vault_meta_dir = os.path.join(owner_meta_dir, vault_id)
+                    if not os.path.isdir(vault_meta_dir):
+                        continue
+                    site = load_publish_meta(data_dir, owner, vault_id, "site.json", {})
+                    if site.get("slug") == slug:
+                        return {"id": vault_id, "slug": slug, "host": site.get("host", "")}
 
         return Response(body=json.dumps({"error": "Not found"}).encode("utf-8"), status=404, content_type="application/json")
     except Exception as e:
         logger.error(f"HTTP publish_site failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_customurl', renderer='json')
+@view_config(route_name='publish_customurl', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def publish_customurl_view(request):
     return {"url": "", "redirect": False}
 
-@view_config(route_name='publish_slug', renderer='json')
+@view_config(route_name='publish_slug', renderer='json', permission='vault-access')
 def publish_slug_view(request):
     try:
         body = request.json_body
-        vault_id = body.get("id")
+        vault_id = request.context.vault_id
         host = body.get("host", "")
         slug = body.get("slug", "")
-        if not vault_id:
-            return Response(body=json.dumps({"error": "Missing id"}).encode("utf-8"), status=400, content_type="application/json")
-
-        auth_res = verify_vault_ownership(request, vault_id)
-        if auth_res is None:
-            return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-        if auth_res is False:
-            return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
 
         data_dir = request.registry.settings.get("data_dir")
-        site = load_publish_meta(data_dir, vault_id, "site.json", {})
+        owner = request.context.owner
+        site = load_publish_meta(data_dir, owner, vault_id, "site.json", {})
         site["slug"] = slug
         site["host"] = host
-        save_publish_meta(data_dir, vault_id, "site.json", site)
+        save_publish_meta(data_dir, owner, vault_id, "site.json", site)
         return {"ok": True}
     except Exception as e:
         logger.error(f"HTTP publish_slug failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_password', renderer='json')
+@view_config(route_name='publish_password', renderer='json', permission='vault-access')
 def publish_password_view(request):
     try:
         body = request.json_body
-        vault_id = body.get("id")
-        if not vault_id:
-            return Response(body=json.dumps({"error": "Missing id"}).encode("utf-8"), status=400, content_type="application/json")
-
-        auth_res = verify_vault_ownership(request, vault_id)
-        if auth_res is None:
-            return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-        if auth_res is False:
-            return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
+        vault_id = request.context.vault_id
+        owner = request.context.owner
 
         data_dir = request.registry.settings.get("data_dir")
-        passwords = load_publish_meta(data_dir, vault_id, "passwords.json", [])
+        passwords = load_publish_meta(data_dir, owner, vault_id, "passwords.json", [])
 
         name = body.get("name")
         pw = body.get("pw")
@@ -2906,12 +3121,12 @@ def publish_password_view(request):
 
         if del_name:
             passwords = [p for p in passwords if p.get("name") != del_name]
-            save_publish_meta(data_dir, vault_id, "passwords.json", passwords)
+            save_publish_meta(data_dir, owner, vault_id, "passwords.json", passwords)
             return {"ok": True}
         elif name and pw:
             passwords = [p for p in passwords if p.get("name") != name]
             passwords.append({"name": name, "pw": pw})
-            save_publish_meta(data_dir, vault_id, "passwords.json", passwords)
+            save_publish_meta(data_dir, owner, vault_id, "passwords.json", passwords)
             return {"ok": True}
         else:
             # GET: return list without pw values
@@ -2921,22 +3136,12 @@ def publish_password_view(request):
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
 
-@view_config(route_name='publish_share_list', renderer='json')
+@view_config(route_name='publish_share_list', renderer='json', permission='vault-access')
 def publish_share_list_view(request):
     try:
-        body = request.json_body
-        vault_id = body.get("site_uid")
-        if not vault_id:
-            return Response(body=json.dumps({"error": "Missing site_uid"}).encode("utf-8"), status=400, content_type="application/json")
-
-        auth_res = verify_vault_ownership(request, vault_id)
-        if auth_res is None:
-            return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-        if auth_res is False:
-            return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
-
+        vault_id = request.context.vault_id
         data_dir = request.registry.settings.get("data_dir")
-        shares = load_publish_meta(data_dir, vault_id, "shares.json", [])
+        shares = load_publish_meta(data_dir, request.context.owner, vault_id, "shares.json", [])
         # Don't expose invite_code externally
         public_shares = [
             {"uid": s["uid"], "email": s["email"], "name": s.get("name", ""), "accepted": s.get("accepted", False)}
@@ -2947,23 +3152,18 @@ def publish_share_list_view(request):
         logger.error(f"HTTP publish_share_list failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_share_invite', renderer='json')
+@view_config(route_name='publish_share_invite', renderer='json', permission='vault-access')
 def publish_share_invite_view(request):
     try:
         body = request.json_body
-        vault_id = body.get("site_uid")
+        vault_id = request.context.vault_id
         email = body.get("email")
-        if not vault_id or not email:
+        if not email:
             return Response(body=json.dumps({"error": "Missing site_uid or email"}).encode("utf-8"), status=400, content_type="application/json")
 
-        auth_res = verify_vault_ownership(request, vault_id)
-        if auth_res is None:
-            return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-        if auth_res is False:
-            return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
-
         data_dir = request.registry.settings.get("data_dir")
-        shares = load_publish_meta(data_dir, vault_id, "shares.json", [])
+        owner = request.context.owner
+        shares = load_publish_meta(data_dir, owner, vault_id, "shares.json", [])
         new_share = {
             "uid": str(uuid.uuid4()),
             "email": email,
@@ -2972,37 +3172,32 @@ def publish_share_invite_view(request):
             "invite_code": str(uuid.uuid4()),
         }
         shares.append(new_share)
-        save_publish_meta(data_dir, vault_id, "shares.json", shares)
+        save_publish_meta(data_dir, owner, vault_id, "shares.json", shares)
         return {"ok": True}
     except Exception as e:
         logger.error(f"HTTP publish_share_invite failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_share_remove', renderer='json')
+@view_config(route_name='publish_share_remove', renderer='json', permission='vault-access')
 def publish_share_remove_view(request):
     try:
         body = request.json_body
-        vault_id = body.get("site_uid")
+        vault_id = request.context.vault_id
         share_uid = body.get("share_uid")
-        if not vault_id or not share_uid:
+        if not share_uid:
             return Response(body=json.dumps({"error": "Missing site_uid or share_uid"}).encode("utf-8"), status=400, content_type="application/json")
 
-        auth_res = verify_vault_ownership(request, vault_id)
-        if auth_res is None:
-            return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-        if auth_res is False:
-            return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
-
         data_dir = request.registry.settings.get("data_dir")
-        shares = load_publish_meta(data_dir, vault_id, "shares.json", [])
+        owner = request.context.owner
+        shares = load_publish_meta(data_dir, owner, vault_id, "shares.json", [])
         shares = [s for s in shares if s.get("uid") != share_uid]
-        save_publish_meta(data_dir, vault_id, "shares.json", shares)
+        save_publish_meta(data_dir, owner, vault_id, "shares.json", shares)
         return {"ok": True}
     except Exception as e:
         logger.error(f"HTTP publish_share_remove failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_share_accept', renderer='json')
+@view_config(route_name='publish_share_accept', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def publish_share_accept_view(request):
     try:
         body = request.json_body
@@ -3012,42 +3207,43 @@ def publish_share_accept_view(request):
 
         data_dir = request.registry.settings.get("data_dir")
         meta_root = os.path.join(data_dir, "publish_meta")
+        # A public lookup by invite code, with no owner known in advance -- has to walk both
+        # levels of publish_meta/{owner}/{vault_id}/.
         if os.path.isdir(meta_root):
-            for vault_id in os.listdir(meta_root):
-                vault_meta_dir = os.path.join(meta_root, vault_id)
-                if not os.path.isdir(vault_meta_dir):
+            for owner in os.listdir(meta_root):
+                owner_meta_dir = os.path.join(meta_root, owner)
+                if not os.path.isdir(owner_meta_dir):
                     continue
-                shares = load_publish_meta(data_dir, vault_id, "shares.json", [])
-                changed = False
-                for s in shares:
-                    if s.get("invite_code") == code:
-                        s["accepted"] = True
-                        changed = True
-                if changed:
-                    save_publish_meta(data_dir, vault_id, "shares.json", shares)
-                    return {"ok": True}
+                for vault_id in os.listdir(owner_meta_dir):
+                    vault_meta_dir = os.path.join(owner_meta_dir, vault_id)
+                    if not os.path.isdir(vault_meta_dir):
+                        continue
+                    shares = load_publish_meta(data_dir, owner, vault_id, "shares.json", [])
+                    changed = False
+                    for s in shares:
+                        if s.get("invite_code") == code:
+                            s["accepted"] = True
+                            changed = True
+                    if changed:
+                        save_publish_meta(data_dir, owner, vault_id, "shares.json", shares)
+                        return {"ok": True}
 
         return Response(body=json.dumps({"error": "Invalid code"}).encode("utf-8"), status=404, content_type="application/json")
     except Exception as e:
         logger.error(f"HTTP publish_share_accept failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='user_logout', renderer='json')
+@view_config(route_name='user_logout', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def user_logout_view(request):
-    user_info = get_authenticated_user(request)
-    if user_info and not user_info["is_admin"]:
-        request.repository.update_user_token(user_info["username"], None)
-        logger.info(f"User '{user_info['username']}' logged out, token cleared.")
+    token = extract_token(request)
+    if token:
+        request.repository.delete_device_token(token)
+        logger.info("Session logged out.")
+    clear_session_cookie(request)
     return {"ok": True}
 
-@view_config(route_name='admin_users', renderer='json')
+@view_config(route_name='admin_users', renderer='json', permission='admin')
 def admin_users_view(request):
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-    if not user_info["is_admin"]:
-        return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
-        
     try:
         page = int(request.params.get("page", 1))
         limit = int(request.params.get("limit", 10))
@@ -3074,20 +3270,15 @@ def admin_users_view(request):
         "limit": limit
     }
 
-@view_config(route_name='admin_user_delete', renderer='json')
+@view_config(route_name='admin_user_delete', renderer='json', permission='admin')
 def admin_user_delete_view(request):
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-    if not user_info["is_admin"]:
-        return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
-        
+    user_info = request.identity
     try:
         body = request.json_body
         username_to_delete = body.get("username")
         if not username_to_delete:
             return Response(status=400, body=json.dumps({"error": "Missing username"}).encode("utf-8"), content_type="application/json")
-            
+
         if username_to_delete == user_info["username"]:
             return Response(status=400, body=json.dumps({"error": "Cannot delete currently logged in admin user"}).encode("utf-8"), content_type="application/json")
             
@@ -3098,21 +3289,16 @@ def admin_user_delete_view(request):
         logger.error(f"Failed to delete user: {e}")
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
 
-@view_config(route_name='admin_user_reset_password', renderer='json')
+@view_config(route_name='admin_user_reset_password', renderer='json', permission='admin')
 def admin_user_reset_password_view(request):
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-    if not user_info["is_admin"]:
-        return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
-        
+    user_info = request.identity
     try:
         body = request.json_body
         username = body.get("username")
         new_password = body.get("password")
         if not username or not new_password:
             return Response(status=400, body=json.dumps({"error": "Missing username or password"}).encode("utf-8"), content_type="application/json")
-            
+
         pw_hash = hash_password(new_password)
         request.repository.update_user_password(username, pw_hash)
         logger.info(f"Admin '{user_info['username']}' changed password for user '{username}'")
@@ -3121,14 +3307,9 @@ def admin_user_reset_password_view(request):
         logger.error(f"Failed to reset user password: {e}")
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
 
-@view_config(route_name='admin_user_create', renderer='json')
+@view_config(route_name='admin_user_create', renderer='json', permission='admin')
 def admin_user_create_view(request):
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-    if not user_info["is_admin"]:
-        return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
-        
+    user_info = request.identity
     try:
         body = request.json_body
         username = body.get("username")
@@ -3139,11 +3320,9 @@ def admin_user_create_view(request):
             return Response(status=400, body=json.dumps({"error": "Missing username or password"}).encode("utf-8"), content_type="application/json")
             
         pw_hash = hash_password(password)
-        token = secrets.token_hex(32)
         success = request.repository.create_user(
             username=username,
             password_hash=pw_hash,
-            token=token,
             name=name,
             email=email,
             is_admin=False
@@ -3156,35 +3335,62 @@ def admin_user_create_view(request):
         logger.error(f"Failed to create user: {e}")
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
 
-@view_config(route_name='admin_user_reset_token', renderer='json')
-def admin_user_reset_token_view(request):
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-    if not user_info["is_admin"]:
-        return Response(status=403, body=json.dumps({"error": "Forbidden"}).encode("utf-8"), content_type="application/json")
-        
+@view_config(route_name='admin_user_devices', renderer='json', permission='admin')
+def admin_user_devices_view(request):
+    target_username = request.matchdict.get("username")
+    devices = request.repository.list_device_tokens(target_username)
+    return {"devices": devices}
+
+@view_config(route_name='admin_user_device_delete', renderer='json', permission='admin')
+def admin_user_device_delete_view(request):
+    user_info = request.identity
+    target_username = request.matchdict.get("username")
     try:
         body = request.json_body
-        username = body.get("username")
-        if not username:
-            return Response(status=400, body=json.dumps({"error": "Missing username"}).encode("utf-8"), content_type="application/json")
-            
-        new_token = secrets.token_hex(32)
-        request.repository.update_user_token(username, new_token)
-        logger.info(f"Admin '{user_info['username']}' reset token for user '{username}'")
-        return {"ok": True, "token": new_token}
+        token = body.get("token")
+        if not token:
+            return Response(status=400, body=json.dumps({"error": "Missing token"}).encode("utf-8"), content_type="application/json")
+
+        device = request.repository.get_device_token(token)
+        if not device or device["username"] != target_username:
+            return Response(status=404, body=json.dumps({"error": "Device token not found"}).encode("utf-8"), content_type="application/json")
+
+        request.repository.delete_device_token(token)
+        logger.info(f"Admin '{user_info['username']}' revoked a device token for user '{target_username}'")
+        return {"ok": True}
     except Exception as e:
-        logger.error(f"Failed to reset token: {e}")
+        logger.error(f"Failed to revoke device token: {e}")
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
 
-@view_config(route_name='user_profile', renderer='json')
+@view_config(route_name='user_devices', renderer='json', permission='authenticated')
+def user_devices_view(request):
+    user_info = request.identity
+    devices = request.repository.list_device_tokens(user_info["username"])
+    return {"devices": devices}
+
+@view_config(route_name='user_device_delete', renderer='json', permission='authenticated')
+def user_device_delete_view(request):
+    user_info = request.identity
+    try:
+        body = request.json_body
+        token = body.get("token")
+        if not token:
+            return Response(status=400, body=json.dumps({"error": "Missing token"}).encode("utf-8"), content_type="application/json")
+
+        device = request.repository.get_device_token(token)
+        if not device or device["username"] != user_info["username"]:
+            return Response(status=404, body=json.dumps({"error": "Device token not found"}).encode("utf-8"), content_type="application/json")
+
+        request.repository.delete_device_token(token)
+        logger.info(f"User '{user_info['username']}' revoked their own device token.")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Failed to revoke own device token: {e}")
+        return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
+
+@view_config(route_name='user_profile', renderer='json', permission='authenticated')
 def user_profile_view(request):
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-        
-    username = user_info["username"]
+    username = request.identity["username"]
 
     # Look up the user in the DB (the env-var admin account has a real DB row too, created at
     # startup -- see main.py)
@@ -3196,39 +3402,12 @@ def user_profile_view(request):
         "username": user["username"],
         "name": user.get("name") or "",
         "email": user.get("email") or "",
-        "token": user.get("token") or "",
         "is_admin": bool(user.get("is_admin", False))
     }
 
-@view_config(route_name='user_profile_reset_token', renderer='json')
-def user_profile_reset_token_view(request):
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-        
-    username = user_info["username"]
-    
-    # Block the env-var admin from reissuing the master token
-    admin_user = os.getenv("ADMIN_USER") or "admin"
-    if username == admin_user:
-        return Response(status=400, body=json.dumps({"error": "Cannot reset default system administrator token from the UI."}).encode("utf-8"), content_type="application/json")
-        
-    try:
-        new_token = secrets.token_hex(32)
-        request.repository.update_user_token(username, new_token)
-        logger.info(f"User '{username}' reset their own API token.")
-        return {"ok": True, "token": new_token}
-    except Exception as e:
-        logger.error(f"Failed to reset user's own token: {e}")
-        return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
-
-@view_config(route_name='user_profile_update', renderer='json')
+@view_config(route_name='user_profile_update', renderer='json', permission='authenticated')
 def user_profile_update_view(request):
-    user_info = get_authenticated_user(request)
-    if not user_info:
-        return Response(status=401, body=json.dumps({"error": "Unauthorized"}).encode("utf-8"), content_type="application/json")
-        
-    username = user_info["username"]
+    username = request.identity["username"]
     
     # Block the env-var admin from editing their profile directly
     admin_user = os.getenv("ADMIN_USER") or "admin"
@@ -3270,12 +3449,22 @@ def create_pyramid_app(repository, data_dir):
     # Register a helper attribute so views can reach the DB repository via request.repository
     config.add_request_method(lambda r: r.registry.settings["repository"], "repository", reify=True)
 
-    # Add tweens: a tween added later runs on the outermost layer —
-    # add in the order token_auth → cors so cors (CORS preflight) runs first
-    config.add_tween("server.web.token_auth_tween_factory")
+    # Add tweens: a tween added later runs on the outermost layer
     config.add_tween("server.web.cors_tween_factory")
 
-    # Add routes
+    # Authorization (see the "Authorization (Pyramid ACL)" section above): every route requires
+    # at least a valid identity unless its view explicitly opts out with
+    # permission=NO_PERMISSION_REQUIRED -- secure by default, instead of the old tween's
+    # manually-maintained bypass list (easy to forget to update, and it silently defaulted to
+    # *open* rather than *closed*).
+    config.set_security_policy(DeviceTokenSecurityPolicy())
+    config.set_root_factory(RootFactory)
+    config.set_default_permission("authenticated")
+
+    # Add routes. Endpoints scoped to a single vault get VaultContext as their route factory,
+    # which resolves vault_id (from matchdict/params/obs-id header/JSON body, whichever that
+    # endpoint uses) and builds its ACL from ownership -- paired with permission='vault-access'
+    # on the view itself.
     config.add_route('ping', '/api/ping')
     config.add_route('login_page', '/login')
     config.add_route('dashboard_page', '/dashboard')
@@ -3283,35 +3472,37 @@ def create_pyramid_app(repository, data_dir):
     config.add_route('user_logout', '/user/logout')
     config.add_route('user_profile', '/api/user/profile')
     config.add_route('user_profile_update', '/api/user/profile/update')
-    config.add_route('user_profile_reset_token', '/api/user/profile/reset-token')
+    config.add_route('user_devices', '/api/user/devices')
+    config.add_route('user_device_delete', '/api/user/devices/delete')
     config.add_route('admin_users', '/api/admin/users')
     config.add_route('admin_user_create', '/api/admin/users/create')
-    config.add_route('admin_user_reset_token', '/api/admin/users/reset-token')
     config.add_route('admin_user_delete', '/api/admin/users/delete')
     config.add_route('admin_user_reset_password', '/api/admin/users/reset-password')
+    config.add_route('admin_user_devices', '/api/admin/users/{username}/devices')
+    config.add_route('admin_user_device_delete', '/api/admin/users/{username}/devices/delete')
     config.add_route('admin_vaults', '/api/admin/vaults')
-    config.add_route('admin_vault_files', '/api/admin/vaults/{vault_id}')
+    config.add_route('admin_vault_files', '/api/admin/vaults/{vault_id}', factory=VaultContext)
     config.add_route('admin_published', '/api/admin/published')
     config.add_route('get_token_info', '/api/token/info')
-    config.add_route('get_history', '/api/history')
-    config.add_route('download_history', '/api/history/download')
-    config.add_route('restore_history', '/api/history/restore')
-    config.add_route('publish_list', '/api/list')
-    config.add_route('publish_upload', '/api/upload')
-    config.add_route('publish_remove', '/api/remove')
-    config.add_route('publish_download', '/api/download')
+    config.add_route('get_history', '/api/history', factory=VaultContext)
+    config.add_route('download_history', '/api/history/download', factory=VaultContext)
+    config.add_route('restore_history', '/api/history/restore', factory=VaultContext)
+    config.add_route('publish_list', '/api/list', factory=VaultContext)
+    config.add_route('publish_upload', '/api/upload', factory=VaultContext)
+    config.add_route('publish_remove', '/api/remove', factory=VaultContext)
+    config.add_route('publish_download', '/api/download', factory=VaultContext)
     config.add_route('publish_slugs', '/api/slugs')
     config.add_route('publish_site', '/api/site')
     config.add_route('publish_customurl', '/api/customurl')
-    config.add_route('publish_slug', '/api/slug')
-    config.add_route('publish_password', '/api/password')
+    config.add_route('publish_slug', '/api/slug', factory=VaultContext)
+    config.add_route('publish_password', '/api/password', factory=VaultContext)
     # Register the specific /publish/share/* routes before the wildcard /publish/{vault_id}/{path:.*}
-    config.add_route('publish_share_list', '/publish/share/list')
-    config.add_route('publish_share_invite', '/publish/share/invite')
-    config.add_route('publish_share_remove', '/publish/share/remove')
+    config.add_route('publish_share_list', '/publish/share/list', factory=VaultContext)
+    config.add_route('publish_share_invite', '/publish/share/invite', factory=VaultContext)
+    config.add_route('publish_share_remove', '/publish/share/remove', factory=VaultContext)
     config.add_route('publish_share_accept', '/publish/share/accept')
     config.add_route('publish_view', '/publish/{username}/{vault_id}/{path:.*}')
-    
+
     # Scan for decorators (@view_config, etc.)
     config.scan(__name__)
     
