@@ -20,14 +20,14 @@ from twisted.internet import asyncioreactor
 asyncioreactor.install()
 from twisted.internet import reactor
 
-from server.service import SyncServiceServicer
-from server.grpc_web_resource import SyncServiceResource, RootResource
+from pumice_server.service import SyncServiceServicer
+from pumice_server.grpc_web_resource import SyncServiceResource, RootResource
 from twisted.web.wsgi import WSGIResource
 from twisted.web.server import Site
-from server.web import create_pyramid_app
+from pumice_server.web import create_pyramid_app
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("server.main")
+logger = logging.getLogger("pumice_server.main")
 
 from twisted.internet import task
 
@@ -78,7 +78,7 @@ def build_connection_url(db_type: str, data_dir: str) -> str:
 
 def main():
     import argparse
-    from server.repository import SqlAlchemyMetadataRepository
+    from pumice_server.repository import SqlAlchemyMetadataRepository
 
     env_http_port = int(os.getenv("HTTP_PORT", "8080"))
     env_data_dir = os.path.expanduser(os.getenv("DATA_DIR", "~/.obsidian-sync-server"))

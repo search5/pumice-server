@@ -5,7 +5,7 @@
 Self-hosted sync/version-history/publish backend for the [Pumice](https://github.com/search5/pumice)
 Obsidian plugin. Built on Python 3.13+ and Twisted (`asyncioreactor`): the sync RPCs (`Delta`,
 `UploadFiles`, `DownloadFiles`, ...) are served by a native gRPC-Web `Resource`
-(`src/server/grpc_web_resource.py`) driven directly off the reactor's event loop, and a Pyramid app
+(`src/pumice_server/grpc_web_resource.py`) driven directly off the reactor's event loop, and a Pyramid app
 handles the publish site, REST endpoints, and the web login/admin dashboard -- both share a single
 HTTP port.
 
@@ -125,7 +125,7 @@ caller's own identity -- so `permission='vault-access'` is really just "are you 
 
 The login and dashboard pages are translated server-side, negotiated per-request from the
 browser's `Accept-Language` header (`ko` or `en` today) — no client-side language switching.
-Translation strings live in `src/server/locale/{ko,en}.json`, not inline in `web.py`.
+Translation strings live in `src/pumice_server/locale/{ko,en}.json`, not inline in `web.py`.
 
 ## What it does
 

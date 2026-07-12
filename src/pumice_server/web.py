@@ -11,7 +11,7 @@ from pyramid.config import Configurator
 from pyramid.response import Response
 from pyramid.view import view_config
 
-logger = logging.getLogger("server.web")
+logger = logging.getLogger("pumice_server.web")
 
 # ─── i18n ────────────────────────────────────────────────────────────────
 # Locale is negotiated per-request from the browser's Accept-Language header --
@@ -3466,7 +3466,7 @@ def create_pyramid_app(repository, data_dir):
     config.add_request_method(lambda r: r.registry.settings["repository"], "repository", reify=True)
 
     # Add tweens: a tween added later runs on the outermost layer
-    config.add_tween("server.web.cors_tween_factory")
+    config.add_tween("pumice_server.web.cors_tween_factory")
 
     # Authorization (see the "Authorization (Pyramid ACL)" section above): every route requires
     # at least a valid identity unless its view explicitly opts out with

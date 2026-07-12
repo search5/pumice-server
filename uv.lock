@@ -305,6 +305,41 @@ wheels = [
 ]
 
 [[package]]
+name = "pumice-server"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "grpcio" },
+    { name = "grpcio-tools" },
+    { name = "i18nice" },
+    { name = "markdown" },
+    { name = "protobuf" },
+    { name = "psycopg2-binary" },
+    { name = "pymysql" },
+    { name = "pyramid" },
+    { name = "python-dotenv" },
+    { name = "sqlalchemy" },
+    { name = "sqlalchemy-cubrid" },
+    { name = "twisted" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "grpcio", specifier = ">=1.81.1" },
+    { name = "grpcio-tools", specifier = ">=1.81.1" },
+    { name = "i18nice", specifier = ">=0.16.0" },
+    { name = "markdown", specifier = ">=3.10.2" },
+    { name = "protobuf", specifier = ">=6.33.6" },
+    { name = "psycopg2-binary", specifier = ">=2.9" },
+    { name = "pymysql", specifier = ">=1.1" },
+    { name = "pyramid", specifier = ">=2.1" },
+    { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "sqlalchemy", specifier = ">=2.0" },
+    { name = "sqlalchemy-cubrid", git = "https://github.com/search5/sqlalchemy_cubrid" },
+    { name = "twisted", specifier = ">=26.4.0" },
+]
+
+[[package]]
 name = "pycubrid"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -349,41 +384,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
-]
-
-[[package]]
-name = "server"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "grpcio" },
-    { name = "grpcio-tools" },
-    { name = "i18nice" },
-    { name = "markdown" },
-    { name = "protobuf" },
-    { name = "psycopg2-binary" },
-    { name = "pymysql" },
-    { name = "pyramid" },
-    { name = "python-dotenv" },
-    { name = "sqlalchemy" },
-    { name = "sqlalchemy-cubrid" },
-    { name = "twisted" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "grpcio", specifier = ">=1.81.1" },
-    { name = "grpcio-tools", specifier = ">=1.81.1" },
-    { name = "i18nice", specifier = ">=0.16.0" },
-    { name = "markdown", specifier = ">=3.10.2" },
-    { name = "protobuf", specifier = ">=6.33.6" },
-    { name = "psycopg2-binary", specifier = ">=2.9" },
-    { name = "pymysql", specifier = ">=1.1" },
-    { name = "pyramid", specifier = ">=2.1" },
-    { name = "python-dotenv", specifier = ">=1.2.2" },
-    { name = "sqlalchemy", specifier = ">=2.0" },
-    { name = "sqlalchemy-cubrid", git = "https://github.com/search5/sqlalchemy_cubrid" },
-    { name = "twisted", specifier = ">=26.4.0" },
 ]
 
 [[package]]
