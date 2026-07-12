@@ -1,5 +1,7 @@
 # Pumice server
 
+🇺🇸 English | [🇰🇷 한국어](README.ko.md)
+
 Self-hosted sync/version-history/publish backend for the [Pumice](https://github.com/search5/pumice)
 Obsidian plugin. Built on Python 3.13+ and Twisted (`asyncioreactor`): the sync RPCs (`Delta`,
 `UploadFiles`, `DownloadFiles`, ...) are served by a native gRPC-Web `Resource`
