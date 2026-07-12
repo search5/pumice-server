@@ -138,3 +138,8 @@ Translation strings live in `src/server/locale/{ko,en}.json`, not inline in `web
   and the admin dashboard.
 - `/publish/{username}/{vault}/...` — the actual published site, rendering markdown on the fly
   (wikilinks resolved, YAML frontmatter stripped).
+
+## Support
+
+If you'd like to sponsor this project, reach out at search5@gmail.com. Sponsorships make a real
+difference in how much time can go into development.

@@ -1,7 +1,7 @@
 [project]
 name = "server"
 version = "0.1.0"
-description = "Add your description here"
+description = "Self-hosted sync/version-history/publish backend for the Pumice Obsidian plugin."
 readme = "README.md"
 authors = [
     { name = "Ji-ho Lee", email = "search5@gmail.com" }
@@ -21,6 +21,9 @@ dependencies = [
     "sqlalchemy-cubrid",
     "i18nice>=0.16.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/search5/pumice-server"
 
 [project.scripts]
 server = "server.main:main"
