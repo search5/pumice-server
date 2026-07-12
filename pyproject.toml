@@ -1,5 +1,5 @@
 [project]
-name = "server"
+name = "pumice-server"
 version = "0.1.0"
 description = "Self-hosted sync/version-history/publish backend for the Pumice Obsidian plugin."
 readme = "README.md"
@@ -31,6 +31,9 @@ server = "server.main:main"
 [build-system]
 requires = ["uv_build>=0.9.21,<0.10.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "server"
 
 [tool.uv.sources]
 sqlalchemy-cubrid = { git = "https://github.com/search5/sqlalchemy_cubrid" }
