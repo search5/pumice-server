@@ -157,80 +157,42 @@ Vault 범위의 라우트(퍼블리시, 버전 히스토리, 관리자의 vault�
 ## 스트리밍 업로드 (`UploadFilesStream`)
 
 `UploadFiles`(위)는 바디 바이트를 단 하나도 처리하기 전에 요청 바디 전체를 메모리에 버퍼링합니다
-(`grpc_web_resource.py`의 `request.content.read()`) — 지금 튜닝된 배치 크기에서는 문제없지만,
-훨씬 큰 단일 요청이 이 방식에 의존하게 둘 이유는 없습니다. `UploadFilesStream`은 같은 결과(파일이
-디스크에 기록되고, `UploadFiles`와 완전히 동일하게 해시 검증·백업·기록됨)를 내는 두 번째, 옵트인
-경로로, 바디 바이트가 도착하는 대로 점진적으로 파싱합니다 — `src/pumice_server/streaming.py`
-(`EnvelopeStreamParser`)와 `src/pumice_server/streaming_upload_resource.py`
-(`StreamingUploadRequest`/`StreamingUploadResource`)로 구현됨. 생성된 gRPC-Web 스텁이 아니라
-클라이언트의 손으로 짠 `fetch()` + envelope 프레이밍으로 호출됩니다 — 브라우저의 grpc-web/connect-es
-라이브러리는 애초에 client-streaming을 지원하지 않기 때문입니다.
+(`grpc_web_resource.py`의 `request.content.read()`) — 원래 의도한 배치 크기에서는 문제없지만,
+훨씬 큰 단일 요청이 이 방식에 의존할 이유는 없습니다. `UploadFilesStream`은 바디 바이트가 도착하는
+대로 점진적으로 파싱하는 옵트인 대안으로(`src/pumice_server/streaming.py`의
+`EnvelopeStreamParser`, `src/pumice_server/streaming_upload_resource.py`의
+`StreamingUploadRequest`/`StreamingUploadResource`), 파일이 디스크에 기록되고 `UploadFiles`와
+완전히 동일하게 해시 검증·백업·기록되며, 바디 전체를 메모리에 버퍼링하지 않습니다. 생성된 gRPC-Web
+스텁이 아니라 클라이언트가 직접 짠 `fetch()` + envelope 프레이밍으로 호출됩니다 — 브라우저의
+grpc-web/connect-es 라이브러리는 애초에 client-streaming을 지원하지 않기 때문입니다.
 
-독립 PoC(`/home/jiho/twisted-streaming-poc`, 테스트 28개)로 먼저 TDD로 만들고 실제 소켓까지
-검증한 뒤, 운영 관심사 3가지를 얹어 이식했습니다(`tests/test_streaming_upload_request.py`,
-`tests/test_upload_accumulator.py`, 테스트 17개 추가):
+보장하는 것들:
 
-- **스트리밍 시작 전 인증** — `Authorization` 헤더를 몸체 바이트가 파서에 단 1바이트도 전달되기
-  *전에* 디바이스/소유자 신원으로 해석합니다(Twisted가 `gotLength()`를 호출하는 시점엔 이미 헤더
-  전체가 파싱 완료된 상태 — 바디 바이트보다 먼저). 토큰이 없거나 잘못됐으면 맨 `401`만 응답하고
-  (공격자가 조작했을 수도 있는) 바디를 처리하기 전에 커넥션을 끊습니다.
+- **스트리밍 시작 전 인증** — `Authorization` 헤더를 바디 바이트가 파서에 단 1바이트도 전달되기
+  전에 디바이스/소유자 신원으로 해석합니다. 토큰이 없거나 잘못됐으면 맨 `401`만 응답하고 (공격자가
+  조작했을 수도 있는) 바디를 처리하기 전에 커넥션을 끊습니다.
 - **백프레셔** — 블로킹 작업(토큰 조회, 각 프레임의 디스크 I/O)이 진행되는 동안은 트랜스포트를
-  일시정지시켜(실제 TCP 트랜스포트에서는 `stopReading()`) 소켓에서 더 이상 읽지 않으므로, 빠르거나
-  악의적인 송신자가 실제로 디스크에 기록된 양보다 한없이 앞서서 큐를 쌓을 수 없습니다.
+  일시정지시켜, 빠르거나 악의적인 송신자가 실제로 디스크에 기록된 양보다 한없이 앞서서 큐를 쌓을 수
+  없습니다.
 - **블로킹 I/O 회피** — 토큰 조회와 모든 파일 I/O는 `twisted.internet.threads.deferToThread`를
   거칩니다 — `service.py`가 `UploadFiles`의 동일한 작업에 이미 쓰고 있는 `asyncio.to_thread`
-  관례와 맞춘 것입니다. 실측으로 확인함: 느리게 트리클되는 업로드 하나가 진행되는 동안 별도
-  커넥션으로 `Ping`을 259번 연속 호출해도 매번 5ms 미만으로 응답 — 업로드의 디스크 I/O 때문에
-  리액터가 멈추는 일이 없음을 확인했습니다.
-
-실제로 구동 중인 서버에 직접 붙여봐서만 발견된 버그도 하나 있습니다(`StringTransport` 기반
-테스트만으로는 안 보였음): 본문 전체가 아주 작아서 스레드 기반 인증 확인이 끝나기도 전에 다
-도착해버리는 요청은, `owner_username`이 아직 정해지지 않은 채로 `render()`까지 먼저 도달해버리는
-경합이 있었습니다 — `pauseProducing()`은 *앞으로의* 소켓 읽기만 막을 뿐, 현재 `dataReceived()`
-호출 안에서 이미 전달된 바이트에는 영향이 없기 때문입니다. `requestReceived()` 자체를 인증이 실제로
-끝날 때까지 미루도록 고쳐서 해결했고(`StreamingUploadRequest._onAuthResolved`/`_onAuthFailed`),
-회귀 테스트(`test_small_full_body_arriving_before_auth_resolves_does_not_race_render`)로 고정해
-뒀습니다. 같은 실측에서 발견된 두 번째 버그: 파일이 끝날 때마다 요청 도중에 ack를 바로 써버렸는데,
-이건 응답을 깨뜨립니다 — 이 앱 서버는 TLS/HTTP2를 직접 종단하지 않는 순수 HTTP/1.1 커넥션이라서,
-`Request.write()`를 Twisted API 상 아무리 일찍 호출할 수 있다 해도 요청 전체가 도착하기 전에는
-응답을 시작할 수 없기 때문입니다. 이제 ack는 버퍼링해뒀다가 `render_POST()`에서 한 번에 몰아서
-쓰도록 고쳤고, 이는 `UploadFiles`의 기존 "본문 전체 수신 후 ack" 동작과 정확히 일치합니다.
+  관례와 맞춘 것으로, 업로드 I/O 때문에 리액터가 멈추는 일이 없습니다.
 
 ### 타임아웃 & 관측성
 
-위 내용에 이어 추가한 운영 관심사 2가지(이 기능 전체 테스트 총 48개):
-
 - **인증 조회 타임아웃**(`AUTH_TIMEOUT_SECONDS = 10`) — DB 스레드 조회가 멈추면(풀 고갈, 데드락)
-  요청과 그 일시정지된 트랜스포트가 더 이상 무한정 대기하지 않습니다. `503`으로 응답하며, `401`("자격
-  증명이 틀림")과는 구분됩니다("서버가 너무 느렸음"). 단, `deferToThread`는 실제로 아직 블로킹 중인
-  워커 스레드를 인터럽트할 수 없으므로 이 Deferred가 더 이상 기다리지 않게 만들 뿐입니다.
-- **최대 업로드 시간 상한**(`MAX_UPLOAD_SECONDS = 600`) — Twisted 자체의 idle 타임아웃(아래 참고)은
-  바이트가 하나라도 도착할 때마다 리셋되므로, 절대 완전히 멈추지는 않지만 끝나지도 않는 slow-loris류
-  전송을 잡아내지 못합니다. 이건 활동 여부와 무관한 별도의 상한으로, `gotLength()`에서 예약하고 본문이
-  전부 도착하거나 다른 이유로 요청이 중단되면 취소합니다.
-- **전역 idle 타임아웃** — 알고 보니 이미 존재하고 있었습니다(`Site`/`HTTPFactory.__init__`이 기본값
-  `timeout=60`을 `buildProtocol()`을 통해 모든 `HTTPChannel`에 적용) — "타임아웃이 아예 없다"는 최초
-  가정을 검증 없이 믿지 않고 Twisted 소스를 직접 읽어 확인한 것입니다(처음엔 실제 인스턴스 값이 아니라
-  `HTTPChannel.timeOut`의 *클래스* 기본값을 확인하는 실수를 했습니다). 이제 `main.py`에 명시적으로
-  적어뒀습니다(`Site(root_resource, timeout=60)`) — 나중에 Twisted 기본값이 바뀌어도 암묵적으로
-  영향받지 않도록 문서화된 결정으로 남기기 위함입니다.
-- **메트릭**(`StreamingUploadMetrics`, 새 의존성 없음 — 기존 메트릭 스택 자체가 없음) — 활성/누적
-  업로드 수, 수신 바이트 수, 파일 성공/실패 카운트(실패는 사유별로: 잘못된 vault/경로, 임시파일 오류,
-  경로 불일치, 해시 불일치), 거부 카운트(인증 실패/타임아웃, 프레임 초과, 프레임 손상, 최대 시간 초과),
-  백프레셔 일시정지 빈도/누적 시간. `GET /api/admin/streaming-stats`(`permission='admin'`, 기존 admin
-  API 관례와 동일)와 5분 주기 로그 요약(`main.py`의 `log_streaming_upload_stats`, 기존 임시파일 GC
-  태스크와 같은 LoopingCall 방식)으로 노출됩니다.
-
-메트릭을 연결하다가 실제 데드락 버그를 하나 더 발견했습니다: `_UploadAccumulator._enqueue()`가
-inflight/`resumeProducing()` 정리 로직엔 `addCallback`을, 로깅엔 별도의 `addErrback`을 썼는데 — 이는
-블로킹 핸들러에서 *예상치 못한* 예외(예: 디스크 꽉 찬 상태에서의 `OSError`)가 나면 정리 로직 자체가
-통째로 건너뛰어져서 트랜스포트가 영원히 일시정지 상태로 남는다는 뜻이었습니다. 둘을 하나의 `addBoth`로
-합쳐서 고쳤고, 고치기 전엔 실패(행)하는 회귀 테스트(`test_unhandled_exception_in_blocking_handler_still_resumes_transport`)로 고정해뒀습니다.
-
-가정하지 않고 실측으로 확인한 것 하나 더: `Request.notifyFinish()`(`active_uploads` 추적에 사용)는
-`StringTransport` 기반 테스트에서 `loseConnection()`만 호출해서는 발동하지 않습니다 — 직접 실험으로
-확인한 뒤, 구현이 아니라 *테스트* 쪽에서 `channel.connectionLost()`를 명시적으로 시뮬레이션하도록
-고쳤습니다 — 실제 리액터/소켓에서 이게 실제로 어떻게 완료되는지에 맞춘 것입니다.
+  요청과 그 일시정지된 트랜스포트가 무한정 대기하지 않고 `503`으로 응답합니다. `401`("자격증명이
+  틀림")과는 구분됩니다("서버가 너무 느렸음").
+- **최대 업로드 시간 상한**(`MAX_UPLOAD_SECONDS = 600`) — 아래 idle 타임아웃과 별개로, 활동 여부와
+  무관한 상한입니다 — 바이트를 완전히 멈추지는 않을 만큼만 드문드문 보내는 slow-loris류 전송도
+  커넥션을 무한정 붙잡을 수 없습니다.
+- **전역 idle 타임아웃**(60초) — `main.py`에서 `Site(root_resource, timeout=60)`으로 명시적으로
+  설정되며, Twisted의 `HTTPFactory`/`HTTPChannel`을 통해 모든 커넥션에 적용됩니다.
+- **메트릭**(`StreamingUploadMetrics`) — 활성/누적 업로드 수, 수신 바이트 수, 파일 성공/실패
+  카운트(실패는 사유별로: 잘못된 vault/경로, 임시파일 오류, 경로 불일치, 해시 불일치), 거부
+  카운트(인증 실패/타임아웃, 프레임 초과, 프레임 손상, 최대 시간 초과), 백프레셔 일시정지 빈도/누적
+  시간. `GET /api/admin/streaming-stats`(`permission='admin'`)와 주기적 로그 요약(`main.py`의
+  `log_streaming_upload_stats`)으로 노출됩니다.
 
 ## 후원
 
