@@ -144,11 +144,103 @@ Translation strings live in `src/pumice_server/locale/{ko,en}.json`, not inline 
 - `Delta` / `UploadFiles` / `DownloadFiles` (gRPC-Web) — the core file sync protocol.
 - `GetFileHistory` / `DownloadHistoryVersion` / `RestoreHistoryVersion` (gRPC-Web) — per-file
   version history, backed by a physical backup (hard-linked where possible) on every change.
+- `UploadFilesStream` (`/obsidian.sync.v1.SyncService/UploadFilesStream`, opt-in) — true
+  client-streaming upload for browsers that support `fetch()` request-body streaming, handled
+  entirely outside the gRPC-Web dispatch above (see "Streaming upload" below).
 - `/api/*` (HTTP, Pyramid) — publish (upload/list/remove/download), publish sharing (invite by
   email, accept via invite code), version history REST mirrors, user accounts, device management,
   and the admin dashboard.
 - `/publish/{username}/{vault}/...` — the actual published site, rendering markdown on the fly
   (wikilinks resolved, YAML frontmatter stripped).
+
+## Streaming upload (`UploadFilesStream`)
+
+`UploadFiles` (above) buffers its whole request body into memory before processing a single
+byte (`request.content.read()` in `grpc_web_resource.py`) -- fine for the batch sizes it's
+tuned for, but not something a much larger single request should rely on. `UploadFilesStream`
+is a second, opt-in path to the same effect (files land on disk, get hashed/backed up/recorded
+exactly like `UploadFiles`) that instead parses the request body incrementally as bytes arrive,
+via `src/pumice_server/streaming.py` (`EnvelopeStreamParser`) and
+`src/pumice_server/streaming_upload_resource.py` (`StreamingUploadRequest`/`StreamingUploadResource`).
+It's reached by a hand-rolled `fetch()` + envelope framing on the client, not the generated
+gRPC-Web stub -- browsers' grpc-web/connect-es libraries don't support client-streaming at all.
+
+This was TDD-developed and real-socket-verified as a standalone PoC first
+(`/home/jiho/twisted-streaming-poc`, 28 tests) before being ported in here with three
+production concerns layered on top (`tests/test_streaming_upload_request.py`,
+`tests/test_upload_accumulator.py`, 17 more tests):
+
+- **Auth-before-streaming** — the `Authorization` header is resolved to a device/owner
+  identity *before* a single body byte is handed to the parser (headers are fully parsed by
+  the time Twisted calls `gotLength()`, ahead of any body byte). An invalid/missing token
+  gets a bare `401` and the connection is dropped without ever processing the (possibly
+  attacker-controlled) body.
+- **Backpressure** — every piece of blocking work (token resolution, each frame's disk I/O)
+  pauses the transport (`stopReading()` on the real TCP transport) until it drains, so a
+  fast/malicious sender can't queue arbitrarily far ahead of what's actually been written to
+  disk.
+- **Blocking I/O avoidance** — token resolution and all file I/O run via
+  `twisted.internet.threads.deferToThread`, matching the `asyncio.to_thread` convention
+  `service.py` already uses for the same operations on `UploadFiles`. Verified for real: a
+  slow trickled upload running concurrently with 259 `Ping` calls on a separate connection
+  kept every `Ping` under 5ms — the reactor never stalled waiting on the upload's disk I/O.
+
+One real bug found only by driving this against an actual running server (not just
+`StringTransport`-based tests): a request whose entire (small) body arrives before the
+threaded auth check completes used to race ahead into `render()` with `owner_username` still
+unset, since `pauseProducing()` only blocks *future* socket reads, not bytes already delivered
+within the current `dataReceived()` call. Fixed by deferring `requestReceived()` itself until
+auth actually resolves (see `StreamingUploadRequest._onAuthResolved`/`_onAuthFailed`), with a
+regression test (`test_small_full_body_arriving_before_auth_resolves_does_not_race_render`)
+covering it. A second bug from the same real run: acks were being written as each file
+finished, mid-request -- which corrupts the response, because this is a plain HTTP/1.1
+connection (the app server never terminates TLS/HTTP2 itself) and a response can't start
+until the whole request has been received, regardless of what Twisted's `Request.write()`
+technically allows you to call early. Acks are now buffered and flushed in one batch from
+`render_POST()`, exactly matching `UploadFiles`' existing ack-after-full-body behavior.
+
+### Timeouts & observability
+
+Two more production concerns, added after the above (48 tests total for this feature now):
+
+- **Auth-resolution timeout** (`AUTH_TIMEOUT_SECONDS = 10`) — a stuck DB thread call
+  (pool exhaustion, deadlock) no longer hangs the request (and its paused transport) forever;
+  it errors out with `503`, distinct from `401` ("we were too slow" vs "your credentials are
+  wrong"). Note this only stops *this Deferred* from waiting further — `deferToThread` can't
+  interrupt an actually-still-blocked worker thread.
+- **Max-upload-duration ceiling** (`MAX_UPLOAD_SECONDS = 600`) — Twisted's own idle timeout
+  (see below) resets on every byte received, so it doesn't catch a slow-loris-style sender
+  that drips bytes just often enough to never go idle but never finishes. This is a separate,
+  activity-independent ceiling on the whole request, scheduled in `gotLength()` and cancelled
+  once the body fully arrives or the request aborts for any other reason.
+- **Global idle timeout** — turns out this already existed (`Site`/`HTTPFactory.__init__`
+  defaults `timeout=60`, applied to every `HTTPChannel` via `buildProtocol()`) — confirmed by
+  reading the Twisted source rather than trusting an initial assumption that it was `None`
+  (that was checking `HTTPChannel.timeOut`'s *class* default, not the actual per-instance
+  value the factory sets). Now spelled out explicitly in `main.py` (`Site(root_resource,
+  timeout=60)`) so it's a documented decision rather than an implicit library default.
+- **Metrics** (`StreamingUploadMetrics`, no new dependency — there's no existing metrics
+  stack here) — active/total uploads, bytes received, file success/failure counts (with
+  failure broken down by reason: invalid vault/path, temp-file error, path mismatch, hash
+  mismatch), rejection counts (auth failed/timed out, frame too large, malformed frame, max
+  duration exceeded), and backpressure pause frequency/total duration. Exposed via
+  `GET /api/admin/streaming-stats` (`permission='admin'`, matching the existing admin API
+  convention) and a 5-minute log summary (`main.py`'s `log_streaming_upload_stats`,
+  LoopingCall-based like the existing temp-file GC task).
+
+A second real deadlock bug turned up while wiring metrics in: `_UploadAccumulator._enqueue()`
+used `addCallback` for its inflight/`resumeProducing()` bookkeeping and a separate
+`addErrback` only for logging -- meaning an *unexpected* exception in a blocking handler (an
+`OSError` writing to a full disk, say) skipped the bookkeeping entirely and left the
+transport paused forever. Fixed by merging both into one `addBoth`, with a regression test
+(`test_unhandled_exception_in_blocking_handler_still_resumes_transport`) that fails (hangs)
+without the fix.
+
+One more thing verified empirically rather than assumed: `Request.notifyFinish()` (used to
+track `active_uploads`) does *not* fire under a `StringTransport`-driven test purely from
+calling `loseConnection()` -- confirmed by direct experiment, then fixed at the *test* level
+(not the implementation) by explicitly simulating `channel.connectionLost()`, matching how
+this actually completes under a real reactor/socket.
 
 ## Support
 
