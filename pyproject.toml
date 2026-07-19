@@ -34,3 +34,13 @@ build-backend = "uv_build"
 
 [tool.uv.sources]
 sqlalchemy-cubrid = { git = "https://github.com/search5/sqlalchemy_cubrid" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-twisted>=1.14.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -21,7 +21,13 @@ asyncioreactor.install()
 from twisted.internet import reactor
 
 from pumice_server.service import SyncServiceServicer
-from pumice_server.grpc_web_resource import SyncServiceResource, RootResource
+from pumice_server.grpc_web_resource import SyncServiceResource, RootResource, UPLOAD_STREAM_PATH
+from pumice_server.streaming_upload_resource import (
+    StreamingUploadResource,
+    make_streaming_upload_request_factory,
+    metrics as streaming_upload_metrics,
+    resolve_owner_via_thread,
+)
 from twisted.web.wsgi import WSGIResource
 from twisted.web.server import Site
 from pumice_server.web import create_pyramid_app
@@ -51,6 +57,15 @@ def clean_temp_files(data_dir: str, max_age_seconds=3600):
                 pass
     if count > 0:
         logger.info(f"Garbage Collector: Cleaned up {count} expired temporary files.")
+
+def log_streaming_upload_stats():
+    # Same data as GET /api/admin/streaming-stats (web.py's admin_streaming_stats_view) --
+    # this periodic log line exists for operators who watch logs rather than the dashboard.
+    # Skipped when nothing has happened yet, to avoid a wall of empty log lines on an
+    # idle/low-traffic server.
+    if streaming_upload_metrics.total_uploads_started == 0:
+        return
+    logger.info("Streaming upload stats: %s", streaming_upload_metrics.snapshot())
 
 def build_connection_url(db_type: str, data_dir: str) -> str:
     host = os.getenv("DB_HOST", "127.0.0.1")
@@ -127,7 +142,7 @@ def main():
     def startup():
         # Create the Pyramid WSGI app (web UI + admin/publish API only now -- the sync RPCs
         # are handled natively below, no WSGI bridge involved for those anymore)
-        pyramid_app = create_pyramid_app(repository, args.data_dir)
+        pyramid_app = create_pyramid_app(repository, args.data_dir, streaming_upload_metrics)
 
         # Wrap Pyramid with the same CORS behavior the whole server used to get from the
         # single shared middleware, so the web UI's responses are unaffected by the split.
@@ -169,9 +184,28 @@ def main():
 
         servicer = SyncServiceServicer(data_dir=args.data_dir, repository=repository)
         sync_resource = SyncServiceResource(servicer)
+        streaming_resource = StreamingUploadResource(servicer, streaming_upload_metrics)
 
-        root_resource = RootResource(sync_resource, pyramid_resource)
-        site = Site(root_resource)
+        root_resource = RootResource(sync_resource, pyramid_resource, streaming_resource)
+        # Idle-connection timeout (no bytes received for this long -> drop). This is
+        # twisted.web's own long-standing default (HTTPFactory.__init__(timeout=60)) --
+        # spelled out explicitly here, at the same value, so it's a documented decision
+        # rather than an implicit library default that could silently change on a future
+        # Twisted upgrade. It resets on every byte received (HTTPChannel.dataReceived() ->
+        # resetTimeout()), including for the streaming upload path below -- but that alone
+        # doesn't bound a slow-loris-style sender that never goes fully idle; see
+        # streaming_upload_resource.py's MAX_UPLOAD_SECONDS for the total-duration ceiling
+        # that covers that case specifically.
+        site = Site(root_resource, timeout=60)
+        # Only the one streaming upload path gets incremental body handling -- every other
+        # path (Pyramid web UI, admin API, and every other SyncService RPC) is untouched and
+        # keeps Twisted's default full-buffering-into-request.content behaviour.
+        site.requestFactory = make_streaming_upload_request_factory(
+            should_stream=lambda path: path == UPLOAD_STREAM_PATH,
+            resolve_owner=resolve_owner_via_thread(repository),
+            on_frame=streaming_resource.make_on_frame(),
+            upload_metrics=streaming_upload_metrics,
+        )
 
         logger.info(f"Starting Pyramid HTTP + gRPC-Web server on port {args.http_port}...")
         reactor.listenTCP(args.http_port, site)
@@ -181,7 +215,11 @@ def main():
     # Run the temp-file garbage collector (every 10 minutes)
     gc_task = task.LoopingCall(clean_temp_files, args.data_dir)
     gc_task.start(600, now=False)
-    
+
+    # Streaming upload stats summary (every 5 minutes) -- see log_streaming_upload_stats()
+    stats_task = task.LoopingCall(log_streaming_upload_stats)
+    stats_task.start(300, now=False)
+
     logger.info("Starting Twisted reactor...")
     reactor.run()
 

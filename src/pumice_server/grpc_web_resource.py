@@ -59,6 +59,12 @@ _CORS_ALLOW_HEADERS = (
     b"obs-token, obs-id, obs-path, obs-hash, x-device-name, x-user-name"
 )
 
+# Not a real generated-stub RPC dispatch target (see streaming_upload_resource.py) -- this
+# path is recognized purely by StreamingUploadRequest/RootResource via a plain byte-string
+# comparison against the raw request path, before any Resource lookup or the unary
+# request.content.read() handling every other method below goes through.
+UPLOAD_STREAM_PATH = b"/obsidian.sync.v1.SyncService/UploadFilesStream"
+
 
 class Aborted(Exception):
     """Raised by NativeServicerContext.abort() to unwind out of a servicer method
@@ -249,12 +255,20 @@ class RootResource(Resource):
 
     isLeaf = True
 
-    def __init__(self, sync_resource, fallback_resource):
+    def __init__(self, sync_resource, fallback_resource, streaming_resource=None):
         super().__init__()
         self._sync_resource = sync_resource
         self._fallback_resource = fallback_resource
+        self._streaming_resource = streaming_resource
 
     def render(self, request):
+        # Checked before the generic SyncService prefix below -- the streaming upload path
+        # shares that same prefix but must never fall into SyncServiceResource's
+        # request.content.read() (full-buffering) handling; its body is already being
+        # incrementally parsed by StreamingUploadRequest by the time render() runs (see
+        # streaming_upload_resource.py).
+        if self._streaming_resource is not None and request.path == UPLOAD_STREAM_PATH:
+            return self._streaming_resource.render(request)
         if request.path.decode("utf-8").startswith(SyncServiceResource._PATH_PREFIX):
             return self._sync_resource.render(request)
         return self._fallback_resource.render(request)

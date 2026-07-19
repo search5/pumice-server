@@ -3258,6 +3258,13 @@ def user_logout_view(request):
     clear_session_cookie(request)
     return {"ok": True}
 
+@view_config(route_name='admin_streaming_stats', renderer='json', permission='admin')
+def admin_streaming_stats_view(request):
+    # See streaming_upload_resource.py's StreamingUploadMetrics docstring -- in-process
+    # counters only (reset on restart), not persisted history/billing data.
+    upload_metrics = request.registry.settings.get("streaming_upload_metrics")
+    return upload_metrics.snapshot() if upload_metrics is not None else {}
+
 @view_config(route_name='admin_users', renderer='json', permission='admin')
 def admin_users_view(request):
     try:
@@ -3454,10 +3461,18 @@ def user_profile_update_view(request):
         logger.error(f"Failed to update profile: {e}")
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
 
-def create_pyramid_app(repository, data_dir):
+def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
+    if streaming_upload_metrics is None:
+        # Defaults to the same module-level singleton streaming_upload_resource.py's
+        # StreamingUploadRequest/_UploadAccumulator update by default -- passing it in
+        # explicitly (as main.py does) keeps that wiring visible instead of relying on two
+        # separate places importing the same global.
+        from .streaming_upload_resource import metrics as streaming_upload_metrics
+
     settings = {
         "repository": repository,
-        "data_dir": data_dir
+        "data_dir": data_dir,
+        "streaming_upload_metrics": streaming_upload_metrics,
     }
     # Initialize the Pyramid Configurator
     config = Configurator(settings=settings)
@@ -3500,6 +3515,7 @@ def create_pyramid_app(repository, data_dir):
     config.add_route('admin_vaults', '/api/admin/vaults')
     config.add_route('admin_vault_files', '/api/admin/vaults/{vault_id}', factory=VaultContext)
     config.add_route('admin_published', '/api/admin/published')
+    config.add_route('admin_streaming_stats', '/api/admin/streaming-stats')
     config.add_route('get_token_info', '/api/token/info')
     config.add_route('get_history', '/api/history', factory=VaultContext)
     config.add_route('download_history', '/api/history/download', factory=VaultContext)
