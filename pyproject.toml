@@ -1,6 +1,6 @@
 [project]
 name = "pumice-server"
-version = "0.2.1"
+version = "0.2.2"
 description = "Self-hosted sync/version-history/publish backend for the Pumice Obsidian plugin."
 readme = "README.md"
 authors = [
