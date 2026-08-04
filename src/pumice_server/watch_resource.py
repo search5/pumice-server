@@ -22,6 +22,15 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "15"))
 
 
+def watch_cors_options_headers(origin: bytes) -> list[tuple[bytes, bytes]]:
+    return [
+        (b"Access-Control-Allow-Origin", origin),
+        (b"Access-Control-Allow-Methods", b"GET, OPTIONS"),
+        (b"Access-Control-Allow-Headers", b"authorization"),
+        (b"Access-Control-Allow-Credentials", b"true"),
+    ]
+
+
 class WatchResource(Resource):
     isLeaf = True
 
@@ -53,6 +62,14 @@ class WatchResource(Resource):
 
         self._resolve_owner(request).addCallbacks(on_authorized, on_auth_failed)
         return NOT_DONE_YET
+
+    def render_OPTIONS(self, request: Request) -> bytes:
+        origin = request.getHeader(b"origin") or b"*"
+        request.setResponseCode(204)
+        for name, value in watch_cors_options_headers(origin):
+            request.setHeader(name, value)
+        request.setHeader(b"Content-Length", b"0")
+        return b""
 
     def _start_stream(self, request: Request, owner: str, vault_id: str) -> None:
         # This connection's whole point is to sit mostly-silent from the client's side for a
