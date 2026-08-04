@@ -36,12 +36,25 @@ class ChangeNotifier:
             on_change()
 
 
+def _normalize_metadata(files: dict) -> dict:
+    # Compares only the fields that make a file meaningfully "changed" for notification purposes
+    # -- deliberately ignores everything else so mismatched dict shapes between callers can never
+    # cause a false positive again (see the regression test this was added for).
+    return {path: (meta.get("content_hash"), bool(meta.get("is_deleted"))) for path, meta in files.items()}
+
+
 def did_metadata_change(before: dict, after: dict) -> bool:
     """Whether a vault's file metadata actually differs between two snapshots (e.g.
     _scan_and_merge()'s metadata_files before vs. merged_files about to be saved). Delta gets
     called on every sync/poll cycle regardless of whether anything changed, so callers must gate
     notify_change() on this -- otherwise a client's own no-op Delta would notify its own /watch
-    subscription and every other device's, every single cycle. Plain dict equality already
-    compares nested values recursively in Python, so this is correct as-is; named as its own
-    function purely so the intent is explicit and testable at the call site."""
-    return before != after
+    subscription and every other device's, every single cycle.
+
+    Normalizes both sides to (content_hash, is_deleted) per path before comparing -- a plain
+    `before != after` looks correct but is NOT: repository.load_all() returns full DB rows
+    (owner_username, vault_id, path, ...) while _scan_and_merge() builds its own dicts with only
+    5 keys (no owner_username/vault_id). That key-set mismatch made this return True on every
+    single call regardless of real changes, which meant every sync -- including one triggered
+    purely by receiving a live-update notification -- renotified itself: an infinite
+    notify -> resync -> notify loop with no actual file change driving it."""
+    return _normalize_metadata(before) != _normalize_metadata(after)

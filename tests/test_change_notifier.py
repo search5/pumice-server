@@ -132,3 +132,37 @@ def test_did_metadata_change_false_for_two_empty_vaults():
     from pumice_server.change_notifier import did_metadata_change
 
     assert did_metadata_change({}, {}) is False
+
+
+def test_did_metadata_change_false_when_before_has_extra_db_row_keys():
+    """Regression test: repository.load_all() returns full DB rows (owner_username, vault_id,
+    path, plus the rest) for `before`, but _scan_and_merge() builds `after` with only 5 keys per
+    file (no owner_username/vault_id) -- see service.py's _scan_and_merge(). A naive dict `!=`
+    compares key sets too, so this mismatch alone made did_metadata_change() return True on every
+    single Delta call regardless of whether any file actually changed, which meant every sync
+    (including ones triggered purely by receiving a live-update notification) renotified itself,
+    forming an infinite self-sustaining notify -> resync -> notify loop.
+    """
+    from pumice_server.change_notifier import did_metadata_change
+
+    before = {
+        "a.md": {
+            "owner_username": "alice",
+            "vault_id": "vault1",
+            "path": "a.md",
+            "content_hash": "h1",
+            "is_deleted": False,
+            "modified_at_ms": 1000,
+            "size_bytes": 5,
+        }
+    }
+    after = {
+        "a.md": {
+            "path": "a.md",
+            "content_hash": "h1",
+            "is_deleted": False,
+            "modified_at_ms": 1000,
+            "size_bytes": 5,
+        }
+    }
+    assert did_metadata_change(before, after) is False
