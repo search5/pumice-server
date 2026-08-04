@@ -43,6 +43,17 @@ def pack_trailers(trailers) -> bytes:
     return "".join(f"{k.lower()}: {v}\r\n" for k, v in trailers).encode("ascii")
 
 
+# The response Content-Type must always be exactly one of these two values -- never an echo of
+# whatever the client's Accept header happened to contain. Real browser/Electron clients (the
+# official grpc-web JS runtime doesn't set an Accept header in binary mode) get one auto-added by
+# the HTTP stack, defaulting to "*/*" -- which used to get echoed straight back as Content-Type,
+# and grpc-web's own client then rejects "*/*" as an unrecognized response Content-Type. Accept is
+# still used (see is_text_response below) to decide *which* of these two to send, just never as
+# the literal header value.
+def response_content_type(is_text: bool) -> bytes:
+    return b"application/grpc-web-text" if is_text else b"application/grpc-web+proto"
+
+
 # method name -> (request class, streaming response)
 _METHODS = {
     "Ping": (sync_pb2.Empty, False),
@@ -202,7 +213,7 @@ class SyncServiceResource(Resource):
 
         origin = request.getHeader(b"origin") or b"*"
         request.setResponseCode(200)
-        request.setHeader(b"Content-Type", accept.encode("ascii"))
+        request.setHeader(b"Content-Type", response_content_type(is_text_response))
         request.setHeader(b"Access-Control-Allow-Origin", origin)
         request.setHeader(b"Access-Control-Allow-Credentials", b"true")
         request.setHeader(b"Access-Control-Expose-Headers", b"grpc-status, grpc-message")
