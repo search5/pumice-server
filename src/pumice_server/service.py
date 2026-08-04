@@ -11,6 +11,7 @@ from urllib.parse import unquote
 
 from . import sync_pb2
 from . import sync_pb2_grpc
+from .history_policy import is_history_excluded_path
 from .repository import MetadataRepository
 
 logger = logging.getLogger(__name__)
@@ -130,7 +131,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                                 "is_deleted": False
                             }
 
-                            if not existing:
+                            if not existing and not is_history_excluded_path(file_rel):
                                 try:
                                     timestamp = int(time.time() * 1000)
                                     backup_dir = os.path.join(self.data_dir, "history", owner_username, vault_id)
@@ -372,7 +373,9 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             should_backup = True
             rename_related_path = None
 
-            if is_new_file:
+            if is_history_excluded_path(current_rel_path):
+                should_backup = False
+            elif is_new_file:
                 # Check whether some previous path (old_path) exists as a deletion tombstone
                 # with the same hash (an O(1) lookup instead of scanning every file)
                 old_path = tombstones_by_hash.get(calculated_hash)
