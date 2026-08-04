@@ -266,11 +266,12 @@ class RootResource(Resource):
 
     isLeaf = True
 
-    def __init__(self, sync_resource, fallback_resource, streaming_resource=None):
+    def __init__(self, sync_resource, fallback_resource, streaming_resource=None, watch_resource=None):
         super().__init__()
         self._sync_resource = sync_resource
         self._fallback_resource = fallback_resource
         self._streaming_resource = streaming_resource
+        self._watch_resource = watch_resource
 
     def render(self, request):
         # Checked before the generic SyncService prefix below -- the streaming upload path
@@ -280,6 +281,10 @@ class RootResource(Resource):
         # streaming_upload_resource.py).
         if self._streaming_resource is not None and request.path == UPLOAD_STREAM_PATH:
             return self._streaming_resource.render(request)
+        # /watch is a plain SSE endpoint, not gRPC-Web -- see watch_resource.py's module
+        # docstring for why it's deliberately outside sync.proto entirely.
+        if self._watch_resource is not None and request.path == b"/watch":
+            return self._watch_resource.render(request)
         if request.path.decode("utf-8").startswith(SyncServiceResource._PATH_PREFIX):
             return self._sync_resource.render(request)
         return self._fallback_resource.render(request)

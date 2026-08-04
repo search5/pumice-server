@@ -28,6 +28,8 @@ from pumice_server.streaming_upload_resource import (
     metrics as streaming_upload_metrics,
     resolve_owner_via_thread,
 )
+from pumice_server.watch_resource import WatchResource
+from pumice_server.change_notifier import ChangeNotifier
 from twisted.web.wsgi import WSGIResource
 from twisted.web.server import Site
 from pumice_server.web import create_pyramid_app
@@ -182,11 +184,13 @@ def main():
         reactor.suggestThreadPoolSize(50)
         pyramid_resource = WSGIResource(reactor, reactor.getThreadPool(), final_pyramid_app)
 
-        servicer = SyncServiceServicer(data_dir=args.data_dir, repository=repository)
+        change_notifier = ChangeNotifier()
+        servicer = SyncServiceServicer(data_dir=args.data_dir, repository=repository, change_notifier=change_notifier)
         sync_resource = SyncServiceResource(servicer)
         streaming_resource = StreamingUploadResource(servicer, streaming_upload_metrics)
+        watch_resource = WatchResource(repository, change_notifier)
 
-        root_resource = RootResource(sync_resource, pyramid_resource, streaming_resource)
+        root_resource = RootResource(sync_resource, pyramid_resource, streaming_resource, watch_resource)
         # Idle-connection timeout (no bytes received for this long -> drop). This is
         # twisted.web's own long-standing default (HTTPFactory.__init__(timeout=60)) --
         # spelled out explicitly here, at the same value, so it's a documented decision
