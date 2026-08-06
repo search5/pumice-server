@@ -376,3 +376,111 @@ def write_note(
     )
 
     return {"path": path, "size_bytes": write_result["size_bytes"], "encrypted": encrypted}
+
+
+def delete_note(
+    repository,
+    owner_username: str,
+    vault_id: str,
+    path: str,
+    delete_file: Callable[[str, str, str], dict],
+) -> dict:
+    """Soft-deletes a note -- mirrors service.py's own _delete_on_server exactly: a history entry
+    backing up the last version (if the file still exists on disk), then a separate tombstone
+    history entry (deleted=True, no content), then the metadata row itself marked is_deleted.
+    Recoverable via history, not a hard delete. No E2EE handling needed -- deleting doesn't touch
+    file content at all."""
+    meta = repository.load_one(owner_username, vault_id, path)
+    if meta is None or meta.get("is_deleted"):
+        raise ToolError(f"No note found at '{path}' in this vault")
+
+    delete_result = delete_file(owner_username, vault_id, path)
+    deleted_at_ms = delete_result["deleted_at_ms"]
+    backup_file_path = delete_result.get("backup_file_path")
+
+    if backup_file_path:
+        repository.add_history(
+            owner_username=owner_username,
+            vault_id=vault_id,
+            path=path,
+            modified_at_ms=meta["modified_at_ms"],
+            size_bytes=meta["size_bytes"],
+            content_hash=meta["content_hash"],
+            backup_file_path=backup_file_path,
+            device_name="MCP",
+            user_name=owner_username,
+        )
+
+    repository.add_history(
+        owner_username=owner_username,
+        vault_id=vault_id,
+        path=path,
+        modified_at_ms=deleted_at_ms,
+        size_bytes=0,
+        content_hash="",
+        backup_file_path="",
+        device_name="MCP",
+        user_name=owner_username,
+        deleted=True,
+    )
+
+    repository.save_one(
+        owner_username,
+        vault_id,
+        path,
+        {
+            "path": path,
+            "modified_at_ms": deleted_at_ms,
+            "size_bytes": 0,
+            "content_hash": "",
+            "is_deleted": True,
+        },
+    )
+
+    return {"path": path, "deleted": True}
+
+
+def rename_note(
+    repository,
+    owner_username: str,
+    vault_id: str,
+    old_path: str,
+    new_path: str,
+    move_file: Callable[[str, str, str, str], dict],
+) -> dict:
+    """Moves/renames a note. repository.migrate_history_on_rename() relabels the metadata row and
+    every history row from old_path to new_path in place (not a tombstone-then-recreate), so
+    content_hash/size/modified_at_ms are preserved exactly -- nothing about the note's content
+    changed, only its path. A fresh history entry is still recorded at new_path (related_path=
+    old_path), matching how a real client-driven rename gets one too (service.py's
+    _finalize_uploaded_file always backs up the just-placed file, even when content is unchanged --
+    cheap since _backup_file hard-links rather than copies). No E2EE handling needed -- moving a
+    file doesn't touch its bytes."""
+    old_meta = repository.load_one(owner_username, vault_id, old_path)
+    if old_meta is None or old_meta.get("is_deleted"):
+        raise ToolError(f"No note found at '{old_path}' in this vault")
+
+    existing_at_new_path = repository.load_one(owner_username, vault_id, new_path)
+    if existing_at_new_path is not None and not existing_at_new_path.get("is_deleted"):
+        raise ToolError(f"'{new_path}' already exists in this vault -- rename_note refuses to overwrite it")
+
+    move_result = move_file(owner_username, vault_id, old_path, new_path)
+
+    repository.migrate_history_on_rename(owner_username, vault_id, old_path, new_path)
+
+    backup_file_path = move_result.get("backup_file_path")
+    if backup_file_path:
+        repository.add_history(
+            owner_username=owner_username,
+            vault_id=vault_id,
+            path=new_path,
+            modified_at_ms=old_meta["modified_at_ms"],
+            size_bytes=old_meta["size_bytes"],
+            content_hash=old_meta["content_hash"],
+            backup_file_path=backup_file_path,
+            device_name="MCP",
+            user_name=owner_username,
+            related_path=old_path,
+        )
+
+    return {"old_path": old_path, "new_path": new_path}

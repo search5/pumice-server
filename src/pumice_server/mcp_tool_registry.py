@@ -101,6 +101,23 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
         "required": ["vault_id", "path", "content"],
     },
+    "delete_note": {
+        "type": "object",
+        "properties": {
+            "vault_id": {"type": "string"},
+            "path": {"type": "string"},
+        },
+        "required": ["vault_id", "path"],
+    },
+    "rename_note": {
+        "type": "object",
+        "properties": {
+            "vault_id": {"type": "string"},
+            "old_path": {"type": "string"},
+            "new_path": {"type": "string"},
+        },
+        "required": ["vault_id", "old_path", "new_path"],
+    },
 }
 
 TOOL_DESCRIPTIONS: dict[str, str] = {
@@ -138,6 +155,15 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "vault. If the vault looks encrypted and no e2ee_password is given, the write is refused "
         "rather than silently storing unencrypted content."
     ),
+    "delete_note": (
+        "Soft-delete a note (recoverable via get_file_history/read_file_version, not a hard "
+        "delete). No e2ee_password needed -- deleting doesn't touch file content."
+    ),
+    "rename_note": (
+        "Move/rename a note from old_path to new_path, preserving its content and version "
+        "history. Refuses to overwrite an existing active note already at new_path. No "
+        "e2ee_password needed -- moving a file doesn't touch its bytes."
+    ),
 }
 
 
@@ -165,6 +191,8 @@ def dispatch_tool_call(
     read_bytes: Optional[Callable[[str], bytes]] = None,
     read_vault_file: Optional[Callable[[str, str, str], bytes]] = None,
     write_vault_file: Optional[Callable[[str, str, str, bytes], dict]] = None,
+    delete_vault_file: Optional[Callable[[str, str, str], dict]] = None,
+    move_vault_file: Optional[Callable[[str, str, str, str], dict]] = None,
 ) -> dict:
     arguments = arguments or {}
 
@@ -249,6 +277,23 @@ def dispatch_tool_call(
             read_file=read_vault_file,
             write_file=write_vault_file,
             e2ee_password=e2ee_password,
+        )
+
+    if tool_name == "delete_note":
+        vault_id = _require_str(arguments, "vault_id")
+        path = _require_str(arguments, "path")
+        if delete_vault_file is None:
+            raise ToolError("delete_note is not available: no vault file deleter was configured")
+        return mcp_tools.delete_note(repository, owner_username, vault_id, path, delete_file=delete_vault_file)
+
+    if tool_name == "rename_note":
+        vault_id = _require_str(arguments, "vault_id")
+        old_path = _require_str(arguments, "old_path")
+        new_path = _require_str(arguments, "new_path")
+        if move_vault_file is None:
+            raise ToolError("rename_note is not available: no vault file mover was configured")
+        return mcp_tools.rename_note(
+            repository, owner_username, vault_id, old_path, new_path, move_file=move_vault_file
         )
 
     raise ToolError(f"Unknown tool: {tool_name}")

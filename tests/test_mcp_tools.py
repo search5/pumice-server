@@ -13,6 +13,7 @@ import pytest
 from pumice_server.e2ee import decrypt, derive_key, encrypt
 from pumice_server.mcp_tools import (
     ToolError,
+    delete_note,
     get_file_history,
     get_recent_notes,
     list_files,
@@ -20,6 +21,7 @@ from pumice_server.mcp_tools import (
     list_vaults,
     read_file_version,
     read_note,
+    rename_note,
     resolve_vault_file_path,
     search_by_frontmatter,
     search_notes,
@@ -37,6 +39,7 @@ class FakeRepository:
         self._history_by_id = {}  # history_id -> entry
         self._published = {}  # (owner, vault_id) -> [{"path", "hash"}]
         self.add_history_calls = []
+        self._next_history_id = 1000
 
     def get_vaults_by_owner(self, owner_username):
         return sorted(self._vaults_by_owner.get(owner_username, set()))
@@ -53,6 +56,45 @@ class FakeRepository:
 
     def add_history(self, **kwargs):
         self.add_history_calls.append(kwargs)
+        # Also feed get_history/get_history_by_id, like the real add_history's INSERT does --
+        # otherwise tests asserting on post-add_history read-back (e.g. via rename's history
+        # migration) would see stale state.
+        history_id = self._next_history_id
+        self._next_history_id += 1
+        full = {
+            "history_id": history_id,
+            "owner_username": kwargs["owner_username"],
+            "vault_id": kwargs["vault_id"],
+            "path": kwargs["path"],
+            "modified_at_ms": kwargs["modified_at_ms"],
+            "size_bytes": kwargs["size_bytes"],
+            "content_hash": kwargs["content_hash"],
+            "backup_file_path": kwargs["backup_file_path"],
+            "device_name": kwargs["device_name"],
+            "user_name": kwargs["user_name"],
+            "deleted": kwargs.get("deleted", False),
+            "related_path": kwargs.get("related_path"),
+        }
+        key = (full["owner_username"], full["vault_id"], full["path"])
+        self._history.setdefault(key, []).insert(0, full)
+        self._history_by_id[history_id] = full
+
+    def migrate_history_on_rename(self, owner_username, vault_id, old_path, new_path):
+        # Real behavior (repository.py): an in-place UPDATE relabeling the path column of both
+        # the metadata row and every history row -- not a copy, and not a tombstone left behind
+        # at old_path.
+        files = self._files.get((owner_username, vault_id), {})
+        if old_path in files:
+            files[new_path] = files.pop(old_path)
+        key_old = (owner_username, vault_id, old_path)
+        key_new = (owner_username, vault_id, new_path)
+        if key_old in self._history:
+            self._history[key_new] = self._history.pop(key_old)
+            for entry in self._history[key_new]:
+                entry["path"] = new_path
+        for entry in self._history_by_id.values():
+            if entry["owner_username"] == owner_username and entry["vault_id"] == vault_id and entry["path"] == old_path:
+                entry["path"] = new_path
 
     def get_history(self, owner_username, vault_id, path):
         return list(self._history.get((owner_username, vault_id, path), []))
@@ -789,3 +831,171 @@ def test_write_note_only_samples_first_few_existing_files():
     write_note(repo, "alice", "vault1", "new.md", "hello", read_file=read_file, write_file=writer, sample_size=3)
 
     assert writer.written[("alice", "vault1", "new.md")] == b"hello"
+
+
+class FakeDeleter:
+    """Stands in for the production delete_file callable, which does the real backup-then-remove
+    disk work and reports back what actually happened."""
+
+    def __init__(self, file_exists=True, deleted_at_ms=5000):
+        self.file_exists = file_exists
+        self.deleted_at_ms = deleted_at_ms
+        self.calls = []
+
+    def __call__(self, owner_username, vault_id, path):
+        self.calls.append((owner_username, vault_id, path))
+        backup_file_path = "/fake/last-version.bak" if self.file_exists else None
+        return {"backup_file_path": backup_file_path, "deleted_at_ms": self.deleted_at_ms}
+
+
+def test_delete_note_raises_for_missing_note():
+    repo = FakeRepository()
+    with pytest.raises(ToolError):
+        delete_note(repo, "alice", "vault1", "nope.md", delete_file=FakeDeleter())
+
+
+def test_delete_note_raises_for_already_deleted_note():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "gone.md", is_deleted=True)
+    with pytest.raises(ToolError):
+        delete_note(repo, "alice", "vault1", "gone.md", delete_file=FakeDeleter())
+
+
+def test_delete_note_marks_metadata_as_deleted():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md", modified_at_ms=1, size_bytes=10, content_hash="h1")
+
+    result = delete_note(repo, "alice", "vault1", "a.md", delete_file=FakeDeleter(deleted_at_ms=999))
+
+    assert result == {"path": "a.md", "deleted": True}
+    meta = repo.load_one("alice", "vault1", "a.md")
+    assert meta["is_deleted"] is True
+    assert meta["size_bytes"] == 0
+    assert meta["content_hash"] == ""
+    assert meta["modified_at_ms"] == 999
+
+
+def test_delete_note_records_last_version_backup_and_tombstone_history_entries():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md", modified_at_ms=1, size_bytes=10, content_hash="h1")
+
+    delete_note(repo, "alice", "vault1", "a.md", delete_file=FakeDeleter(deleted_at_ms=999))
+
+    assert len(repo.add_history_calls) == 2
+    last_version_entry, tombstone_entry = repo.add_history_calls
+    assert last_version_entry["backup_file_path"] == "/fake/last-version.bak"
+    assert last_version_entry["content_hash"] == "h1"
+    assert last_version_entry.get("deleted", False) is False
+
+    assert tombstone_entry["deleted"] is True
+    assert tombstone_entry["content_hash"] == ""
+    assert tombstone_entry["size_bytes"] == 0
+    assert tombstone_entry["backup_file_path"] == ""
+
+
+def test_delete_note_skips_last_version_backup_when_file_already_absent_on_disk():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md")
+
+    delete_note(repo, "alice", "vault1", "a.md", delete_file=FakeDeleter(file_exists=False))
+
+    # Only the tombstone entry -- no last-version backup entry when there was nothing on disk to
+    # back up (metadata says the file exists, but it's already gone from the vault directory).
+    assert len(repo.add_history_calls) == 1
+    assert repo.add_history_calls[0]["deleted"] is True
+
+
+class FakeMover:
+    """Stands in for the production move_file callable."""
+
+    def __init__(self, backup_file_path="/fake/renamed.bak"):
+        self.calls = []
+        self.backup_file_path = backup_file_path
+
+    def __call__(self, owner_username, vault_id, old_path, new_path):
+        self.calls.append((owner_username, vault_id, old_path, new_path))
+        return {"backup_file_path": self.backup_file_path}
+
+
+def test_rename_note_raises_when_source_missing():
+    repo = FakeRepository()
+    with pytest.raises(ToolError):
+        rename_note(repo, "alice", "vault1", "nope.md", "new.md", move_file=FakeMover())
+
+
+def test_rename_note_raises_when_source_already_deleted():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md", is_deleted=True)
+    with pytest.raises(ToolError):
+        rename_note(repo, "alice", "vault1", "a.md", "b.md", move_file=FakeMover())
+
+
+def test_rename_note_refuses_to_overwrite_existing_active_note():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md")
+    repo.seed_file("alice", "vault1", "b.md")
+    mover = FakeMover()
+
+    with pytest.raises(ToolError, match="already exists"):
+        rename_note(repo, "alice", "vault1", "a.md", "b.md", move_file=mover)
+    assert mover.calls == []
+
+
+def test_rename_note_allows_overwriting_a_deleted_path():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md", content_hash="h1")
+    repo.seed_file("alice", "vault1", "b.md", is_deleted=True)
+
+    result = rename_note(repo, "alice", "vault1", "a.md", "b.md", move_file=FakeMover())
+
+    assert result == {"old_path": "a.md", "new_path": "b.md"}
+
+
+def test_rename_note_moves_the_physical_file():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md")
+    mover = FakeMover()
+
+    rename_note(repo, "alice", "vault1", "a.md", "b.md", move_file=mover)
+
+    assert mover.calls == [("alice", "vault1", "a.md", "b.md")]
+
+
+def test_rename_note_migrates_metadata_to_new_path():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md", content_hash="h1", size_bytes=10, modified_at_ms=5)
+
+    rename_note(repo, "alice", "vault1", "a.md", "b.md", move_file=FakeMover())
+
+    assert repo.load_one("alice", "vault1", "a.md") is None
+    new_meta = repo.load_one("alice", "vault1", "b.md")
+    assert new_meta["content_hash"] == "h1"
+    assert new_meta["size_bytes"] == 10
+    assert new_meta["modified_at_ms"] == 5
+    assert new_meta["is_deleted"] is False
+
+
+def test_rename_note_records_a_history_entry_with_related_path():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md", content_hash="h1", size_bytes=10, modified_at_ms=5)
+
+    rename_note(repo, "alice", "vault1", "a.md", "b.md", move_file=FakeMover(backup_file_path="/fake/moved.bak"))
+
+    assert len(repo.add_history_calls) == 1
+    entry = repo.add_history_calls[0]
+    assert entry["path"] == "b.md"
+    assert entry["related_path"] == "a.md"
+    assert entry["content_hash"] == "h1"
+    assert entry["backup_file_path"] == "/fake/moved.bak"
+
+
+def test_rename_note_moves_existing_history_entries():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md")
+    repo.seed_history(1, "alice", "vault1", "a.md")
+
+    rename_note(repo, "alice", "vault1", "a.md", "b.md", move_file=FakeMover())
+
+    assert get_file_history(repo, "alice", "vault1", "a.md") == {"history": []}
+    moved_history = get_file_history(repo, "alice", "vault1", "b.md")
+    assert len(moved_history["history"]) == 2  # the pre-existing entry + the rename's own entry

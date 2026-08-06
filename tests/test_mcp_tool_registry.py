@@ -59,8 +59,11 @@ class FakeRepository:
     def add_history(self, **kwargs):
         self.calls.append(("add_history", kwargs))
 
+    def migrate_history_on_rename(self, owner_username, vault_id, old_path, new_path):
+        self.calls.append(("migrate_history_on_rename", owner_username, vault_id, old_path, new_path))
 
-def test_all_ten_tools_have_schemas_and_descriptions():
+
+def test_all_twelve_tools_have_schemas_and_descriptions():
     expected = {
         "list_vaults",
         "list_files",
@@ -72,6 +75,8 @@ def test_all_ten_tools_have_schemas_and_descriptions():
         "read_note",
         "search_by_frontmatter",
         "write_note",
+        "delete_note",
+        "rename_note",
     }
     assert set(TOOL_SCHEMAS.keys()) == expected
     assert set(TOOL_DESCRIPTIONS.keys()) == expected
@@ -341,4 +346,70 @@ def test_write_note_dispatch_passes_optional_password_through():
     )
     # Empty-string password treated as "no password", same convention as the other tools.
     assert result["encrypted"] is False
+
+
+def _fake_delete_vault_file(_owner, _vault_id, _path):
+    return {"backup_file_path": "/fake/last.bak", "deleted_at_ms": 42}
+
+
+def test_delete_note_dispatch_requires_vault_id_and_path():
+    repo = FakeRepository()
+    with pytest.raises(ToolError):
+        dispatch_tool_call(repo, "alice", "delete_note", {"vault_id": "vault1"})
+    with pytest.raises(ToolError):
+        dispatch_tool_call(repo, "alice", "delete_note", {"path": "a.md"})
+
+
+def test_delete_note_dispatch_requires_a_configured_deleter():
+    repo = FakeRepository()
+    with pytest.raises(ToolError, match="deleter"):
+        dispatch_tool_call(repo, "alice", "delete_note", {"vault_id": "vault1", "path": "a.md"})
+
+
+def test_delete_note_dispatch_passes_args_and_uses_injected_deleter():
+    repo = FakeRepository()
+    result = dispatch_tool_call(
+        repo,
+        "alice",
+        "delete_note",
+        {"vault_id": "vault1", "path": "a.md"},
+        delete_vault_file=_fake_delete_vault_file,
+    )
+    assert result == {"path": "a.md", "deleted": True}
+    assert ("load_one", "alice", "vault1", "a.md") in repo.calls
+
+
+def _fake_move_vault_file(_owner, _vault_id, _old_path, _new_path):
+    return {"backup_file_path": "/fake/moved.bak"}
+
+
+def test_rename_note_dispatch_requires_vault_id_old_path_and_new_path():
+    repo = FakeRepository()
+    with pytest.raises(ToolError):
+        dispatch_tool_call(repo, "alice", "rename_note", {"vault_id": "vault1", "old_path": "a.md"})
+    with pytest.raises(ToolError):
+        dispatch_tool_call(repo, "alice", "rename_note", {"vault_id": "vault1", "new_path": "b.md"})
+    with pytest.raises(ToolError):
+        dispatch_tool_call(repo, "alice", "rename_note", {"old_path": "a.md", "new_path": "b.md"})
+
+
+def test_rename_note_dispatch_requires_a_configured_mover():
+    repo = FakeRepository()
+    with pytest.raises(ToolError, match="mover"):
+        dispatch_tool_call(
+            repo, "alice", "rename_note", {"vault_id": "vault1", "old_path": "a.md", "new_path": "b.md"}
+        )
+
+
+def test_rename_note_dispatch_passes_args_and_uses_injected_mover():
+    repo = FakeRepository()
+    result = dispatch_tool_call(
+        repo,
+        "alice",
+        "rename_note",
+        {"vault_id": "vault1", "old_path": "a.md", "new_path": "b.md"},
+        move_vault_file=_fake_move_vault_file,
+    )
+    assert result == {"old_path": "a.md", "new_path": "b.md"}
+    assert ("migrate_history_on_rename", "alice", "vault1", "a.md", "b.md") in repo.calls
 

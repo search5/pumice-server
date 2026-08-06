@@ -247,7 +247,8 @@ class McpResource(Resource):
         return {"modified_at_ms": modified_at_ms, "size_bytes": size_bytes, "backup_file_path": backup_file_path}
 
     def _backup_vault_file(self, owner_username: str, vault_id: str, source_path: str) -> str:
-        """Hard-links (or, failing that, copies) source_path into history/ -- mirrors service.py's
+        """Hard-links (or, failing that, copies) source_path into history/ -- shared by
+        _write_vault_file/_delete_vault_file/_move_vault_file, mirroring service.py's
         _backup_file exactly."""
         backup_dir = os.path.join(self._data_dir, "history", owner_username, vault_id)
         os.makedirs(backup_dir, exist_ok=True)
@@ -258,6 +259,27 @@ class McpResource(Resource):
         except OSError:
             shutil.copy2(source_path, backup_file_path)
         return backup_file_path
+
+    def _delete_vault_file(self, owner_username: str, vault_id: str, path: str) -> dict:
+        """Backs up the last physical version (if it still exists on disk) then removes it --
+        mirrors service.py's _delete_on_server exactly."""
+        full_path = resolve_vault_file_path(self._data_dir, owner_username, vault_id, path)
+        backup_file_path = None
+        if os.path.exists(full_path):
+            backup_file_path = self._backup_vault_file(owner_username, vault_id, full_path)
+            os.remove(full_path)
+        return {"backup_file_path": backup_file_path, "deleted_at_ms": int(time.time() * 1000)}
+
+    def _move_vault_file(self, owner_username: str, vault_id: str, old_path: str, new_path: str) -> dict:
+        """Moves a note's live file to a new path, then backs up the result -- mirrors
+        service.py's own rename-detected write path (_finalize_uploaded_file always backs up the
+        file at its new location, even though content is unchanged)."""
+        old_full_path = resolve_vault_file_path(self._data_dir, owner_username, vault_id, old_path)
+        new_full_path = resolve_vault_file_path(self._data_dir, owner_username, vault_id, new_path)
+        os.makedirs(os.path.dirname(new_full_path), exist_ok=True)
+        os.rename(old_full_path, new_full_path)
+        backup_file_path = self._backup_vault_file(owner_username, vault_id, new_full_path)
+        return {"backup_file_path": backup_file_path}
 
     def _create_session(self, owner_username: str) -> _McpSession:
         client_to_server_send, client_to_server_receive = anyio.create_memory_object_stream(0)
@@ -286,6 +308,8 @@ class McpResource(Resource):
                     params.arguments,
                     read_vault_file=self._read_vault_file,
                     write_vault_file=self._write_vault_file,
+                    delete_vault_file=self._delete_vault_file,
+                    move_vault_file=self._move_vault_file,
                 )
                 text = json.dumps(result, ensure_ascii=False)
                 return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
