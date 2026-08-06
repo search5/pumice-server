@@ -152,6 +152,87 @@ Translation strings live in `src/pumice_server/locale/{ko,en}.json`, not inline 
   and the admin dashboard.
 - `/publish/{username}/{vault}/...` — the actual published site, rendering markdown on the fly
   (wikilinks resolved, YAML frontmatter stripped).
+- `/mcp` — an MCP (Model Context Protocol) server over Streamable HTTP, giving AI clients
+  read/write access to a synced vault (see "MCP" below).
+
+## MCP (Model Context Protocol)
+
+`/mcp` exposes a synced vault to MCP-compatible AI clients (Claude Code, Claude Desktop, ...) over
+Streamable HTTP (protocol version `2025-06-18`), via the official `mcp` Python SDK
+(`src/pumice_server/mcp_resource.py`). Authentication reuses the exact same device token as
+everything else — no separate MCP-specific credential.
+
+### Connecting a client
+
+```json
+{
+  "mcpServers": {
+    "pumice": {
+      "type": "http",
+      "url": "https://your-server/mcp",
+      "headers": { "Authorization": "Bearer <device-token>" }
+    }
+  }
+}
+```
+
+Any device token works here — the same one the Obsidian plugin or a browser session already uses
+(see "Accounts and authentication" above). A client sees only vaults belonging to that token's
+account, same as everywhere else in this server.
+
+### Tools
+
+**Read-only:**
+
+- `list_vaults` — list every vault this account has synced.
+- `list_files` — current (non-deleted) files in a vault, with path/size/hash/modified time.
+- `get_recent_notes` — the most recently modified files, newest first.
+- `get_file_history` — version history for one file.
+- `read_file_version` — content of one specific historical version, by `history_id`.
+- `read_note` — a note's current content by path (one call instead of `get_file_history` +
+  `read_file_version`).
+- `search_notes` — full-text search across a vault's current files.
+- `search_by_frontmatter` — find notes whose YAML frontmatter has a given key containing a given
+  value.
+- `list_published_files` — files currently published (shared publicly) from a vault.
+
+**Write:**
+
+- `write_note` — create or overwrite a note's current content.
+- `delete_note` — soft-delete a note (recoverable via history, not a hard delete).
+- `rename_note` — move/rename a note, preserving content and version history; refuses to
+  overwrite an existing active note.
+
+Full argument schemas are served via the standard MCP `tools/list` call — this list is intentionally
+not duplicated in more detail here to avoid drifting out of sync with the actual code.
+
+### End-to-end encryption
+
+This server never holds an E2EE decryption key persistently — it has no record of whether a given
+vault has E2EE enabled at all (that's a client-local setting, never transmitted). Every tool that
+touches file content instead accepts an optional per-call `e2ee_password` argument:
+
+- **Reads** (`read_file_version`, `read_note`, `search_notes`, `search_by_frontmatter`) decrypt on
+  the fly if given a password, and let it fall out of scope once the response is built. Without
+  one, content that fails to decode as UTF-8 text comes back as a clear error suggesting you retry
+  with `e2ee_password` set (`search_notes`/`search_by_frontmatter` instead silently skip files they
+  can't read as text, since scanning a whole vault should tolerate a handful of unreadable files).
+- **`write_note`** can't afford to guess wrong the way a read can, since a bad guess immediately
+  syncs out and corrupts the file for every other device. If `e2ee_password` is given, it's always
+  trusted and used — the server encrypts the content the same way a real client would (same
+  key-derivation and deterministic IV, verified byte-for-byte against real client output). If not
+  given, it samples a few of the vault's existing files first and refuses the write, rather than
+  silently storing plain text, if the vault looks encrypted.
+- **`delete_note`/`rename_note`** never need a password — deleting only removes bytes, and renaming
+  only moves them; neither touches file content.
+- Metadata-only tools (`list_vaults`, `list_files`, `get_recent_notes`, `get_file_history`,
+  `list_published_files`) are unaffected either way, since they never touch file content.
+
+### Known limitations
+
+Server-initiated notifications (the GET/SSE half of Streamable HTTP) aren't implemented yet — `GET
+/mcp` returns `501`. There's currently nothing this server needs to push to a connected MCP client
+proactively.
 
 ## Streaming upload (`UploadFilesStream`)
 

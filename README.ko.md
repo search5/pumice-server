@@ -153,6 +153,86 @@ Vault 범위의 라우트(퍼블리시, 버전 히스토리, 관리자의 vault�
   코드로 수락), 버전 히스토리 REST 미러, 사용자 계정, 디바이스 관리, 관리자 대시보드.
 - `/publish/{username}/{vault}/...` — 실제로 퍼블리시된 사이트, 마크다운을 즉석에서 렌더링
   (위키링크 해석, YAML 프런트매터 제거).
+- `/mcp` — Streamable HTTP 기반 MCP(Model Context Protocol) 서버로, AI 클라이언트에게 동기화된
+  vault에 대한 읽기/쓰기 접근을 제공합니다 (아래 "MCP" 참고).
+
+## MCP (Model Context Protocol)
+
+`/mcp`는 동기화된 vault를 MCP 호환 AI 클라이언트(Claude Code, Claude Desktop 등)에 Streamable
+HTTP(프로토콜 버전 `2025-06-18`)로 노출합니다. 공식 `mcp` Python SDK를 사용합니다
+(`src/pumice_server/mcp_resource.py`). 인증은 다른 모든 곳과 완전히 동일한 디바이스 토큰을 그대로
+재사용합니다 — MCP 전용 별도 자격증명은 없습니다.
+
+### 클라이언트 연결하기
+
+```json
+{
+  "mcpServers": {
+    "pumice": {
+      "type": "http",
+      "url": "https://your-server/mcp",
+      "headers": { "Authorization": "Bearer <device-token>" }
+    }
+  }
+}
+```
+
+여기엔 어떤 디바이스 토큰이든 사용할 수 있습니다 — 옵시디언 플러그인이나 브라우저 세션이 이미
+쓰고 있는 것과 같은 토큰이면 됩니다("계정과 인증" 참고). 클라이언트는 그 토큰이 속한 계정의
+vault만 볼 수 있습니다. 서버의 다른 모든 곳과 동일합니다.
+
+### 도구 목록
+
+**읽기 전용:**
+
+- `list_vaults` — 이 계정이 동기화한 모든 vault 목록.
+- `list_files` — vault 내 현재(삭제되지 않은) 파일 목록, 경로/크기/해시/수정 시각 포함.
+- `get_recent_notes` — 최근 수정된 파일을 최신순으로.
+- `get_file_history` — 파일 하나의 버전 히스토리.
+- `read_file_version` — `history_id`로 특정 과거 버전의 내용을 읽기.
+- `read_note` — 경로로 노트의 현재 내용을 바로 읽기 (`get_file_history` + `read_file_version`을
+  한 번에 대체).
+- `search_notes` — vault의 현재 파일 전체를 대상으로 하는 전문(full-text) 검색.
+- `search_by_frontmatter` — YAML frontmatter의 특정 키가 특정 값을 포함하는 노트 찾기.
+- `list_published_files` — vault에서 현재 퍼블리시(공개)된 파일 목록.
+
+**쓰기:**
+
+- `write_note` — 노트를 새로 만들거나 덮어쓰기.
+- `delete_note` — 소프트 삭제(완전 삭제가 아니라 히스토리로 복구 가능).
+- `rename_note` — 노트 이동/이름변경, 내용과 버전 히스토리 보존; 이미 존재하는 활성 노트를
+  덮어쓰려 하면 거부.
+
+전체 인자 스키마는 표준 MCP `tools/list` 호출로 제공됩니다 — 실제 코드와 어긋나는 걸 막기 위해
+여기서는 더 자세히 중복 기술하지 않습니다.
+
+### 종단간 암호화(E2EE)
+
+이 서버는 E2EE 복호화 키를 영구적으로 보관하지 않습니다 — 애초에 특정 vault가 E2EE를 켜놨는지
+자체를 알지 못합니다(클라이언트 로컬 설정이라 전송된 적이 없음). 파일 내용을 다루는 모든 도구는
+대신 호출마다 선택적인 `e2ee_password` 인자를 받습니다:
+
+- **읽기**(`read_file_version`, `read_note`, `search_notes`, `search_by_frontmatter`)는 비밀번호가
+  주어지면 그때그때 복호화하고, 응답을 만들고 나면 그 키를 즉시 버립니다. 비밀번호가 없는데
+  내용이 UTF-8 텍스트로 디코딩되지 않으면 `e2ee_password`를 설정해서 다시 시도하라는 명확한
+  에러를 돌려줍니다(`search_notes`/`search_by_frontmatter`는 대신 텍스트로 읽을 수 없는 파일을
+  조용히 건너뜁니다 — vault 전체를 스캔할 때는 일부 읽을 수 없는 파일이 있는 게 정상이기
+  때문입니다).
+- **`write_note`**는 읽기처럼 잘못 짐작해도 되는 여유가 없습니다 — 잘못 짐작하면 즉시 다른
+  기기로 동기화되어 나가서 해당 파일이 깨집니다. `e2ee_password`가 주어지면 항상 그대로 신뢰해서
+  사용합니다 — 서버가 실제 클라이언트와 동일한 방식으로 콘텐츠를 암호화합니다(동일한 키 유도와
+  결정론적 IV, 실제 클라이언트 출력과 바이트 단위로 대조 검증됨). 주어지지 않으면 먼저 vault의
+  기존 파일 몇 개를 샘플링해보고, vault가 암호화된 것처럼 보이면 평문을 조용히 저장하는 대신 쓰기
+  자체를 거부합니다.
+- **`delete_note`/`rename_note`**는 비밀번호가 전혀 필요 없습니다 — 삭제는 바이트를 제거할
+  뿐이고, 이름변경은 바이트를 옮길 뿐이라 둘 다 파일 내용을 건드리지 않습니다.
+- 메타데이터만 다루는 도구들(`list_vaults`, `list_files`, `get_recent_notes`, `get_file_history`,
+  `list_published_files`)은 애초에 파일 내용을 건드리지 않으므로 이 문제와 무관합니다.
+
+### 알려진 제한사항
+
+서버발 알림(Streamable HTTP의 GET/SSE 절반)은 아직 구현되어 있지 않습니다 — `GET /mcp`는 `501`을
+반환합니다. 현재로선 서버가 연결된 MCP 클라이언트에게 능동적으로 보내야 할 게 없습니다.
 
 ## 스트리밍 업로드 (`UploadFilesStream`)
 
