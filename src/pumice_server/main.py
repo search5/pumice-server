@@ -29,6 +29,7 @@ from pumice_server.streaming_upload_resource import (
     resolve_owner_via_thread,
 )
 from pumice_server.watch_resource import WatchResource
+from pumice_server.mcp_resource import McpResource
 from pumice_server.change_notifier import ChangeNotifier
 from twisted.web.wsgi import WSGIResource
 from twisted.web.server import Site
@@ -189,8 +190,9 @@ def main():
         sync_resource = SyncServiceResource(servicer)
         streaming_resource = StreamingUploadResource(servicer, streaming_upload_metrics)
         watch_resource = WatchResource(repository, change_notifier)
+        mcp_resource = McpResource(repository, args.data_dir)
 
-        root_resource = RootResource(sync_resource, pyramid_resource, streaming_resource, watch_resource)
+        root_resource = RootResource(sync_resource, pyramid_resource, streaming_resource, watch_resource, mcp_resource)
         # Idle-connection timeout (no bytes received for this long -> drop). This is
         # twisted.web's own long-standing default (HTTPFactory.__init__(timeout=60)) --
         # spelled out explicitly here, at the same value, so it's a documented decision

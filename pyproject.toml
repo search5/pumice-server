@@ -20,6 +20,8 @@ dependencies = [
     "twisted>=26.4.0",
     "sqlalchemy-cubrid",
     "i18nice>=0.16.0",
+    "mcp>=2.0.0",
+    "cryptography>=50.0.0",
 ]
 
 [project.urls]
