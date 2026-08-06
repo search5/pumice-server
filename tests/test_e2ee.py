@@ -11,7 +11,7 @@ import base64
 
 import pytest
 
-from pumice_server.e2ee import DecryptionError, decrypt, derive_key
+from pumice_server.e2ee import DecryptionError, decrypt, derive_key, encrypt
 
 
 def test_derive_key_is_32_bytes():
@@ -62,3 +62,34 @@ def test_decrypt_rejects_tampered_ciphertext():
     key = derive_key("test-password-123", "test-vault")
     with pytest.raises(DecryptionError):
         decrypt(bytes(wire_blob), key)
+
+
+def test_encrypt_matches_real_client_ciphertext():
+    # Same reference vector as test_decrypt_matches_real_client_ciphertext, used in the opposite
+    # direction: encrypting "hello e2ee world" under this exact password/vault_id must reproduce
+    # the exact same bytes the real client produced -- this only holds if the IV derivation
+    # (SHA-256(plaintext)[:12], not random) matches the client exactly. A random IV would still
+    # produce *decryptable* ciphertext, but different bytes here, and would silently break the
+    # hash-based dedup that depends on identical content -> identical ciphertext across devices.
+    expected_wire_blob = base64.b64decode("7cVv31PI6om44N14q580ME3T9hrbP9Hl5KTNpO0ZCYETl0vrE9HjB4z2coc=")
+    key = derive_key("test-password-123", "test-vault")
+
+    wire_blob = encrypt(b"hello e2ee world", key)
+
+    assert wire_blob == expected_wire_blob
+
+
+def test_encrypt_output_round_trips_through_decrypt():
+    key = derive_key("pw", "vault1")
+    wire_blob = encrypt(b"some note content", key)
+    assert decrypt(wire_blob, key) == b"some note content"
+
+
+def test_encrypt_is_deterministic_for_identical_plaintext_and_key():
+    key = derive_key("pw", "vault1")
+    assert encrypt(b"same content", key) == encrypt(b"same content", key)
+
+
+def test_encrypt_differs_for_different_plaintext():
+    key = derive_key("pw", "vault1")
+    assert encrypt(b"content a", key) != encrypt(b"content b", key)

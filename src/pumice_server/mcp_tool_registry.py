@@ -84,6 +84,23 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
         "required": ["vault_id", "key", "value"],
     },
+    "write_note": {
+        "type": "object",
+        "properties": {
+            "vault_id": {"type": "string"},
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+            "e2ee_password": {
+                "type": "string",
+                "description": (
+                    "Pass this if the vault has end-to-end encryption enabled -- the content will "
+                    "be encrypted before being stored. Omitting it on an encrypted vault is refused "
+                    "rather than silently writing plain text."
+                ),
+            },
+        },
+        "required": ["vault_id", "path", "content"],
+    },
 }
 
 TOOL_DESCRIPTIONS: dict[str, str] = {
@@ -114,6 +131,13 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "If the vault has end-to-end encryption enabled, pass e2ee_password to search decrypted "
         "content -- otherwise encrypted files are silently skipped."
     ),
+    "write_note": (
+        "Create or overwrite a note's current content. If the vault has end-to-end encryption "
+        "enabled, pass e2ee_password -- the content will be encrypted the same way a real client "
+        "would before being stored, so it stays readable by every other device syncing this "
+        "vault. If the vault looks encrypted and no e2ee_password is given, the write is refused "
+        "rather than silently storing unencrypted content."
+    ),
 }
 
 
@@ -140,6 +164,7 @@ def dispatch_tool_call(
     arguments: Optional[dict[str, Any]],
     read_bytes: Optional[Callable[[str], bytes]] = None,
     read_vault_file: Optional[Callable[[str, str, str], bytes]] = None,
+    write_vault_file: Optional[Callable[[str, str, str, bytes], dict]] = None,
 ) -> dict:
     arguments = arguments or {}
 
@@ -202,6 +227,28 @@ def dispatch_tool_call(
         e2ee_password = arguments.get("e2ee_password") or None
         return mcp_tools.search_by_frontmatter(
             repository, owner_username, vault_id, key, value, read_file=read_vault_file, e2ee_password=e2ee_password
+        )
+
+    if tool_name == "write_note":
+        vault_id = _require_str(arguments, "vault_id")
+        path = _require_str(arguments, "path")
+        content = arguments.get("content")
+        if not isinstance(content, str):
+            raise ToolError("content is required and must be a string")
+        if read_vault_file is None:
+            raise ToolError("write_note is not available: no vault file reader was configured")
+        if write_vault_file is None:
+            raise ToolError("write_note is not available: no vault file writer was configured")
+        e2ee_password = arguments.get("e2ee_password") or None
+        return mcp_tools.write_note(
+            repository,
+            owner_username,
+            vault_id,
+            path,
+            content,
+            read_file=read_vault_file,
+            write_file=write_vault_file,
+            e2ee_password=e2ee_password,
         )
 
     raise ToolError(f"Unknown tool: {tool_name}")

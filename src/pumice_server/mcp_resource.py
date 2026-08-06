@@ -15,7 +15,10 @@ import asyncio
 import importlib.metadata
 import json
 import logging
+import os
 import secrets
+import shutil
+import time
 from contextlib import asynccontextmanager
 from typing import Dict, Optional
 
@@ -214,6 +217,48 @@ class McpResource(Resource):
         with open(full_path, "rb") as f:
             return f.read()
 
+    def _write_vault_file(self, owner_username: str, vault_id: str, path: str, raw: bytes) -> dict:
+        """Writes raw bytes as a note's new current content, then records a history backup --
+        mirrors service.py's own write path exactly (temp-file-then-rename, then hard-link the
+        result into history/): _backup_file's hard-link trick is only safe because a live file is
+        never edited in place, always replaced via a fresh temp file + os.rename(), so a past
+        backup's inode is never mutated retroactively. Deliberately skips service.py's
+        same-hash-skip-backup dedup optimization -- write_note is an occasional agent-driven write,
+        not continuous sync traffic, so the extra backup-per-write cost doesn't matter here, and
+        skipping the dedup check keeps this simpler."""
+        final_path = resolve_vault_file_path(self._data_dir, owner_username, vault_id, path)
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
+
+        temp_dir = os.path.join(self._data_dir, "tmp", owner_username, vault_id)
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"{secrets.token_hex(8)}.tmp")
+        with open(temp_path, "wb") as f:
+            f.write(raw)
+
+        if os.path.exists(final_path):
+            os.remove(final_path)
+        os.rename(temp_path, final_path)
+
+        stat = os.stat(final_path)
+        modified_at_ms = int(stat.st_mtime * 1000)
+        size_bytes = stat.st_size
+        backup_file_path = self._backup_vault_file(owner_username, vault_id, final_path)
+
+        return {"modified_at_ms": modified_at_ms, "size_bytes": size_bytes, "backup_file_path": backup_file_path}
+
+    def _backup_vault_file(self, owner_username: str, vault_id: str, source_path: str) -> str:
+        """Hard-links (or, failing that, copies) source_path into history/ -- mirrors service.py's
+        _backup_file exactly."""
+        backup_dir = os.path.join(self._data_dir, "history", owner_username, vault_id)
+        os.makedirs(backup_dir, exist_ok=True)
+        timestamp = int(time.time() * 1000)
+        backup_file_path = os.path.join(backup_dir, f"{timestamp}_{secrets.token_hex(4)}.bak")
+        try:
+            os.link(source_path, backup_file_path)
+        except OSError:
+            shutil.copy2(source_path, backup_file_path)
+        return backup_file_path
+
     def _create_session(self, owner_username: str) -> _McpSession:
         client_to_server_send, client_to_server_receive = anyio.create_memory_object_stream(0)
         server_to_client_send, server_to_client_receive = anyio.create_memory_object_stream(0)
@@ -240,6 +285,7 @@ class McpResource(Resource):
                     params.name,
                     params.arguments,
                     read_vault_file=self._read_vault_file,
+                    write_vault_file=self._write_vault_file,
                 )
                 text = json.dumps(result, ensure_ascii=False)
                 return types.CallToolResult(content=[types.TextContent(type="text", text=text)])

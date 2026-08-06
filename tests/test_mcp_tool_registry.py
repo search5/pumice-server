@@ -53,8 +53,14 @@ class FakeRepository:
             return None
         return {"path": path, "modified_at_ms": 1, "size_bytes": 1, "content_hash": "h", "is_deleted": False}
 
+    def save_one(self, owner_username, vault_id, path, meta):
+        self.calls.append(("save_one", owner_username, vault_id, path, meta))
 
-def test_all_nine_tools_have_schemas_and_descriptions():
+    def add_history(self, **kwargs):
+        self.calls.append(("add_history", kwargs))
+
+
+def test_all_ten_tools_have_schemas_and_descriptions():
     expected = {
         "list_vaults",
         "list_files",
@@ -65,6 +71,7 @@ def test_all_nine_tools_have_schemas_and_descriptions():
         "search_notes",
         "read_note",
         "search_by_frontmatter",
+        "write_note",
     }
     assert set(TOOL_SCHEMAS.keys()) == expected
     assert set(TOOL_DESCRIPTIONS.keys()) == expected
@@ -267,4 +274,71 @@ def test_search_by_frontmatter_dispatch_passes_args_and_uses_injected_reader():
     )
     assert repo.calls == [("load_all", "alice", "vault1")]
     assert result == {"paths": ["a.md"], "truncated": False}
+
+
+def _fake_write_vault_file(_owner, _vault_id, _path, raw):
+    return {"modified_at_ms": 1, "size_bytes": len(raw), "backup_file_path": "/fake/x.bak"}
+
+
+def test_write_note_dispatch_requires_vault_id_path_and_content():
+    repo = FakeRepository()
+    with pytest.raises(ToolError):
+        dispatch_tool_call(repo, "alice", "write_note", {"vault_id": "vault1", "path": "a.md"})
+    with pytest.raises(ToolError):
+        dispatch_tool_call(repo, "alice", "write_note", {"path": "a.md", "content": "x"})
+    with pytest.raises(ToolError):
+        dispatch_tool_call(repo, "alice", "write_note", {"vault_id": "vault1", "content": "x"})
+
+
+def test_write_note_dispatch_requires_configured_readers_and_writer():
+    repo = FakeRepository()
+    with pytest.raises(ToolError, match="reader|writer"):
+        dispatch_tool_call(repo, "alice", "write_note", {"vault_id": "vault1", "path": "a.md", "content": "x"})
+    with pytest.raises(ToolError, match="reader|writer"):
+        dispatch_tool_call(
+            repo,
+            "alice",
+            "write_note",
+            {"vault_id": "vault1", "path": "a.md", "content": "x"},
+            read_vault_file=lambda *_: b"plain",
+        )
+
+
+def test_write_note_dispatch_passes_args_and_uses_injected_reader_and_writer():
+    repo = FakeRepository()
+    result = dispatch_tool_call(
+        repo,
+        "alice",
+        "write_note",
+        {"vault_id": "vault1", "path": "a.md", "content": "hello world"},
+        read_vault_file=lambda *_: b"plain",
+        write_vault_file=_fake_write_vault_file,
+    )
+    assert result == {"path": "a.md", "size_bytes": 11, "encrypted": False}
+
+    save_one_calls = [c for c in repo.calls if c[0] == "save_one"]
+    assert len(save_one_calls) == 1
+    _, owner, vault_id, path, meta = save_one_calls[0]
+    assert (owner, vault_id, path) == ("alice", "vault1", "a.md")
+    assert meta["modified_at_ms"] == 1
+    assert meta["size_bytes"] == 11
+    assert meta["is_deleted"] is False
+    assert meta["content_hash"]
+
+    add_history_calls = [c for c in repo.calls if c[0] == "add_history"]
+    assert len(add_history_calls) == 1
+
+
+def test_write_note_dispatch_passes_optional_password_through():
+    repo = FakeRepository()
+    result = dispatch_tool_call(
+        repo,
+        "alice",
+        "write_note",
+        {"vault_id": "vault1", "path": "a.md", "content": "hello world", "e2ee_password": ""},
+        read_vault_file=lambda *_: b"plain",
+        write_vault_file=_fake_write_vault_file,
+    )
+    # Empty-string password treated as "no password", same convention as the other tools.
+    assert result["encrypted"] is False
 

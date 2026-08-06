@@ -13,10 +13,11 @@ what repository.py itself already guards.
 """
 
 import base64
+import hashlib
 import os
 from typing import Callable, Optional
 
-from .e2ee import DecryptionError, decrypt, derive_key
+from .e2ee import DecryptionError, decrypt, derive_key, encrypt
 
 
 class ToolError(Exception):
@@ -282,3 +283,96 @@ def search_by_frontmatter(
         matches.append(path)
 
     return {"paths": matches, "truncated": truncated}
+
+
+def _vault_looks_encrypted(
+    repository, owner_username: str, vault_id: str, read_file: Callable[[str, str, str], bytes], sample_size: int
+) -> bool:
+    """Heuristic for write_note when no e2ee_password was given: sample a few of the vault's
+    existing active files and see if any fail to decode as UTF-8 text. The server has no actual
+    record of whether E2EE is on (it's a client-local setting, never transmitted -- see #5-1), so
+    this is the same kind of best-effort inference read_note/read_file_version already use, just
+    applied before a write instead of after a read. A vault with no existing files (or none
+    readable) is treated as unencrypted -- there's nothing to infer from, and the first write
+    establishes the convention."""
+    files = repository.load_all(owner_username, vault_id)
+    active_paths = sorted(path for path, meta in files.items() if not meta.get("is_deleted"))
+    for sample_path in active_paths[:sample_size]:
+        try:
+            raw = read_file(owner_username, vault_id, sample_path)
+        except OSError:
+            continue
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return True
+    return False
+
+
+def write_note(
+    repository,
+    owner_username: str,
+    vault_id: str,
+    path: str,
+    content: str,
+    read_file: Callable[[str, str, str], bytes],
+    write_file: Callable[[str, str, str, bytes], dict],
+    e2ee_password: Optional[str] = None,
+    sample_size: int = 3,
+) -> dict:
+    """Creates or overwrites a note's current content. Unlike the read tools, a write can't afford
+    to guess wrong and let the caller retry -- a plaintext write into an E2EE vault immediately
+    syncs out and corrupts that file for every other device. So: if e2ee_password is given, it's
+    trusted outright and always used (explicit signal wins, same convention as the read tools). If
+    not given, existing files in the vault are sampled first (_vault_looks_encrypted) and the
+    write is refused, rather than silently writing plaintext, if the vault looks encrypted.
+
+    write_file does the actual disk write plus history backup-file creation (mirroring what a
+    normal client sync does via service.py's own scan-and-backup logic) and reports back the real
+    on-disk modified_at_ms/size_bytes/backup_file_path, which are then recorded via
+    repository.save_one/add_history so this shows up exactly like any other synced version --
+    visible to list_files/get_recent_notes and any other device's next sync."""
+    plaintext_bytes = content.encode("utf-8")
+
+    if e2ee_password:
+        key = derive_key(e2ee_password, vault_id)
+        raw = encrypt(plaintext_bytes, key)
+        encrypted = True
+    else:
+        if _vault_looks_encrypted(repository, owner_username, vault_id, read_file, sample_size):
+            raise ToolError(
+                "This vault appears to have end-to-end encryption enabled (existing notes aren't "
+                "plain text) -- retry with the e2ee_password argument set. Writing plain text here "
+                "would break decryption for every other device syncing this vault."
+            )
+        raw = plaintext_bytes
+        encrypted = False
+
+    write_result = write_file(owner_username, vault_id, path, raw)
+    content_hash = hashlib.sha256(raw).hexdigest()
+
+    repository.save_one(
+        owner_username,
+        vault_id,
+        path,
+        {
+            "path": path,
+            "modified_at_ms": write_result["modified_at_ms"],
+            "size_bytes": write_result["size_bytes"],
+            "content_hash": content_hash,
+            "is_deleted": False,
+        },
+    )
+    repository.add_history(
+        owner_username=owner_username,
+        vault_id=vault_id,
+        path=path,
+        modified_at_ms=write_result["modified_at_ms"],
+        size_bytes=write_result["size_bytes"],
+        content_hash=content_hash,
+        backup_file_path=write_result.get("backup_file_path", ""),
+        device_name="MCP",
+        user_name=owner_username,
+    )
+
+    return {"path": path, "size_bytes": write_result["size_bytes"], "encrypted": encrypted}

@@ -1,16 +1,21 @@
-"""Mirrors syncClient.ts's getE2eeKey()/decryptData() exactly -- this server never generates E2EE
-ciphertext itself (it's a "dumb" encrypted-blob store, see #5-1 in
-MCP_STREAMABLE_HTTP_구현_계획.md), it only ever decrypts what a real client already produced, on
-demand, for the read-only MCP tools (read_file_version/read_note/search_notes/
-search_by_frontmatter). The derived key is never persisted anywhere -- callers must derive it fresh
-per request and let it fall out of scope when done.
+"""Mirrors syncClient.ts's getE2eeKey()/encryptData()/decryptData() exactly -- this server never
+generates E2EE ciphertext on its own initiative (it's a "dumb" encrypted-blob store, see #5-1 in
+MCP_STREAMABLE_HTTP_구현_계획.md); it only decrypts what a real client already produced (for
+read_file_version/read_note/search_notes/search_by_frontmatter) or encrypts content an MCP caller
+explicitly asked to write (write_note, when the caller supplies e2ee_password). The derived key is
+never persisted anywhere -- callers must derive it fresh per request and let it fall out of scope
+when done.
 
 Wire format (must match syncClient.ts's encryptData() exactly): 12-byte IV, then 16-byte GCM tag,
 then ciphertext. The IV is not random -- the client derives it deterministically from
 SHA-256(plaintext)[:12] so that re-encrypting unchanged content always reproduces the same
-ciphertext (see syncClient.ts's own comment on this), which this module has no need to replicate
-since it only ever decrypts.
+ciphertext (see syncClient.ts's own comment on this). encrypt() replicates that derivation exactly
+(not a random IV) so that if a real client later independently encrypts the same plaintext, it
+produces byte-identical ciphertext -- the hash-based dedup/change-detection this whole sync system
+relies on depends on that invariant holding across every writer, not just real clients.
 """
+
+import hashlib
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -54,3 +59,13 @@ def decrypt(wire_blob: bytes, key: bytes) -> bytes:
         return aesgcm.decrypt(iv, ciphertext + tag, None)
     except InvalidTag as e:
         raise DecryptionError("Decryption failed: wrong password or corrupted data") from e
+
+
+def encrypt(plaintext: bytes, key: bytes) -> bytes:
+    iv = hashlib.sha256(plaintext).digest()[:_IV_LENGTH_BYTES]
+    aesgcm = AESGCM(key)
+    # AESGCM.encrypt returns ciphertext with the 16-byte tag appended -- split it apart to match
+    # the wire format's [iv][tag][ciphertext] layout (decrypt()'s exact inverse).
+    ciphertext_and_tag = aesgcm.encrypt(iv, plaintext, None)
+    ciphertext, tag = ciphertext_and_tag[:-_TAG_LENGTH_BYTES], ciphertext_and_tag[-_TAG_LENGTH_BYTES:]
+    return iv + tag + ciphertext

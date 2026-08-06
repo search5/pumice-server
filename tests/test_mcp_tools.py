@@ -10,7 +10,7 @@ import base64
 
 import pytest
 
-from pumice_server.e2ee import derive_key
+from pumice_server.e2ee import decrypt, derive_key, encrypt
 from pumice_server.mcp_tools import (
     ToolError,
     get_file_history,
@@ -23,6 +23,7 @@ from pumice_server.mcp_tools import (
     resolve_vault_file_path,
     search_by_frontmatter,
     search_notes,
+    write_note,
 )
 
 
@@ -35,6 +36,7 @@ class FakeRepository:
         self._history = {}  # (owner, vault_id, path) -> [entry, ...], newest first
         self._history_by_id = {}  # history_id -> entry
         self._published = {}  # (owner, vault_id) -> [{"path", "hash"}]
+        self.add_history_calls = []
 
     def get_vaults_by_owner(self, owner_username):
         return sorted(self._vaults_by_owner.get(owner_username, set()))
@@ -44,6 +46,13 @@ class FakeRepository:
 
     def load_one(self, owner_username, vault_id, path):
         return self._files.get((owner_username, vault_id), {}).get(path)
+
+    def save_one(self, owner_username, vault_id, path, meta):
+        self._vaults_by_owner.setdefault(owner_username, set()).add(vault_id)
+        self._files.setdefault((owner_username, vault_id), {})[path] = dict(meta)
+
+    def add_history(self, **kwargs):
+        self.add_history_calls.append(kwargs)
 
     def get_history(self, owner_username, vault_id, path):
         return list(self._history.get((owner_username, vault_id, path), []))
@@ -618,3 +627,165 @@ def test_resolve_vault_file_path_rejects_sibling_vault_prefix_collision(tmp_path
     (tmp_path / "vaults" / "alice" / "vault1x").mkdir(parents=True)
     with pytest.raises(ToolError):
         resolve_vault_file_path(data_dir, "alice", "vault1", "../vault1x/secret.md")
+
+
+class FakeWriter:
+    """Records what write_note actually wrote, and stands in for the production write_file
+    callable (which does real disk I/O + backup-file creation and reports back the resulting
+    modified_at_ms/size_bytes/backup_file_path -- see mcp_resource.py)."""
+
+    def __init__(self, modified_at_ms=12345):
+        self.written = {}  # (owner, vault_id, path) -> raw bytes
+        self.modified_at_ms = modified_at_ms
+
+    def __call__(self, owner_username, vault_id, path, raw):
+        self.written[(owner_username, vault_id, path)] = raw
+        return {"modified_at_ms": self.modified_at_ms, "size_bytes": len(raw), "backup_file_path": "/fake/new.bak"}
+
+
+def test_write_note_writes_plaintext_to_new_file_in_empty_vault():
+    repo = FakeRepository()
+    writer = FakeWriter()
+
+    result = write_note(repo, "alice", "vault1", "new.md", "hello world", read_file=lambda *_: b"", write_file=writer)
+
+    assert writer.written[("alice", "vault1", "new.md")] == b"hello world"
+    assert result == {"path": "new.md", "size_bytes": 11, "encrypted": False}
+
+
+def test_write_note_writes_plaintext_when_existing_files_are_plaintext():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md")
+    writer = FakeWriter()
+
+    write_note(
+        repo, "alice", "vault1", "b.md", "new content", read_file=lambda *_: b"existing plaintext", write_file=writer
+    )
+
+    assert writer.written[("alice", "vault1", "b.md")] == b"new content"
+
+
+def test_write_note_refuses_plaintext_write_when_existing_files_look_encrypted():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md")
+    writer = FakeWriter()
+
+    with pytest.raises(ToolError, match="e2ee_password"):
+        write_note(
+            repo,
+            "alice",
+            "vault1",
+            "b.md",
+            "new content",
+            read_file=lambda *_: b"\xff\xfe\x00\x01not-utf8",
+            write_file=writer,
+        )
+    assert writer.written == {}
+
+
+def test_write_note_ignores_deleted_files_when_checking_for_encryption():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "gone.md", is_deleted=True)
+    writer = FakeWriter()
+
+    # The only existing file "looks encrypted", but it's deleted -- shouldn't be sampled, so this
+    # (otherwise-empty) vault is still treated as unencrypted.
+    write_note(
+        repo,
+        "alice",
+        "vault1",
+        "new.md",
+        "hello",
+        read_file=lambda *_: b"\xff\xfe\x00\x01not-utf8",
+        write_file=writer,
+    )
+
+    assert writer.written[("alice", "vault1", "new.md")] == b"hello"
+
+
+def test_write_note_encrypts_when_password_given():
+    repo = FakeRepository()
+    writer = FakeWriter()
+    password, vault_id = "correct horse", "vault1"
+
+    result = write_note(
+        repo, "alice", vault_id, "a.md", "secret content", read_file=lambda *_: b"", write_file=writer,
+        e2ee_password=password,
+    )
+
+    key = derive_key(password, vault_id)
+    expected_wire_blob = encrypt(b"secret content", key)
+    assert writer.written[("alice", vault_id, "a.md")] == expected_wire_blob
+    assert result["encrypted"] is True
+    # And it must actually be decryptable by a real client with the same password afterward.
+    assert decrypt(writer.written[("alice", vault_id, "a.md")], key) == b"secret content"
+
+
+def test_write_note_encrypts_even_when_existing_files_look_like_plaintext():
+    # Explicit e2ee_password always wins over the "existing files look unencrypted" inference --
+    # e.g. the very first write to a fresh vault the caller already knows should be encrypted.
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md")
+    writer = FakeWriter()
+
+    result = write_note(
+        repo,
+        "alice",
+        "vault1",
+        "b.md",
+        "secret",
+        read_file=lambda *_: b"totally plain text",
+        write_file=writer,
+        e2ee_password="pw",
+    )
+
+    assert result["encrypted"] is True
+    assert writer.written[("alice", "vault1", "b.md")] != b"secret"
+
+
+def test_write_note_updates_repository_metadata():
+    repo = FakeRepository()
+    writer = FakeWriter(modified_at_ms=999)
+
+    write_note(repo, "alice", "vault1", "new.md", "hello world", read_file=lambda *_: b"", write_file=writer)
+
+    meta = repo.load_one("alice", "vault1", "new.md")
+    assert meta["path"] == "new.md"
+    assert meta["modified_at_ms"] == 999
+    assert meta["size_bytes"] == len(b"hello world")
+    assert meta["is_deleted"] is False
+    assert meta["content_hash"]  # non-empty
+
+
+def test_write_note_records_a_history_entry():
+    repo = FakeRepository()
+    writer = FakeWriter(modified_at_ms=999)
+
+    write_note(repo, "alice", "vault1", "new.md", "hello world", read_file=lambda *_: b"", write_file=writer)
+
+    assert len(repo.add_history_calls) == 1
+    entry = repo.add_history_calls[0]
+    assert entry["owner_username"] == "alice"
+    assert entry["vault_id"] == "vault1"
+    assert entry["path"] == "new.md"
+    assert entry["modified_at_ms"] == 999
+    assert entry["backup_file_path"] == "/fake/new.bak"
+
+
+def test_write_note_only_samples_first_few_existing_files():
+    repo = FakeRepository()
+    # 5 plaintext files, then one that looks encrypted -- default sample_size is small enough
+    # that the encrypted-looking one (sorted last) is never even looked at.
+    for i in range(5):
+        repo.seed_file("alice", "vault1", f"{i}.md")
+    repo.seed_file("alice", "vault1", "z-encrypted-looking.md")
+    writer = FakeWriter()
+
+    def read_file(_owner, _vault_id, path):
+        if path == "z-encrypted-looking.md":
+            return b"\xff\xfe\x00\x01not-utf8"
+        return b"plain text"
+
+    write_note(repo, "alice", "vault1", "new.md", "hello", read_file=read_file, write_file=writer, sample_size=3)
+
+    assert writer.written[("alice", "vault1", "new.md")] == b"hello"
