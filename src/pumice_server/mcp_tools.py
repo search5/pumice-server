@@ -289,24 +289,37 @@ def _vault_looks_encrypted(
     repository, owner_username: str, vault_id: str, read_file: Callable[[str, str, str], bytes], sample_size: int
 ) -> bool:
     """Heuristic for write_note when no e2ee_password was given: sample a few of the vault's
-    existing active files and see if any fail to decode as UTF-8 text. The server has no actual
+    existing active files and see if they fail to decode as UTF-8 text. The server has no actual
     record of whether E2EE is on (it's a client-local setting, never transmitted -- see #5-1), so
     this is the same kind of best-effort inference read_note/read_file_version already use, just
-    applied before a write instead of after a read. A vault with no existing files (or none
-    readable) is treated as unencrypted -- there's nothing to infer from, and the first write
-    establishes the convention."""
+    applied before a write instead of after a read.
+
+    Requires the ENTIRE sample to fail decoding, not just one file -- E2EE encrypts every file
+    uniformly, so a genuinely encrypted vault's sample should fail unanimously. A vault with
+    ordinary binary attachments (images, PDFs, ...) mixed in with plaintext notes is the normal
+    case, not a signal of encryption; treating any single binary file in the sample as "looks
+    encrypted" produces false positives whenever such a file happens to sort early among the
+    vault's paths (confirmed in production: a .jpg attachment alone triggered this on an
+    unencrypted vault). A vault with no existing files (or none readable) is treated as
+    unencrypted -- there's nothing to infer from, and the first write establishes the convention.
+    """
     files = repository.load_all(owner_username, vault_id)
     active_paths = sorted(path for path, meta in files.items() if not meta.get("is_deleted"))
+
+    checked = 0
+    failed = 0
     for sample_path in active_paths[:sample_size]:
         try:
             raw = read_file(owner_username, vault_id, sample_path)
         except OSError:
             continue
+        checked += 1
         try:
             raw.decode("utf-8")
         except UnicodeDecodeError:
-            return True
-    return False
+            failed += 1
+
+    return checked > 0 and failed == checked
 
 
 def write_note(

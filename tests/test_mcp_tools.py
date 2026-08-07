@@ -725,6 +725,47 @@ def test_write_note_refuses_plaintext_write_when_existing_files_look_encrypted()
     assert writer.written == {}
 
 
+def test_write_note_writes_plaintext_when_only_some_sampled_files_look_encrypted():
+    # A vault with ordinary binary attachments (images, PDFs, ...) sorted early among the
+    # sampled paths must not be mistaken for an encrypted vault -- real E2EE encrypts every
+    # file uniformly, so a real encrypted vault's sample should fail unanimously. A single
+    # binary attachment mixed in with otherwise-plaintext notes is the normal, expected case,
+    # not a signal of encryption.
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.jpg")  # binary attachment, sorted first
+    repo.seed_file("alice", "vault1", "b.md")
+    repo.seed_file("alice", "vault1", "c.md")
+    writer = FakeWriter()
+
+    def read_file(_owner, _vault_id, path):
+        if path == "a.jpg":
+            return b"\xff\xd8\xff\xe0binary-jpeg-bytes"
+        return b"plain text content"
+
+    write_note(repo, "alice", "vault1", "new.md", "hello", read_file=read_file, write_file=writer)
+
+    assert writer.written[("alice", "vault1", "new.md")] == b"hello"
+
+
+def test_write_note_refuses_when_all_sampled_files_look_encrypted():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md")
+    repo.seed_file("alice", "vault1", "b.md")
+    writer = FakeWriter()
+
+    with pytest.raises(ToolError, match="e2ee_password"):
+        write_note(
+            repo,
+            "alice",
+            "vault1",
+            "c.md",
+            "new content",
+            read_file=lambda *_: b"\xff\xfe\x00\x01not-utf8",
+            write_file=writer,
+        )
+    assert writer.written == {}
+
+
 def test_write_note_ignores_deleted_files_when_checking_for_encryption():
     repo = FakeRepository()
     repo.seed_file("alice", "vault1", "gone.md", is_deleted=True)
