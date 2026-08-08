@@ -87,15 +87,15 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
-    def enable_plugin(self, owner_username: str, plugin_id: str, enabled_at_ms: int) -> None:
+    def enable_plugin(self, owner_username: str, vault_id: str, plugin_id: str, enabled_at_ms: int) -> None:
         pass
 
     @abstractmethod
-    def disable_plugin(self, owner_username: str, plugin_id: str) -> None:
+    def disable_plugin(self, owner_username: str, vault_id: str, plugin_id: str) -> None:
         pass
 
     @abstractmethod
-    def list_enabled_plugins(self, owner_username: str) -> list:
+    def list_enabled_plugins(self, owner_username: str, vault_id: str) -> list:
         pass
 
     @abstractmethod
@@ -244,16 +244,22 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         )
 
         # Which server-side publish plugins (plugin_registry.py) are turned on for a given
-        # owner -- a plugin can be baked into the server image (declared as a build-time
+        # vault -- a plugin can be baked into the server image (declared as a build-time
         # pumice-server dependency, discoverable via discover_plugins()) without being enabled
-        # anywhere; a row here is what actually lets it run, and each owner enables it for
-        # themselves (self-service, not an admin action). Scoped by owner_username only,
-        # not owner+vault: once on for an account it applies
-        # across every vault that account owns -- the vault a plugin resolver needs is already
-        # known from the publish request's own path (/publish/{username}/{vault_id}/...) at the
-        # point a plugin would actually run, so there's nothing to look up per-vault here.
+        # anywhere; a row here is what actually lets it run when that vault gets published.
+        # Scoped by (owner_username, vault_id, plugin_id), mirroring how Obsidian itself scopes
+        # plugins per vault, not per account -- a user might have harang-immich enabled in one
+        # vault (where they actually embed Immich photos) but not in an unrelated vault they
+        # also own, and publishing that second vault must never run harang-immich's syntax
+        # resolution over it just because the account has the plugin on elsewhere. This was
+        # originally scoped by owner_username alone; reverted after realizing that reasoning
+        # only holds for *installation* (a server-wide, account-independent concept -- the code
+        # either exists in the image or it doesn't), not *enablement*, which is a genuine
+        # per-vault choice with no way to derive "should this vault run this plugin at all"
+        # from request context the way a resolver's actual target vault can be.
         self._plugin_enablement = Table("plugin_enablement", self._meta,
             Column("owner_username", String(100), primary_key=True),
+            Column("vault_id", String(255), primary_key=True),
             Column("plugin_id", String(255), primary_key=True),
             Column("enabled_at_ms", BigInteger, nullable=False),
         )
@@ -506,28 +512,31 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             ).fetchall()
             return [{"path": r.path, "hash": r.content_hash} for r in rows]
 
-    def enable_plugin(self, owner_username: str, plugin_id: str, enabled_at_ms: int) -> None:
+    def enable_plugin(self, owner_username: str, vault_id: str, plugin_id: str, enabled_at_ms: int) -> None:
         with self.engine.begin() as conn:
             self._upsert(conn, self._plugin_enablement, {
                 "owner_username": owner_username,
+                "vault_id": vault_id,
                 "plugin_id": plugin_id,
                 "enabled_at_ms": enabled_at_ms,
-            }, ["owner_username", "plugin_id"])
+            }, ["owner_username", "vault_id", "plugin_id"])
 
-    def disable_plugin(self, owner_username: str, plugin_id: str) -> None:
+    def disable_plugin(self, owner_username: str, vault_id: str, plugin_id: str) -> None:
         with self.engine.begin() as conn:
             conn.execute(
                 delete(self._plugin_enablement).where(
                     self._plugin_enablement.c.owner_username == owner_username,
+                    self._plugin_enablement.c.vault_id == vault_id,
                     self._plugin_enablement.c.plugin_id == plugin_id,
                 )
             )
 
-    def list_enabled_plugins(self, owner_username: str) -> list:
+    def list_enabled_plugins(self, owner_username: str, vault_id: str) -> list:
         with self.engine.connect() as conn:
             rows = conn.execute(
                 select(self._plugin_enablement).where(
                     self._plugin_enablement.c.owner_username == owner_username,
+                    self._plugin_enablement.c.vault_id == vault_id,
                 )
             ).fetchall()
             return [{"plugin_id": r.plugin_id, "enabled_at_ms": r.enabled_at_ms} for r in rows]
@@ -538,6 +547,7 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             return [
                 {
                     "owner_username": r.owner_username,
+                    "vault_id": r.vault_id,
                     "plugin_id": r.plugin_id,
                     "enabled_at_ms": r.enabled_at_ms,
                 }

@@ -13,6 +13,7 @@ from pyramid.response import Response
 from pyramid.view import view_config
 
 from .plugin_registry import discover_plugins
+from .plugin_loader import run_enabled_plugins
 from . import oauth_server
 
 logger = logging.getLogger("pumice_server.web")
@@ -1035,6 +1036,10 @@ def publish_view(request):
         
     processed_md = parse_wikilinks(strip_frontmatter(md_content), username, vault_id)
 
+    enabled_plugin_ids = [p["plugin_id"] for p in request.repository.list_enabled_plugins(username, vault_id)]
+    if enabled_plugin_ids:
+        processed_md = run_enabled_plugins(processed_md, enabled_plugin_ids, owner_username=username, vault_id=vault_id)
+
     import markdown
     html_content = markdown.markdown(processed_md, extensions=['extra', 'codehilite', 'toc'])
 
@@ -1386,11 +1391,16 @@ def admin_plugins_view(request):
         "enabled": request.repository.list_all_enabled_plugins(),
     }
 
-@view_config(route_name='user_plugins', renderer='json', permission='authenticated')
-def user_plugins_view(request):
-    username = request.identity["username"]
+@view_config(route_name='publish_plugins', renderer='json', permission='vault-access')
+def publish_plugins_view(request):
+    # Vault-scoped, not account-scoped -- lives in the publish tab next to the vault's other
+    # publish settings (slug, password, ...), not in My Page, because "should this plugin's
+    # syntax get resolved when THIS vault is published" is a per-vault choice, the same way
+    # installing/enabling a plugin in Obsidian itself is scoped per vault, not per account.
+    vault_id = request.context.vault_id
+    owner = request.context.owner
     manifests = discover_plugins()
-    enabled_ids = {p["plugin_id"] for p in request.repository.list_enabled_plugins(username)}
+    enabled_ids = {p["plugin_id"] for p in request.repository.list_enabled_plugins(owner, vault_id)}
     return {
         "installed": [
             {
@@ -1404,9 +1414,10 @@ def user_plugins_view(request):
         ],
     }
 
-@view_config(route_name='user_plugin_enable', renderer='json', permission='authenticated')
-def user_plugin_enable_view(request):
-    username = request.identity["username"]
+@view_config(route_name='publish_plugin_enable', renderer='json', permission='vault-access')
+def publish_plugin_enable_view(request):
+    vault_id = request.context.vault_id
+    owner = request.context.owner
     try:
         body = request.json_body
         plugin_id = body.get("plugin_id")
@@ -1417,24 +1428,25 @@ def user_plugin_enable_view(request):
         if plugin_id not in {m.plugin_id for m in manifests}:
             return Response(status=400, body=json.dumps({"error": f"Plugin '{plugin_id}' is not installed"}).encode("utf-8"), content_type="application/json")
 
-        request.repository.enable_plugin(username, plugin_id, int(time.time() * 1000))
-        logger.info(f"User '{username}' enabled plugin '{plugin_id}' for themselves")
+        request.repository.enable_plugin(owner, vault_id, plugin_id, int(time.time() * 1000))
+        logger.info(f"User '{owner}' enabled plugin '{plugin_id}' for vault '{vault_id}'")
         return {"ok": True}
     except Exception as e:
         logger.error(f"Failed to enable plugin: {e}")
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
 
-@view_config(route_name='user_plugin_disable', renderer='json', permission='authenticated')
-def user_plugin_disable_view(request):
-    username = request.identity["username"]
+@view_config(route_name='publish_plugin_disable', renderer='json', permission='vault-access')
+def publish_plugin_disable_view(request):
+    vault_id = request.context.vault_id
+    owner = request.context.owner
     try:
         body = request.json_body
         plugin_id = body.get("plugin_id")
         if not plugin_id:
             return Response(status=400, body=json.dumps({"error": "Missing plugin_id"}).encode("utf-8"), content_type="application/json")
 
-        request.repository.disable_plugin(username, plugin_id)
-        logger.info(f"User '{username}' disabled plugin '{plugin_id}' for themselves")
+        request.repository.disable_plugin(owner, vault_id, plugin_id)
+        logger.info(f"User '{owner}' disabled plugin '{plugin_id}' for vault '{vault_id}'")
         return {"ok": True}
     except Exception as e:
         logger.error(f"Failed to disable plugin: {e}")
@@ -1623,9 +1635,6 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.add_route('admin_published', '/api/admin/published')
     config.add_route('admin_streaming_stats', '/api/admin/streaming-stats')
     config.add_route('admin_plugins', '/api/admin/plugins')
-    config.add_route('user_plugins', '/api/user/plugins')
-    config.add_route('user_plugin_enable', '/api/user/plugins/enable')
-    config.add_route('user_plugin_disable', '/api/user/plugins/disable')
     config.add_route('get_token_info', '/api/token/info')
     config.add_route('oauth_protected_resource_metadata', '/.well-known/oauth-protected-resource')
     config.add_route('oauth_authorization_server_metadata', '/.well-known/oauth-authorization-server')
@@ -1644,6 +1653,9 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.add_route('publish_customurl', '/api/customurl')
     config.add_route('publish_slug', '/api/slug', factory=VaultContext)
     config.add_route('publish_password', '/api/password', factory=VaultContext)
+    config.add_route('publish_plugins', '/api/publish/plugins', factory=VaultContext)
+    config.add_route('publish_plugin_enable', '/api/publish/plugins/enable', factory=VaultContext)
+    config.add_route('publish_plugin_disable', '/api/publish/plugins/disable', factory=VaultContext)
     # Register the specific /publish/share/* routes before the wildcard /publish/{vault_id}/{path:.*}
     config.add_route('publish_share_list', '/publish/share/list', factory=VaultContext)
     config.add_route('publish_share_invite', '/publish/share/invite', factory=VaultContext)

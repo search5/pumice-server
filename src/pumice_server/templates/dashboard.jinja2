@@ -615,7 +615,6 @@
             <div class="subtabs">
                 <button type="button" class="subtab-item active" onclick="switchMypageSubtab('profile')">{{ t('mypage.profile_heading') }}</button>
                 <button type="button" class="subtab-item" onclick="switchMypageSubtab('devices')">{{ t('mypage.devices_heading') }}</button>
-                <button type="button" class="subtab-item" onclick="switchMypageSubtab('plugins')">{{ t('myplugins.heading') }}</button>
             </div>
 
             <div id="mypage-subtab-profile" class="subtab-content active">
@@ -676,24 +675,6 @@
                 </div>
             </div>
 
-            <div id="mypage-subtab-plugins" class="subtab-content">
-                <div class="table-container">
-                    <table id="myPluginsTable">
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>{{ t('myplugins.col_description') }}</th>
-                                <th>{{ t('myplugins.col_version') }}</th>
-                                <th>{{ t('myplugins.col_status') }}</th>
-                                <th>{{ t('common.col_actions') }}</th>
-                            </tr>
-                        </thead>
-                        <tbody id="myPluginsTableBody">
-                            <tr><td colspan="5" class="empty-state">{{ t('common.loading') }}</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
         </div>
 
         <!-- 탭 2: Vault 동기화 관리 -->
@@ -737,7 +718,7 @@
             </div>
 
             <div class="selector-bar">
-                <select id="siteSelect" onchange="loadSiteFiles()">
+                <select id="siteSelect" onchange="loadSiteFiles(); loadSitePlugins();">
                     <option value="">{{ t('publish.select_site') }}</option>
                 </select>
             </div>
@@ -757,6 +738,27 @@
                         <tr>
                             <td colspan="5" class="empty-state">{{ t('publish.empty_select_site') }}</td>
                         </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- 이 vault를 퍼블리시할 때 어떤 서버 플러그인 문법을 해석할지 -- 계정 전체가
+                 아니라 이 vault에 대해서만. 옵시디언에서 플러그인을 vault마다 켜고 끄는 것과
+                 같은 스코프. -->
+            <div style="font-weight: 600; font-size: 15px; margin: 30px 0 10px;">{{ t('myplugins.heading') }}</div>
+            <div class="table-container">
+                <table id="publishPluginsTable">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>{{ t('myplugins.col_description') }}</th>
+                            <th>{{ t('myplugins.col_version') }}</th>
+                            <th>{{ t('myplugins.col_status') }}</th>
+                            <th>{{ t('common.col_actions') }}</th>
+                        </tr>
+                    </thead>
+                    <tbody id="publishPluginsTableBody">
+                        <tr><td colspan="5" class="empty-state">{{ t('publish.empty_select_site') }}</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -833,12 +835,13 @@
                     <thead>
                         <tr>
                             <th>{{ t('plugins.col_owner') }}</th>
+                            <th>{{ t('plugins.col_vault') }}</th>
                             <th>ID</th>
                             <th>{{ t('plugins.col_enabled_at') }}</th>
                         </tr>
                     </thead>
                     <tbody id="pluginsEnabledTableBody">
-                        <tr><td colspan="3" class="empty-state">{{ t('common.loading') }}</td></tr>
+                        <tr><td colspan="4" class="empty-state">{{ t('common.loading') }}</td></tr>
                     </tbody>
                 </table>
             </div>

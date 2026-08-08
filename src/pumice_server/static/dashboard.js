@@ -86,7 +86,6 @@
                 document.getElementById("newDeviceTokenBox").style.display = "none";
                 loadMyProfile();
                 loadMyDevices();
-                loadMyPlugins();
             } else if (tabId === 'sync') {
                 refreshVaultList();
             } else if (tabId === 'publish') {
@@ -627,12 +626,13 @@
             }
         }
 
-        // 서버 플러그인 관리 (스켈레톤) -- 업로드된 .whl을 data_dir/plugins/<id>/에 풀어서
-        // 나열만 한다 -- 무엇이 설치돼있는지는 이 서버 이미지가 빌드될 때 이미 정해져 있다
-        // (pyproject.toml의 일반 의존성 + [project.entry-points."pumice_server.plugins"]).
-        // 관리자도 여기서 설치/삭제를 할 수 없다. "활성화"는 관리자가 아니라 각 로그인 사용자
-        // 본인이 자기 계정에 대해서만 하는 셀프 서비스이다 (아래 loadMyPlugins/toggleMyPlugin,
-        // 마이페이지 탭 소속) -- 이 화면의 "활성화 현황" 표는 읽기 전용이다.
+        // 서버 플러그인 관리 (스켈레톤) -- 나열만 한다. 무엇이 설치돼있는지는 이 서버 이미지가
+        // 빌드될 때 이미 정해져 있다(pyproject.toml의 일반 의존성 +
+        // [project.entry-points."pumice_server.plugins"]). 관리자도 여기서 설치/삭제를 할 수
+        // 없다. "활성화"는 관리자가 아니라 각 vault 소유자가 퍼블리시 탭에서 그 vault에 대해서만
+        // 하는 셀프 서비스이다(아래 loadSitePlugins/toggleSitePlugin) -- 옵시디언 자체가
+        // 플러그인을 vault마다 켜고 끄는 것과 같은 스코프. 이 화면의 "활성화 현황" 표는 읽기
+        // 전용이다.
         async function loadPluginsTab() {
             const data = await fetchAPI("/api/admin/plugins");
             if (!data) return;
@@ -662,23 +662,34 @@
                     const enabledAt = reg.enabled_at_ms ? new Date(reg.enabled_at_ms).toLocaleString() : "-";
                     tr.innerHTML = `
                         <td>${reg.owner_username}</td>
+                        <td>${reg.vault_id}</td>
                         <td>${reg.plugin_id}</td>
                         <td>${enabledAt}</td>
                     `;
                     enabledBody.appendChild(tr);
                 });
             } else {
-                enabledBody.innerHTML = `<tr><td colspan="3" class="empty-state">${t("plugins.empty_no_enabled")}</td></tr>`;
+                enabledBody.innerHTML = `<tr><td colspan="4" class="empty-state">${t("plugins.empty_no_enabled")}</td></tr>`;
             }
         }
 
-        // 마이페이지의 "플러그인" 카드 -- 로그인한 사용자가 설치된 플러그인 중 자기 계정에
-        // 켜고 끌 것을 스스로 고른다. 관리자가 대신 눌러주는 방식이 아니다.
-        async function loadMyPlugins() {
-            const data = await fetchAPI("/api/user/plugins");
+        // 퍼블리시 탭의 "플러그인" 표 -- 선택된 vault에 대해서만, vault 소유자가 설치된
+        // 플러그인 중 켜고 끌 것을 스스로 고른다. 계정 전체 설정이 아니라 이 vault만의 설정.
+        async function loadSitePlugins() {
+            const select = document.getElementById("siteSelect");
+            const siteId = select.value;
+            const body = document.getElementById("publishPluginsTableBody");
+            if (!siteId) {
+                body.innerHTML = `<tr><td colspan="5" class="empty-state">${t("publish.empty_select_site")}</td></tr>`;
+                return;
+            }
+            body.innerHTML = `<tr><td colspan="5" class="empty-state">${t("common.loading")}</td></tr>`;
+
+            const data = await fetchAPI("/api/publish/plugins", {
+                headers: { "obs-id": siteId }
+            });
             if (!data) return;
 
-            const body = document.getElementById("myPluginsTableBody");
             if (data.installed && data.installed.length > 0) {
                 body.innerHTML = "";
                 data.installed.forEach(p => {
@@ -690,7 +701,7 @@
                         <td>${p.description}</td>
                         <td>${p.version}</td>
                         <td>${statusLabel}</td>
-                        <td><button class="btn-sm" onclick="toggleMyPlugin('${p.id}', ${p.enabled})">${buttonLabel}</button></td>
+                        <td><button class="btn-sm" onclick="toggleSitePlugin('${p.id}', ${p.enabled})">${buttonLabel}</button></td>
                     `;
                     body.appendChild(tr);
                 });
@@ -699,17 +710,20 @@
             }
         }
 
-        async function toggleMyPlugin(pluginId, currentlyEnabled) {
-            const url = currentlyEnabled ? "/api/user/plugins/disable" : "/api/user/plugins/enable";
+        async function toggleSitePlugin(pluginId, currentlyEnabled) {
+            const siteId = document.getElementById("siteSelect").value;
+            if (!siteId) return;
+
+            const url = currentlyEnabled ? "/api/publish/plugins/disable" : "/api/publish/plugins/enable";
             const res = await fetchAPI(url, {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: { "Content-Type": "application/json", "obs-id": siteId },
                 body: JSON.stringify({ plugin_id: pluginId })
             });
 
             if (res && res.ok) {
                 showToast(currentlyEnabled ? t("myplugins.msg_disable_success") : t("myplugins.msg_enable_success"));
-                loadMyPlugins();
+                loadSitePlugins();
             } else {
                 const prefix = currentlyEnabled ? t("myplugins.msg_disable_failed_prefix") : t("myplugins.msg_enable_failed_prefix");
                 showToast(prefix + (res ? res.error : t("common.unknown_error")));

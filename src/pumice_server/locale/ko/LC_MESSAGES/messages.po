@@ -298,8 +298,8 @@ msgstr "버전"
 msgid "plugins.desc"
 msgstr ""
 "이 서버 이미지에 빌드 시점에 포함된 퍼블리시 전용 플러그인 목록입니다. 여기서 설치/삭제는 할 수 없으며, 새 플러그인을 "
-"추가하려면 서버 의존성으로 등록하고 이미지를 다시 빌드해야 합니다. 활성화는 각 사용자가 마이페이지에서 직접 합니다. (관리자 "
-"권한)"
+"추가하려면 서버 의존성으로 등록하고 이미지를 다시 빌드해야 합니다. 활성화는 각 vault 소유자가 퍼블리시 탭에서 그 vault에 "
+"대해서만 직접 합니다. (관리자 권한)"
 
 msgid "plugins.empty_no_enabled"
 msgstr "활성화한 사용자가 없습니다."
@@ -308,7 +308,7 @@ msgid "plugins.empty_no_plugins"
 msgstr "이 서버 이미지에 포함된 플러그인이 없습니다."
 
 msgid "plugins.section_enabled"
-msgstr "계정별 활성화 현황"
+msgstr "Vault별 활성화 현황"
 
 msgid "plugins.section_installed"
 msgstr "설치된 플러그인"
@@ -522,3 +522,6 @@ msgstr "승인"
 
 msgid "oauth.button_deny"
 msgstr "거부"
+
+msgid "plugins.col_vault"
+msgstr "Vault"

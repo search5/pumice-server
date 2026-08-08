@@ -303,8 +303,8 @@ msgid "plugins.desc"
 msgstr ""
 "Publish-only plugins baked into this server image at build time. There's "
 "no install/remove here -- adding a new plugin means declaring it as a "
-"server dependency and rebuilding the image. Each user enables plugins for"
-" themselves on their My Page. (Admin only)"
+"server dependency and rebuilding the image. Each vault's owner enables "
+"plugins for that vault only, from the Publish tab. (Admin only)"
 
 msgid "plugins.empty_no_enabled"
 msgstr "No one has enabled a plugin yet."
@@ -313,7 +313,7 @@ msgid "plugins.empty_no_plugins"
 msgstr "No plugins are baked into this server image."
 
 msgid "plugins.section_enabled"
-msgstr "Per-account enablement"
+msgstr "Per-vault enablement"
 
 msgid "plugins.section_installed"
 msgstr "Installed plugins"
@@ -528,3 +528,6 @@ msgstr "Approve"
 
 msgid "oauth.button_deny"
 msgstr "Deny"
+
+msgid "plugins.col_vault"
+msgstr "Vault"

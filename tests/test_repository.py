@@ -5,10 +5,17 @@ skeleton pass, so there's nothing else to verify these methods through -- a real
 test is the only way to catch a wrong SQLAlchemy Table/query, and it's fast/cheap enough that
 this doesn't need a fake instead.
 
-Enablement is scoped by owner_username only, not owner+vault -- a plugin, once on for an
-account, applies across every vault that account owns. The vault a plugin resolver actually
-needs is already known from the publish request's own path (/publish/{username}/{vault_id}/...)
-at the point a plugin would run, so there's nothing to look up per-vault here.
+Enablement is scoped by (owner_username, vault_id, plugin_id) -- this mirrors how Obsidian
+itself scopes plugins per vault, not per account: a user might have harang-immich installed and
+enabled in one vault (where they actually embed Immich photos) but not in a completely
+unrelated vault, and publishing that second vault must never run harang-immich's syntax
+resolution over it just because the account happens to have the plugin on elsewhere. This was
+initially scoped by owner_username only (a plugin, once on for an account, applied everywhere
+that account owned) -- reverted after realizing that reasoning only holds for *installation*
+(a server-wide, account-independent concept: the code either exists in the image or it doesn't)
+and not for *enablement*, which is a genuine per-vault choice with no way to derive "should this
+vault's publish rendering run this plugin at all" from context the way a resolver's actual
+target vault can be derived from the request path.
 """
 
 import pytest
@@ -23,67 +30,77 @@ def repo():
     return r
 
 
-def test_list_enabled_plugins_is_empty_for_unregistered_owner(repo):
-    assert repo.list_enabled_plugins("alice") == []
+def test_list_enabled_plugins_is_empty_for_unregistered_vault(repo):
+    assert repo.list_enabled_plugins("alice", "vault-1") == []
 
 
 def test_enable_plugin_then_list_returns_it(repo):
-    repo.enable_plugin("alice", "harang-immich", 1000)
+    repo.enable_plugin("alice", "vault-1", "harang-immich", 1000)
 
-    result = repo.list_enabled_plugins("alice")
+    result = repo.list_enabled_plugins("alice", "vault-1")
 
     assert result == [{"plugin_id": "harang-immich", "enabled_at_ms": 1000}]
 
 
 def test_enable_plugin_is_idempotent(repo):
-    repo.enable_plugin("alice", "harang-immich", 1000)
-    repo.enable_plugin("alice", "harang-immich", 2000)
+    repo.enable_plugin("alice", "vault-1", "harang-immich", 1000)
+    repo.enable_plugin("alice", "vault-1", "harang-immich", 2000)
 
-    result = repo.list_enabled_plugins("alice")
+    result = repo.list_enabled_plugins("alice", "vault-1")
 
     assert result == [{"plugin_id": "harang-immich", "enabled_at_ms": 2000}]
 
 
 def test_enable_plugin_scopes_by_owner(repo):
-    repo.enable_plugin("alice", "harang-immich", 1000)
+    repo.enable_plugin("alice", "vault-1", "harang-immich", 1000)
 
-    assert repo.list_enabled_plugins("bob") == []
+    assert repo.list_enabled_plugins("bob", "vault-1") == []
+
+
+def test_enable_plugin_scopes_by_vault_even_for_the_same_owner(repo):
+    # The scenario the whole (owner, vault_id, plugin_id) key exists for: alice enables a
+    # plugin in one vault, a completely different vault she also owns must not see it.
+    repo.enable_plugin("alice", "vault-with-immich-photos", "harang-immich", 1000)
+
+    assert repo.list_enabled_plugins("alice", "unrelated-work-notes-vault") == []
 
 
 def test_disable_plugin_removes_it(repo):
-    repo.enable_plugin("alice", "harang-immich", 1000)
+    repo.enable_plugin("alice", "vault-1", "harang-immich", 1000)
 
-    repo.disable_plugin("alice", "harang-immich")
+    repo.disable_plugin("alice", "vault-1", "harang-immich")
 
-    assert repo.list_enabled_plugins("alice") == []
+    assert repo.list_enabled_plugins("alice", "vault-1") == []
 
 
 def test_disable_plugin_is_a_no_op_when_not_enabled(repo):
-    repo.disable_plugin("alice", "harang-immich")
+    repo.disable_plugin("alice", "vault-1", "harang-immich")
 
-    assert repo.list_enabled_plugins("alice") == []
+    assert repo.list_enabled_plugins("alice", "vault-1") == []
 
 
-def test_disable_plugin_only_affects_the_matching_owner_plugin(repo):
-    repo.enable_plugin("alice", "harang-immich", 1000)
-    repo.enable_plugin("alice", "other-plugin", 1000)
-    repo.enable_plugin("bob", "harang-immich", 1000)
+def test_disable_plugin_only_affects_the_matching_owner_vault_plugin(repo):
+    repo.enable_plugin("alice", "vault-1", "harang-immich", 1000)
+    repo.enable_plugin("alice", "vault-1", "other-plugin", 1000)
+    repo.enable_plugin("alice", "vault-2", "harang-immich", 1000)
+    repo.enable_plugin("bob", "vault-1", "harang-immich", 1000)
 
-    repo.disable_plugin("alice", "harang-immich")
+    repo.disable_plugin("alice", "vault-1", "harang-immich")
 
-    assert [p["plugin_id"] for p in repo.list_enabled_plugins("alice")] == ["other-plugin"]
-    assert [p["plugin_id"] for p in repo.list_enabled_plugins("bob")] == ["harang-immich"]
+    assert [p["plugin_id"] for p in repo.list_enabled_plugins("alice", "vault-1")] == ["other-plugin"]
+    assert [p["plugin_id"] for p in repo.list_enabled_plugins("alice", "vault-2")] == ["harang-immich"]
+    assert [p["plugin_id"] for p in repo.list_enabled_plugins("bob", "vault-1")] == ["harang-immich"]
 
 
 def test_list_all_enabled_plugins_returns_every_registration(repo):
-    repo.enable_plugin("alice", "harang-immich", 1000)
-    repo.enable_plugin("bob", "other-plugin", 2000)
+    repo.enable_plugin("alice", "vault-1", "harang-immich", 1000)
+    repo.enable_plugin("bob", "vault-2", "other-plugin", 2000)
 
     result = repo.list_all_enabled_plugins()
 
     assert sorted(result, key=lambda r: r["owner_username"]) == [
-        {"owner_username": "alice", "plugin_id": "harang-immich", "enabled_at_ms": 1000},
-        {"owner_username": "bob", "plugin_id": "other-plugin", "enabled_at_ms": 2000},
+        {"owner_username": "alice", "vault_id": "vault-1", "plugin_id": "harang-immich", "enabled_at_ms": 1000},
+        {"owner_username": "bob", "vault_id": "vault-2", "plugin_id": "other-plugin", "enabled_at_ms": 2000},
     ]
 
 

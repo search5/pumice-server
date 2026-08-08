@@ -320,11 +320,8 @@ Guarantees:
 
 ## Server plugins
 
-Server-side plugins for the publish page — a discover/enable lifecycle for extending what a
+Server-side plugins for the publish page — a discover/enable/run lifecycle for extending what a
 published page can render, entirely server-local (nothing about it is synced from a vault).
-This is currently infrastructure only — there's no publish-renderer integration yet, so an
-enabled plugin doesn't actually do anything to a published page. It exists so that piece can be
-built later without also having to design discovery/enablement machinery at the same time.
 
 There is deliberately no runtime install step. A plugin's code runs inside the very same Python
 process as the web server itself, so adding one is exactly as consequential as adding any other
@@ -350,6 +347,21 @@ description = "Resolves harang-immich embeds on published pages."
 harang-immich = "harang_immich_plugin:resolve"
 ```
 
+That entry point must resolve to a callable with this signature:
+
+```python
+def resolve(content: str, *, owner_username: str, vault_id: str) -> str:
+    ...
+```
+
+It's a plain text-in, text-out transformer — given the note's processed markdown (frontmatter
+stripped, wikilinks already resolved to real `<a>`/`<img>` tags), return it with the plugin's
+own embed syntax resolved into real markdown/HTML. It runs before the markdown-to-HTML pass, so
+returning literal HTML tags works the same way `[[wikilinks]]` resolution already does. Raising
+an exception (or the entry point failing to import in the first place) just skips that plugin
+for that render — logged, not surfaced to the visitor — a bug in one plugin, or an upstream
+dependency it calls out to being down, must never turn a public publish page into a 500.
+
 ### Adding it to the server
 
 Add it as a normal pumice-server dependency (`uv add harang-immich-plugin`, or a path/git
@@ -361,12 +373,11 @@ nothing to configure beyond the entry point declaration above.
 
 ### Enabling
 
-Enabling is self-service, not something an admin does on a user's behalf — every logged-in
-account turns a discovered plugin on/off for itself, from its own **My Page**. It's scoped by
-owner account only, not per-vault — turning a plugin on applies to every vault that account
-owns. There's no per-vault toggle, because whatever vault a plugin ends up needing is already
-known from the publish request's own path (`/publish/{username}/{vault_id}/...`) at the point
-the plugin would actually run.
+Enabling is self-service and scoped per vault, not per account — from the **Publish** tab, for
+whichever vault is currently selected, not from My Page. This mirrors how Obsidian itself scopes
+plugins per vault rather than per account: a vault that actually has Immich embeds can have
+harang-immich turned on without it also running (and needlessly scanning for syntax that'll
+never appear) over every other vault the same account happens to own.
 
 ## Support
 
