@@ -1,0 +1,512 @@
+# English translations for pumice-server.
+# Copyright (C) 2026 ORGANIZATION
+# This file is distributed under the same license as the pumice-server
+# project.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: pumice-server VERSION\n"
+"Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
+"POT-Creation-Date: 2026-08-08 11:44+0900\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: en\n"
+"Language-Team: en <LL@li.org>\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+msgid "common.button_cancel"
+msgstr "Cancel"
+
+msgid "common.button_change"
+msgstr "Change"
+
+msgid "common.button_close"
+msgstr "Close"
+
+msgid "common.button_confirm"
+msgstr "Confirm"
+
+msgid "common.button_delete"
+msgstr "Delete"
+
+msgid "common.button_next"
+msgstr "Next"
+
+msgid "common.button_prev"
+msgstr "Previous"
+
+msgid "common.col_actions"
+msgstr "Actions"
+
+msgid "common.col_size"
+msgstr "Size (bytes)"
+
+msgid "common.col_status"
+msgstr "Status"
+
+msgid "common.dialog_content_default"
+msgstr "Are you sure you want to delete this?"
+
+msgid "common.dialog_title_default"
+msgstr "Confirm deletion"
+
+msgid "common.loading"
+msgstr "Loading..."
+
+msgid "common.theme_dark"
+msgstr "Dark mode"
+
+msgid "common.theme_light"
+msgstr "Light mode"
+
+msgid "common.unknown_error"
+msgstr "Unknown error"
+
+msgid "dashboard.card_site_count"
+msgstr "Published sites"
+
+msgid "dashboard.card_site_count_desc"
+msgstr "Deployed document sites"
+
+msgid "dashboard.card_vault_count"
+msgstr "Connected vaults"
+
+msgid "dashboard.card_vault_count_desc"
+msgstr "Fully synced repositories"
+
+msgid "dashboard.desc"
+msgstr "Monitor local sync and publishing status."
+
+msgid "dashboard.page_title"
+msgstr "Obsidian Sync - Dashboard"
+
+msgid "dashboard.title"
+msgstr "Dashboard Overview"
+
+msgid "devices.button_manage"
+msgstr "Manage devices"
+
+msgid "devices.button_revoke"
+msgstr "Revoke"
+
+msgid "devices.col_created"
+msgstr "First login"
+
+msgid "devices.col_name"
+msgstr "Device name"
+
+msgid "devices.confirm_content"
+msgstr ""
+"Revoke this device's sync credential?\n"
+"The device will need to log in again to sync."
+
+msgid "devices.confirm_title"
+msgstr "Disconnect device"
+
+msgid "devices.empty"
+msgstr "No connected devices."
+
+msgid "devices.msg_revoke_failed_prefix"
+msgstr "Failed to revoke device: "
+
+msgid "devices.msg_revoke_success"
+msgstr "Device revoked."
+
+msgid "devices.unnamed"
+msgstr "Unnamed device"
+
+msgid "login.button_submit"
+msgstr "Log in"
+
+msgid "login.button_submitting"
+msgstr "Logging in..."
+
+msgid "login.device_return_button"
+msgstr "Return to Obsidian"
+
+msgid "login.device_return_desc"
+msgstr ""
+"Tap the button below to return to Obsidian. If it doesn't happen "
+"automatically, you must tap it yourself."
+
+msgid "login.device_return_title"
+msgstr "✅ Login complete"
+
+msgid "login.label_password"
+msgstr "Password"
+
+msgid "login.label_username"
+msgstr "Username"
+
+msgid "login.msg_fail"
+msgstr "Login failed."
+
+msgid "login.msg_network_error"
+msgstr "Failed to communicate with the server."
+
+msgid "login.msg_success"
+msgstr "Login successful! Redirecting to dashboard..."
+
+msgid "login.no_account"
+msgstr "Don't have an account? Contact your administrator to get one."
+
+msgid "login.page_title"
+msgstr "Obsidian Sync - Login"
+
+msgid "login.placeholder_username"
+msgstr "Enter your username"
+
+msgid "login.result_desc"
+msgstr ""
+"Paste the token below into the 'Auth Token' field in the Obsidian plugin "
+"settings."
+
+msgid "login.result_redirecting"
+msgstr "Redirecting to dashboard..."
+
+msgid "login.result_title"
+msgstr "🎉 Your auth token has been issued!"
+
+msgid "login.subtitle"
+msgstr "Sign in & issue a token"
+
+msgid "login.subtitle_device"
+msgstr "Approve device login"
+
+msgid "mypage.button_save"
+msgstr "Save"
+
+msgid "mypage.desc"
+msgstr "View and edit your personal information."
+
+msgid "mypage.devices_heading"
+msgstr "Connected devices"
+
+msgid "mypage.label_email"
+msgstr "Email address"
+
+msgid "mypage.label_name"
+msgstr "Name"
+
+msgid "mypage.label_password"
+msgstr "New password (only if changing)"
+
+msgid "mypage.msg_load_error_prefix"
+msgstr "An error occurred while loading your profile: "
+
+msgid "mypage.msg_load_failed"
+msgstr "Failed to load your profile."
+
+msgid "mypage.msg_name_email_required"
+msgstr "Name and email are required."
+
+msgid "mypage.msg_update_failed"
+msgstr "Failed to update profile."
+
+msgid "mypage.msg_update_success"
+msgstr "Profile updated successfully."
+
+msgid "mypage.placeholder_name"
+msgstr "Enter your name"
+
+msgid "mypage.profile_heading"
+msgstr "Edit profile"
+
+msgid "mypage.title"
+msgstr "My Account"
+
+msgid "myplugins.button_disable"
+msgstr "Disable"
+
+msgid "myplugins.button_enable"
+msgstr "Enable"
+
+msgid "myplugins.col_description"
+msgstr "Description"
+
+msgid "myplugins.col_id"
+msgstr "ID"
+
+msgid "myplugins.col_status"
+msgstr "Status"
+
+msgid "myplugins.col_version"
+msgstr "Version"
+
+msgid "myplugins.empty_no_plugins"
+msgstr "No plugins installed."
+
+msgid "myplugins.heading"
+msgstr "Server plugins"
+
+msgid "myplugins.msg_disable_failed_prefix"
+msgstr "Failed to disable: "
+
+msgid "myplugins.msg_disable_success"
+msgstr "Plugin disabled."
+
+msgid "myplugins.msg_enable_failed_prefix"
+msgstr "Failed to enable: "
+
+msgid "myplugins.msg_enable_success"
+msgstr "Plugin enabled."
+
+msgid "myplugins.status_disabled"
+msgstr "Disabled"
+
+msgid "myplugins.status_enabled"
+msgstr "Enabled"
+
+msgid "nav.dashboard"
+msgstr "Dashboard"
+
+msgid "nav.logout"
+msgstr "Log out"
+
+msgid "nav.mypage"
+msgstr "My Account"
+
+msgid "nav.publish"
+msgstr "Publish Management"
+
+msgid "nav.sync"
+msgstr "Vault Sync Management"
+
+msgid "nav.users"
+msgstr "User Management"
+
+msgid "plugins.col_description"
+msgstr "Description"
+
+msgid "plugins.col_enabled_at"
+msgstr "Enabled at"
+
+msgid "plugins.col_id"
+msgstr "ID"
+
+msgid "plugins.col_name"
+msgstr "Name"
+
+msgid "plugins.col_owner"
+msgstr "Owner"
+
+msgid "plugins.col_version"
+msgstr "Version"
+
+msgid "plugins.desc"
+msgstr ""
+"Publish-only plugins baked into this server image at build time. There's "
+"no install/remove here -- adding a new plugin means declaring it as a "
+"server dependency and rebuilding the image. Each user enables plugins for"
+" themselves on their My Page. (Admin only)"
+
+msgid "plugins.empty_no_enabled"
+msgstr "No one has enabled a plugin yet."
+
+msgid "plugins.empty_no_plugins"
+msgstr "No plugins are baked into this server image."
+
+msgid "plugins.section_enabled"
+msgstr "Per-account enablement"
+
+msgid "plugins.section_installed"
+msgstr "Installed plugins"
+
+msgid "plugins.title"
+msgstr "Server Plugin Management"
+
+msgid "publish.button_unpublish"
+msgstr "Unpublish"
+
+msgid "publish.col_link"
+msgstr "Public link"
+
+msgid "publish.col_path"
+msgstr "Note path"
+
+msgid "publish.col_published"
+msgstr "Last published"
+
+msgid "publish.confirm_button"
+msgstr "Unpublish"
+
+msgid "publish.confirm_content"
+msgstr "Are you sure you want to unpublish '{{path}}'?"
+
+msgid "publish.confirm_title"
+msgstr "Unpublish"
+
+msgid "publish.desc"
+msgstr "Browse notes published to the web and control publishing."
+
+msgid "publish.empty_no_pages"
+msgstr "No published pages."
+
+msgid "publish.empty_select_site"
+msgstr "Please select a site first."
+
+msgid "publish.link_open"
+msgstr "Open link ↗"
+
+msgid "publish.msg_remove_failed_prefix"
+msgstr "Failed to remove: "
+
+msgid "publish.msg_remove_success"
+msgstr "Successfully removed."
+
+msgid "publish.select_site"
+msgstr "Select a published site..."
+
+msgid "publish.title"
+msgstr "Publish Page Management"
+
+msgid "sync.badge_active"
+msgstr "Sync active"
+
+msgid "sync.badge_deleted"
+msgstr "Deleted (tombstone)"
+
+msgid "sync.col_hash"
+msgstr "Hash (SHA-256)"
+
+msgid "sync.col_modified"
+msgstr "Last modified"
+
+msgid "sync.col_path"
+msgstr "File path"
+
+msgid "sync.desc"
+msgstr "Browse synced metadata and deletion tombstones for each vault."
+
+msgid "sync.empty_no_files"
+msgstr "No synced files."
+
+msgid "sync.empty_select_vault"
+msgstr "Please select a vault first."
+
+msgid "sync.select_vault"
+msgstr "Select a vault..."
+
+msgid "sync.title"
+msgstr "Vault Sync File History"
+
+msgid "users.badge_self"
+msgstr "Your account"
+
+msgid "users.button_create"
+msgstr "Create account"
+
+msgid "users.button_reset_password"
+msgstr "Change password"
+
+msgid "users.col_email"
+msgstr "Email address"
+
+msgid "users.col_id"
+msgstr "ID"
+
+msgid "users.col_name"
+msgstr "Name"
+
+msgid "users.confirm_delete_content"
+msgstr ""
+"Are you sure you want to delete the user '{{username}}'?\n"
+"This cannot be undone -- their owned vaults and sync history ownership "
+"will be permanently destroyed."
+
+msgid "users.confirm_delete_title"
+msgstr "Delete user account"
+
+msgid "users.create_heading"
+msgstr "Create a new user"
+
+msgid "users.desc"
+msgstr "View and manage the system's registered user accounts. (Admin only)"
+
+msgid "users.empty_no_users"
+msgstr "No users found."
+
+msgid "users.msg_create_failed_prefix"
+msgstr "Failed to create user: "
+
+msgid "users.msg_create_missing_fields"
+msgstr "Please enter both a username and password."
+
+msgid "users.msg_create_success"
+msgstr "User '{{username}}' created successfully."
+
+msgid "users.msg_delete_failed_prefix"
+msgstr "Failed to delete: "
+
+msgid "users.msg_delete_success"
+msgstr "User deleted successfully."
+
+msgid "users.msg_password_change_failed_prefix"
+msgstr "Failed to change password: "
+
+msgid "users.msg_password_changed"
+msgstr "Password changed successfully."
+
+msgid "users.msg_password_empty"
+msgstr "Password cannot be empty."
+
+msgid "users.placeholder_email"
+msgstr "Email address"
+
+msgid "users.placeholder_name"
+msgstr "Name"
+
+msgid "users.placeholder_new_password"
+msgstr "Enter new password"
+
+msgid "users.placeholder_password"
+msgstr "Password"
+
+msgid "users.placeholder_username"
+msgstr "Username"
+
+msgid "users.prompt_reset_password_content"
+msgstr "Enter a new password for user '{{username}}':"
+
+msgid "users.prompt_reset_password_title"
+msgstr "Change password"
+
+msgid "users.title"
+msgstr "User Account Management"
+
+
+msgid "publish_public.empty_no_files"
+msgstr "No files have been published yet."
+
+msgid "devices.create_heading"
+msgstr "Create a new device"
+
+msgid "devices.placeholder_name"
+msgstr "Device name (e.g. My laptop)"
+
+msgid "devices.button_create"
+msgstr "Create"
+
+msgid "devices.new_token_desc"
+msgstr "You won't be able to see this token again. Copy it now and paste it into the client you want to use it with (e.g. the Obsidian plugin's settings)."
+
+msgid "devices.msg_name_required"
+msgstr "Please enter a device name."
+
+msgid "devices.msg_create_failed_prefix"
+msgstr "Failed to create device: "
+
+msgid "common.button_copy"
+msgstr "Copy"
+
+msgid "common.msg_copied"
+msgstr "Copied to clipboard."
+
+msgid "common.msg_copy_manual"
+msgstr "Text selected -- copy it manually (Ctrl+C)."

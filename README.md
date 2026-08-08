@@ -134,9 +134,29 @@ caller's own identity -- so `permission='vault-access'` is really just "are you 
 
 ## Language
 
-The login and dashboard pages are translated server-side, negotiated per-request from the
-browser's `Accept-Language` header (`ko` or `en` today) — no client-side language switching.
-Translation strings live in `src/pumice_server/locale/{ko,en}.json`, not inline in `web.py`.
+Every server-rendered page (login, dashboard, and the public `/publish/...` pages) is
+translated server-side, negotiated per-request from the browser's `Accept-Language` header
+(`ko` or `en` today, falling back to `en` when nothing matches) — no client-side language
+switching.
+
+Translations are standard gettext catalogs (`src/pumice_server/locale/{lang}/LC_MESSAGES/messages.po`,
+compiled to `.mo` via [Babel](https://babel.pocoo.org/)), not inline in `web.py`. The msgid is
+the same dotted key every call site already uses (`t('login.button_submit', lang)`), not the
+English source text — so this reads like a normal gettext setup but keys stay stable across
+wording changes in any language, and the client-side `I18N` JS blob (used for strings generated
+at runtime — toasts, confirm dialogs, fetch-rendered rows) can keep doing simple dotted-path
+lookups against it.
+
+After hand-editing a `.po` file, recompile with:
+
+```
+uv run python scripts/compile_locale.py
+```
+
+Server plugins (see "Server plugins" below) are expected to honor this same negotiated
+language — once a plugin actually gets invoked (no publish-renderer integration exists yet),
+its entry point will receive the request's resolved `lang`, and it should localize anything it
+renders accordingly rather than hardcoding a language.
 
 ## What it does
 

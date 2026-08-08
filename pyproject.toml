@@ -19,9 +19,10 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "twisted>=26.4.0",
     "sqlalchemy-cubrid",
-    "i18nice>=0.16.0",
     "mcp>=2.0.0",
     "cryptography>=50.0.0",
+    "pyramid-jinja2>=2.10.1",
+    "babel>=2.18.0",
 ]
 
 [project.urls]

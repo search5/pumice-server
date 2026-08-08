@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ t('login.page_title') }}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --md-sys-color-primary: #a8c7fa; /* Google-blue family */
+            --md-sys-color-on-primary: #062e6f;
+            --md-sys-color-primary-container: #004a77;
+            --md-sys-color-on-primary-container: #c2e7ff;
+            --md-sys-color-surface: #121318;
+            --md-sys-color-surface-container: #1f2025;
+            --md-sys-color-on-surface: #e2e2e9;
+            --md-sys-color-on-surface-variant: #c4c6d0;
+            --md-sys-color-outline: #8e9099;
+            --md-sys-color-error: #ffb4ab;
+            --md-sys-color-on-error: #690005;
+        }
+
+        body.light-theme {
+            --md-sys-color-primary: #3f5f90;
+            --md-sys-color-on-primary: #ffffff;
+            --md-sys-color-primary-container: #d6e3ff;
+            --md-sys-color-on-primary-container: #001b3d;
+            --md-sys-color-surface: #f9f9fc;
+            --md-sys-color-surface-container: #f0f0f4;
+            --md-sys-color-on-surface: #191c20;
+            --md-sys-color-on-surface-variant: #43474e;
+            --md-sys-color-outline: #73777f;
+            --md-sys-color-error: #ba1a1a;
+            --md-sys-color-on-error: #ffffff;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: var(--md-sys-color-surface);
+            color: var(--md-sys-color-on-surface);
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            position: relative;
+            transition: background-color 0.3s ease;
+        }
+
+        .theme-fab {
+            position: absolute;
+            top: 24px;
+            right: 24px;
+            background-color: var(--md-sys-color-surface-container);
+            border: 1px solid var(--md-sys-color-outline);
+            color: var(--md-sys-color-on-surface);
+            padding: 10px 20px;
+            border-radius: 100px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.2s ease;
+        }
+        .theme-fab:hover {
+            opacity: 0.9;
+            border-color: var(--md-sys-color-primary);
+        }
+
+        .login-card {
+            background-color: var(--md-sys-color-surface-container);
+            border-radius: 28px; /* M3 Card style */
+            padding: 40px;
+            width: 100%;
+            max-width: 440px;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            transition: transform 0.2s ease, background-color 0.3s ease;
+        }
+        .login-card:hover {
+            transform: translateY(-2px);
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .logo {
+            font-family: 'Outfit', sans-serif;
+            font-size: 32px;
+            font-weight: 700;
+            color: var(--md-sys-color-primary);
+            letter-spacing: -0.5px;
+            margin-bottom: 6px;
+        }
+        .subtitle {
+            font-size: 14px;
+            color: var(--md-sys-color-on-surface-variant);
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group.hidden {
+            display: none;
+        }
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            font-weight: 500;
+            margin-bottom: 8px;
+            color: var(--md-sys-color-on-surface);
+            padding-left: 4px;
+        }
+        .form-group input {
+            width: 100%;
+            background-color: transparent;
+            border: 1px solid var(--md-sys-color-outline);
+            border-radius: 14px; /* M3 Outlined text field style */
+            padding: 14px 16px;
+            color: var(--md-sys-color-on-surface);
+            font-family: inherit;
+            font-size: 15px;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+        .form-group input:focus {
+            outline: none;
+            border-color: var(--md-sys-color-primary);
+            border-width: 2px;
+            box-shadow: 0 0 0 3px rgba(168, 199, 250, 0.15);
+        }
+        .btn {
+            width: 100%;
+            background-color: var(--md-sys-color-primary);
+            color: var(--md-sys-color-on-primary);
+            border: none;
+            border-radius: 100px; /* M3 Pill button style */
+            padding: 14px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s ease, transform 0.1s ease;
+        }
+        .btn:hover {
+            opacity: 0.92;
+        }
+        .btn:active {
+            transform: scale(0.98);
+        }
+        .alert {
+            padding: 12px 16px;
+            border-radius: 12px;
+            font-size: 13px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        .alert-error {
+            background-color: rgba(255, 180, 171, 0.15);
+            border: 1px solid var(--md-sys-color-error);
+            color: var(--md-sys-color-error);
+        }
+        .alert-success {
+            background-color: rgba(168, 199, 250, 0.15);
+            border: 1px solid var(--md-sys-color-primary);
+            color: var(--md-sys-color-primary);
+        }
+        .result-box {
+            margin-top: 25px;
+            background-color: rgba(0, 0, 0, 0.1);
+            border: 1px solid var(--md-sys-color-outline);
+            border-radius: 16px;
+            padding: 20px;
+            display: none;
+            word-break: break-all;
+        }
+        .result-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--md-sys-color-primary);
+            margin-bottom: 8px;
+        }
+        .token-display {
+            font-family: 'Fira Code', monospace;
+            background-color: rgba(255, 255, 255, 0.05);
+            padding: 12px;
+            border-radius: 12px;
+            font-size: 13px;
+            user-select: all;
+            margin-bottom: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: var(--md-sys-color-on-surface);
+        }
+        .copy-hint {
+            font-size: 12px;
+            color: var(--md-sys-color-on-surface-variant);
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <button class="theme-fab" id="themeToggleBtn">
+        <span id="themeToggleIcon">☀️</span> <span id="themeToggleText">{{ t('common.theme_light') }}</span>
+    </button>
+
+    <div class="login-card">
+        <div class="header">
+            <div class="logo">Obsidian Sync</div>
+            <div class="subtitle" id="cardSubtitle">{{ t('login.subtitle') }}</div>
+        </div>
+        <div id="alert" class="alert alert-error"></div>
+        <form id="loginForm">
+            <div class="form-group">
+                <label for="username">{{ t('login.label_username') }}</label>
+                <input type="text" id="username" required placeholder="{{ t('login.placeholder_username') }}">
+            </div>
+            <div class="form-group">
+                <label for="password">{{ t('login.label_password') }}</label>
+                <input type="password" id="password" required placeholder="••••••••">
+            </div>
+
+            <button type="submit" class="btn" id="submitBtn">{{ t('login.button_submit') }}</button>
+        </form>
+
+        <div style="text-align: center; margin-top: 20px; font-size: 13px; color: var(--md-sys-color-on-surface-variant);">
+            {{ t('login.no_account') }}
+        </div>
+
+        <div id="resultBox" class="result-box">
+            <div class="result-title">{{ t('login.result_title') }}</div>
+            <p style="font-size: 12px; margin-bottom: 12px; color: var(--md-sys-color-on-surface-variant);">{{ t('login.result_desc') }}</p>
+            <div class="token-display" id="tokenDisplay"></div>
+            <div class="copy-hint">{{ t('login.result_redirecting') }}</div>
+        </div>
+
+        <!-- 로그인이 obsidian://<action> 콜백으로 끝나는 경우 전용. 브라우저(특히 모바일)는 실제
+             탭/클릭 없이 스크립트가 커스텀 스킴으로 이동시키는 걸 아무 표시 없이 막는 경우가 많아서,
+             자동 리다이렉트 대신 사용자가 직접 눌러야 하는 링크로 보여준다. -->
+        <div id="deviceReturnBox" class="result-box">
+            <div class="result-title">{{ t('login.device_return_title') }}</div>
+            <p style="font-size: 12px; margin-bottom: 16px; color: var(--md-sys-color-on-surface-variant);">{{ t('login.device_return_desc') }}</p>
+            <a id="deviceReturnLink" class="btn" style="display: inline-block; text-decoration: none; text-align: center;" href="#">{{ t('login.device_return_button') }}</a>
+        </div>
+    </div>
+
+    <script>
+        const I18N = {{ i18n_json | safe }};
+    </script>
+    <script src="/static/login.js"></script>
+</body>
+</html>

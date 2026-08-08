@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Obsidian Sync - Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;800&family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20,400,0,0&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            /* M3 Dark Theme Palette */
+            --md-sys-color-primary: #d0bcff;
+            --md-sys-color-on-primary: #381e72;
+            --md-sys-color-primary-container: #4f378b;
+            --md-sys-color-on-primary-container: #eaddff;
+            --md-sys-color-surface: #141218;
+            --md-sys-color-surface-container: #1d1b20;
+            --md-sys-color-surface-container-high: #2b2930;
+            --md-sys-color-on-surface: #e6e1e5;
+            --md-sys-color-on-surface-variant: #cac4d0;
+            --md-sys-color-outline: #938f99;
+            --md-sys-color-error: #ffb4ab;
+            --md-sys-color-on-error: #690005;
+            
+            --bg-color: var(--md-sys-color-surface);
+            --sidebar-bg: var(--md-sys-color-surface-container);
+            --card-bg: var(--md-sys-color-surface-container-high);
+            --border-color: rgba(147, 143, 153, 0.2);
+            --text-primary: var(--md-sys-color-on-surface);
+            --text-muted: var(--md-sys-color-on-surface-variant);
+            --accent-purple: var(--md-sys-color-primary);
+            --accent-blue: #a8c7fa;
+            --accent-green: #c2e7ff;
+            --error-red: var(--md-sys-color-error);
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: var(--bg-color);
+            color: var(--text-primary);
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+            display: flex;
+        }
+        
+        /* Sidebar */
+        .sidebar {
+            width: 280px;
+            background: var(--sidebar-bg);
+            display: flex;
+            flex-direction: column;
+            padding: 36px 16px;
+            position: fixed;
+            height: 100vh;
+            left: 0;
+            top: 0;
+            z-index: 100;
+        }
+        .sidebar .brand {
+            font-family: 'Outfit', sans-serif;
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--accent-purple);
+            margin-bottom: 36px;
+            padding-left: 16px;
+        }
+        .nav-menu { list-style: none; flex-grow: 1; }
+        .nav-item {
+            padding: 14px 20px;
+            border-radius: 100px; /* M3 Pill style navigation */
+            cursor: pointer;
+            color: var(--text-muted);
+            font-weight: 500;
+            font-size: 14px;
+            margin-bottom: 8px;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .nav-item:hover {
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .nav-item.active {
+            color: var(--md-sys-color-on-primary-container);
+            background: var(--md-sys-color-primary-container);
+            font-weight: 600;
+        }
+        .user-info {
+            padding: 20px 16px 0 16px;
+            border-top: 1px solid var(--border-color);
+            font-size: 13px;
+        }
+        .user-info .username {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 6px;
+        }
+        .user-info .logout {
+            color: var(--error-red);
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 8px;
+            font-weight: 500;
+        }
+
+        /* Main Content */
+        .main-content {
+            margin-left: 280px;
+            flex-grow: 1;
+            padding: 48px;
+            min-height: 100vh;
+            background: var(--bg-color);
+        }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Sub-tabs (e.g. inside "My Account": profile / devices / plugins) -- an underlined
+           tab strip, visually distinct from the pill-style sidebar nav, so a section within a
+           tab can also be tab-switched instead of every card being stacked and width-capped
+           regardless of how much space is actually available. */
+        .subtabs {
+            display: flex;
+            gap: 28px;
+            margin-bottom: 28px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .subtab-item {
+            background: transparent;
+            border: none;
+            font-family: inherit;
+            color: var(--text-muted);
+            font-weight: 500;
+            font-size: 14px;
+            padding: 12px 2px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s ease;
+        }
+        .subtab-item:hover {
+            color: var(--text-primary);
+        }
+        .subtab-item.active {
+            color: var(--accent-purple);
+            border-bottom-color: var(--accent-purple);
+            font-weight: 600;
+        }
+        .subtab-content { display: none; }
+        .subtab-content.active { display: block; }
+
+        .header {
+            margin-bottom: 36px;
+        }
+        .header h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 32px;
+            color: var(--text-primary);
+            margin-bottom: 10px;
+        }
+        .header p { color: var(--text-muted); font-size: 14px; }
+
+        /* Widgets/Grid */
+        .widget-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 24px;
+            margin-bottom: 40px;
+        }
+        .card {
+            background: var(--card-bg);
+            border-radius: 20px; /* M3 Medium card */
+            padding: 24px;
+            border: 1px solid var(--border-color);
+            transition: box-shadow 0.2s ease;
+        }
+        .card-val {
+            font-family: 'Outfit', sans-serif;
+            font-size: 32px;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin: 12px 0 6px 0;
+            word-break: break-all;
+        }
+        .card-desc { font-size: 13px; color: var(--text-muted); }
+
+        /* Selector & Table */
+        .selector-bar {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        .selector-bar select {
+            background: var(--md-sys-color-surface-container);
+            border: 1px solid var(--md-sys-color-outline);
+            color: var(--text-primary);
+            padding: 12px 18px;
+            border-radius: 12px; /* M3 input */
+            font-size: 14px;
+            outline: none;
+            min-width: 220px;
+            transition: border-color 0.2s ease;
+        }
+        .selector-bar select:focus {
+            border-color: var(--accent-purple);
+        }
+        .table-container {
+            background: var(--md-sys-color-surface-container);
+            border: 1px solid var(--border-color);
+            border-radius: 16px; /* M3 container shape */
+            overflow: hidden;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+            text-align: left;
+        }
+        th, td {
+            padding: 18px 24px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        th {
+            background: rgba(255, 255, 255, 0.03);
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: rgba(255, 255, 255, 0.01); }
+        
+        .badge {
+            padding: 4px 10px;
+            border-radius: 100px; /* Pill badge */
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .badge-active { background: rgba(168, 199, 250, 0.15); color: var(--accent-blue); }
+        .badge-deleted { background: rgba(255, 180, 171, 0.15); color: var(--error-red); }
+
+        .btn {
+            background: var(--md-sys-color-primary);
+            color: var(--md-sys-color-on-primary);
+            border: none;
+            border-radius: 100px; /* M3 Pill button */
+            padding: 12px 24px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s ease;
+        }
+        .btn:hover {
+            opacity: 0.9;
+        }
+
+        .btn-sm {
+            padding: 8px 16px;
+            border-radius: 100px; /* M3 Pill small button */
+            font-size: 12px;
+            font-weight: 600;
+            border: 1px solid var(--md-sys-color-outline);
+            background: transparent;
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        /* Google's own recommended base rule for the Material Symbols webfont
+           (https://fonts.google.com/icons) -- the icon name (e.g. "content_copy") is the
+           element's literal text content, this font renders it as the glyph via ligatures. */
+        .material-symbols-outlined {
+            font-family: 'Material Symbols Outlined';
+            font-weight: normal;
+            font-style: normal;
+            font-size: 16px;
+            line-height: 1;
+            letter-spacing: normal;
+            text-transform: none;
+            display: inline-block;
+            white-space: nowrap;
+            word-wrap: normal;
+            direction: ltr;
+            vertical-align: -3px;
+            -webkit-font-feature-settings: 'liga';
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* A plain, borderless icon-only button meant to sit inline inside another element
+           (e.g. a copy icon at the end of a value box), rather than as its own separate
+           bordered button next to it. */
+        .icon-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 6px;
+            border-radius: 8px;
+            transition: all 0.2s ease;
+        }
+        .icon-btn:hover {
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text-primary);
+        }
+        .btn-sm:hover {
+            background: rgba(255, 255, 255, 0.05);
+            border-color: var(--accent-purple);
+            color: var(--accent-purple);
+        }
+        
+        .empty-state {
+            padding: 48px;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        /* Pagination */
+        .pagination-bar {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 8px;
+            margin-top: 24px;
+        }
+        .pagination-btn {
+            background: var(--md-sys-color-surface-container);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 10px 18px;
+            border-radius: 100px; /* Pill buttons for pagination */
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+        .pagination-btn:hover:not(:disabled) {
+            border-color: var(--accent-purple);
+            background: rgba(208, 188, 255, 0.08);
+        }
+        .pagination-btn.active {
+            background: var(--md-sys-color-primary-container);
+            border-color: var(--md-sys-color-primary-container);
+            color: var(--md-sys-color-on-primary-container);
+            font-weight: 600;
+        }
+        .pagination-btn:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+
+        body.light-theme {
+            --md-sys-color-primary: #3f5f90;
+            --md-sys-color-on-primary: #ffffff;
+            --md-sys-color-primary-container: #d6e3ff;
+            --md-sys-color-on-primary-container: #001b3d;
+            --md-sys-color-surface: #f9f9fc;
+            --md-sys-color-surface-container: #f0f0f4;
+            --md-sys-color-surface-container-high: #e4e2e6;
+            --md-sys-color-on-surface: #191c20;
+            --md-sys-color-on-surface-variant: #43474e;
+            --md-sys-color-outline: #73777f;
+            --md-sys-color-error: #ba1a1a;
+            --md-sys-color-on-error: #ffffff;
+            
+            --bg-color: var(--md-sys-color-surface);
+            --sidebar-bg: var(--md-sys-color-surface-container);
+            --card-bg: var(--md-sys-color-surface-container-high);
+            --border-color: rgba(115, 119, 127, 0.2);
+            --text-primary: var(--md-sys-color-on-surface);
+            --text-muted: var(--md-sys-color-on-surface-variant);
+            --accent-purple: var(--md-sys-color-primary);
+            --accent-blue: #0061a4;
+            --accent-green: #006837;
+            --error-red: var(--md-sys-color-error);
+        }
+
+        .theme-toggle-container {
+            margin-top: 15px;
+            padding: 0 16px;
+        }
+        .theme-toggle-btn {
+            width: 100%;
+            background: var(--md-sys-color-surface-container-high);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 10px 14px;
+            border-radius: 100px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.2s ease;
+        }
+        .theme-toggle-btn:hover {
+            border-color: var(--accent-purple);
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        /* M3 Dialog Modal Styles */
+        .dialog-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(12px);
+            z-index: 10000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            transition: opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .dialog-overlay.show {
+            opacity: 1;
+        }
+        .dialog-card {
+            background: var(--md-sys-color-surface-container-high);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 28px;
+            padding: 40px;
+            width: 600px;
+            min-height: 280px;
+            box-shadow: 0 24px 48px rgba(0, 0, 0, 0.45);
+            transform: translateY(30px) scale(0.95);
+            transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+            color: var(--text-primary);
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+        /* 라이트 모드일 때 테두리 색상 보강 */
+        body.light-theme .dialog-card {
+            border: 1px solid rgba(0, 0, 0, 0.08);
+            box-shadow: 0 16px 36px rgba(0, 0, 0, 0.15);
+        }
+        .dialog-overlay.show .dialog-card {
+            transform: translateY(0) scale(1);
+        }
+        .dialog-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 26px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin: 0;
+            line-height: 1.3;
+            text-align: left;
+        }
+        .dialog-content {
+            font-size: 17px;
+            color: var(--text-muted);
+            line-height: 1.7;
+            text-align: left;
+            margin: 0;
+            flex-grow: 1;
+        }
+        .dialog-input-container {
+            width: 100%;
+            margin: 4px 0;
+        }
+        .dialog-input {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.15);
+            border: 1px solid var(--md-sys-color-outline);
+            color: var(--text-primary);
+            padding: 18px 20px;
+            border-radius: 16px;
+            font-size: 16px;
+            outline: none;
+            transition: all 0.2s ease;
+        }
+        body.light-theme .dialog-input {
+            background: rgba(0, 0, 0, 0.03);
+        }
+        .dialog-input:focus {
+            border-color: var(--md-sys-color-primary);
+            box-shadow: 0 0 0 3px rgba(208, 188, 255, 0.25);
+            background: transparent;
+        }
+        .dialog-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+            width: 100%;
+            margin-top: 8px;
+        }
+        .dialog-btn {
+            border: none;
+            padding: 12px 32px;
+            border-radius: 100px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            height: 48px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .dialog-btn-text {
+            background: transparent;
+            color: var(--accent-purple);
+        }
+        .dialog-btn-text:hover {
+            background: rgba(208, 188, 255, 0.08);
+        }
+        .dialog-btn-filled {
+            background: var(--error-red);
+            color: var(--md-sys-color-on-error);
+        }
+        .dialog-btn-filled:hover {
+            opacity: 0.9;
+            box-shadow: 0 4px 12px rgba(255, 180, 171, 0.2);
+        }
+        .dialog-btn-primary {
+            background: var(--md-sys-color-primary);
+            color: var(--md-sys-color-on-primary);
+        }
+        .dialog-btn-primary:hover {
+            opacity: 0.9;
+            box-shadow: 0 4px 12px rgba(208, 188, 255, 0.2);
+        }
+        
+        /* Toast Notification Styles */
+        .toast-container {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            pointer-events: none;
+        }
+        .toast {
+            background: var(--md-sys-color-surface-container-high);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+            padding: 12px 24px;
+            border-radius: 100px;
+            font-size: 13px;
+            font-weight: 500;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+            opacity: 0;
+            transform: translateY(20px);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="brand">Obsidian Sync</div>
+        <ul class="nav-menu" id="sidebarMenu">
+            <li class="nav-item active" onclick="switchTab('dashboard')">{{ t('nav.dashboard') }}</li>
+            <li class="nav-item" onclick="switchTab('mypage')">{{ t('nav.mypage') }}</li>
+            <li class="nav-item" onclick="switchTab('sync')">{{ t('nav.sync') }}</li>
+            <li class="nav-item" onclick="switchTab('publish')">{{ t('nav.publish') }}</li>
+        </ul>
+        <div class="user-info">
+            <div class="username" id="sidebarUsername">User Name</div>
+            <a class="logout" onclick="logout()">{{ t('nav.logout') }}</a>
+            <div class="theme-toggle-container">
+                <button class="theme-toggle-btn" id="themeToggleBtn">
+                    <span id="themeToggleIcon">☀️</span> <span id="themeToggleText">{{ t('common.theme_light') }}</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="main-content">
+        <!-- 탭 1: 대시보드 홈 -->
+        <div id="tab-dashboard" class="tab-content active">
+            <div class="header">
+                <h1>{{ t('dashboard.title') }}</h1>
+                <p>{{ t('dashboard.desc') }}</p>
+            </div>
+
+            <div class="widget-grid">
+                <div class="card">
+                    <div class="card-desc">{{ t('dashboard.card_vault_count') }}</div>
+                    <div class="card-val" id="widgetVaultCount">0</div>
+                    <div class="card-desc">{{ t('dashboard.card_vault_count_desc') }}</div>
+                </div>
+                <div class="card">
+                    <div class="card-desc">{{ t('dashboard.card_site_count') }}</div>
+                    <div class="card-val" id="widgetSiteCount">0</div>
+                    <div class="card-desc">{{ t('dashboard.card_site_count_desc') }}</div>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- 탭 5: 내 정보 관리 (마이페이지) -->
+        <div id="tab-mypage" class="tab-content">
+            <div class="header">
+                <h1>{{ t('mypage.title') }}</h1>
+                <p>{{ t('mypage.desc') }}</p>
+            </div>
+
+            <div class="subtabs">
+                <button type="button" class="subtab-item active" onclick="switchMypageSubtab('profile')">{{ t('mypage.profile_heading') }}</button>
+                <button type="button" class="subtab-item" onclick="switchMypageSubtab('devices')">{{ t('mypage.devices_heading') }}</button>
+                <button type="button" class="subtab-item" onclick="switchMypageSubtab('plugins')">{{ t('myplugins.heading') }}</button>
+            </div>
+
+            <div id="mypage-subtab-profile" class="subtab-content active">
+                <div class="card" style="max-width: 600px; background: var(--md-sys-color-surface-container);">
+                    <div id="mypageAlert" class="alert alert-error" style="display: none; margin-bottom: 15px;"></div>
+
+                    <div style="margin-bottom: 18px;">
+                        <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">{{ t('login.label_username') }}</label>
+                        <input type="text" id="mypageUsername" disabled style="width: 100%; background: rgba(0,0,0,0.1); border: 1px solid var(--md-sys-color-outline); color: var(--text-muted); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none; cursor: not-allowed;">
+                    </div>
+                    <div style="margin-bottom: 18px;">
+                        <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">{{ t('mypage.label_name') }}</label>
+                        <input type="text" id="mypageName" placeholder="{{ t('mypage.placeholder_name') }}" style="width: 100%; background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+                    </div>
+                    <div style="margin-bottom: 18px;">
+                        <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">{{ t('mypage.label_email') }}</label>
+                        <input type="email" id="mypageEmail" placeholder="example@example.com" style="width: 100%; background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+                    </div>
+                    <div style="margin-bottom: 25px;">
+                        <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">{{ t('mypage.label_password') }}</label>
+                        <input type="password" id="mypagePassword" placeholder="••••••••" style="width: 100%; background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+                    </div>
+                    <div style="display: flex; justify-content: flex-end;">
+                        <button class="btn" onclick="updateMyProfile()" style="width: auto;">{{ t('mypage.button_save') }}</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="mypage-subtab-devices" class="subtab-content">
+                <div class="card" style="max-width: 640px; background: var(--md-sys-color-surface-container); margin-bottom: 20px;">
+                    <div style="font-weight: 600; font-size: 15px; margin-bottom: 15px; color: var(--text-primary);">{{ t('devices.create_heading') }}</div>
+                    <div style="display: flex; gap: 12px;">
+                        <input type="text" id="newDeviceName" placeholder="{{ t('devices.placeholder_name') }}" style="flex-grow: 1; background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+                        <button class="btn" onclick="createMyDevice()" style="width: auto;">{{ t('devices.button_create') }}</button>
+                    </div>
+                    <div id="newDeviceTokenBox" style="display: none; margin-top: 16px;">
+                        <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">{{ t('devices.new_token_desc') }}</div>
+                        <div style="display: flex; align-items: center; gap: 4px; font-family: 'Fira Code', monospace; background: rgba(0,0,0,0.15); padding: 6px 6px 6px 12px; border-radius: 12px; font-size: 13px; border: 1px solid var(--border-color);">
+                            <span id="newDeviceTokenValue" style="flex-grow: 1; user-select: all; word-break: break-all;"></span>
+                            <button class="icon-btn" onclick="copyNewDeviceToken()" title="{{ t('common.button_copy') }}" aria-label="{{ t('common.button_copy') }}"><span class="material-symbols-outlined">content_copy</span></button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="table-container">
+                    <table id="myDevicesTable">
+                        <thead>
+                            <tr>
+                                <th>{{ t('devices.col_name') }}</th>
+                                <th>{{ t('devices.col_created') }}</th>
+                                <th>{{ t('common.col_actions') }}</th>
+                            </tr>
+                        </thead>
+                        <tbody id="myDevicesTableBody">
+                            <tr><td colspan="3" class="empty-state">{{ t('common.loading') }}</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="mypage-subtab-plugins" class="subtab-content">
+                <div class="table-container">
+                    <table id="myPluginsTable">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>{{ t('myplugins.col_description') }}</th>
+                                <th>{{ t('myplugins.col_version') }}</th>
+                                <th>{{ t('myplugins.col_status') }}</th>
+                                <th>{{ t('common.col_actions') }}</th>
+                            </tr>
+                        </thead>
+                        <tbody id="myPluginsTableBody">
+                            <tr><td colspan="5" class="empty-state">{{ t('common.loading') }}</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- 탭 2: Vault 동기화 관리 -->
+        <div id="tab-sync" class="tab-content">
+            <div class="header">
+                <h1>{{ t('sync.title') }}</h1>
+                <p>{{ t('sync.desc') }}</p>
+            </div>
+
+            <div class="selector-bar">
+                <select id="vaultSelect" onchange="loadVaultFiles()">
+                    <option value="">{{ t('sync.select_vault') }}</option>
+                </select>
+            </div>
+
+            <div class="table-container">
+                <table id="filesTable">
+                    <thead>
+                        <tr>
+                            <th>{{ t('sync.col_path') }}</th>
+                            <th>{{ t('common.col_size') }}</th>
+                            <th>{{ t('sync.col_modified') }}</th>
+                            <th>{{ t('sync.col_hash') }}</th>
+                            <th>{{ t('common.col_status') }}</th>
+                        </tr>
+                    </thead>
+                    <tbody id="filesTableBody">
+                        <tr>
+                            <td colspan="5" class="empty-state">{{ t('sync.empty_select_vault') }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- 탭 3: 퍼블리시 관리 -->
+        <div id="tab-publish" class="tab-content">
+            <div class="header">
+                <h1>{{ t('publish.title') }}</h1>
+                <p>{{ t('publish.desc') }}</p>
+            </div>
+
+            <div class="selector-bar">
+                <select id="siteSelect" onchange="loadSiteFiles()">
+                    <option value="">{{ t('publish.select_site') }}</option>
+                </select>
+            </div>
+
+            <div class="table-container">
+                <table id="publishTable">
+                    <thead>
+                        <tr>
+                            <th>{{ t('publish.col_path') }}</th>
+                            <th>{{ t('common.col_size') }}</th>
+                            <th>{{ t('publish.col_published') }}</th>
+                            <th>{{ t('publish.col_link') }}</th>
+                            <th>{{ t('common.col_actions') }}</th>
+                        </tr>
+                    </thead>
+                    <tbody id="publishTableBody">
+                        <tr>
+                            <td colspan="5" class="empty-state">{{ t('publish.empty_select_site') }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- 탭 4: 사용자 관리 (관리자 전용) -->
+        <div id="tab-users" class="tab-content">
+            <div class="header">
+                <h1>{{ t('users.title') }}</h1>
+                <p>{{ t('users.desc') }}</p>
+            </div>
+
+            <!-- 신규 사용자 추가 폼 -->
+            <div class="card" style="margin-bottom: 25px; background: var(--md-sys-color-surface-container);">
+                <div style="font-weight: 600; font-size: 15px; margin-bottom: 15px; color: var(--text-primary);">{{ t('users.create_heading') }}</div>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 15px;">
+                    <input type="text" id="newUsername" placeholder="{{ t('users.placeholder_username') }}" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+                    <input type="password" id="newPassword" placeholder="{{ t('users.placeholder_password') }}" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+                    <input type="text" id="newName" placeholder="{{ t('users.placeholder_name') }}" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+                    <input type="email" id="newEmail" placeholder="{{ t('users.placeholder_email') }}" style="background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+                </div>
+                <div style="display: flex; justify-content: flex-end;">
+                    <button class="btn" onclick="createUser()" style="width: auto;">{{ t('users.button_create') }}</button>
+                </div>
+            </div>
+
+            <div class="table-container">
+                <table id="usersTable">
+                    <thead>
+                        <tr>
+                            <th>{{ t('users.col_id') }}</th>
+                            <th>{{ t('users.col_name') }}</th>
+                            <th>{{ t('users.col_email') }}</th>
+                            <th>{{ t('common.col_actions') }}</th>
+                        </tr>
+                    </thead>
+                    <tbody id="usersTableBody">
+                        <tr>
+                            <td colspan="4" class="empty-state">{{ t('common.loading') }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <div id="usersPagination" class="pagination-bar"></div>
+        </div>
+
+        <!-- 탭 5: 서버 플러그인 관리 (관리자 전용) -->
+        <div id="tab-plugins" class="tab-content">
+            <div class="header">
+                <h1>{{ t('plugins.title') }}</h1>
+                <p>{{ t('plugins.desc') }}</p>
+            </div>
+
+            <div style="font-weight: 600; font-size: 15px; margin: 10px 0;">{{ t('plugins.section_installed') }}</div>
+            <div class="table-container">
+                <table id="pluginsInstalledTable">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>{{ t('plugins.col_name') }}</th>
+                            <th>{{ t('plugins.col_version') }}</th>
+                            <th>{{ t('plugins.col_description') }}</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pluginsInstalledTableBody">
+                        <tr><td colspan="4" class="empty-state">{{ t('common.loading') }}</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div style="font-weight: 600; font-size: 15px; margin: 20px 0 10px;">{{ t('plugins.section_enabled') }}</div>
+            <div class="table-container">
+                <table id="pluginsEnabledTable">
+                    <thead>
+                        <tr>
+                            <th>{{ t('plugins.col_owner') }}</th>
+                            <th>ID</th>
+                            <th>{{ t('plugins.col_enabled_at') }}</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pluginsEnabledTableBody">
+                        <tr><td colspan="3" class="empty-state">{{ t('common.loading') }}</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const I18N = {{ i18n_json | safe }};
+    </script>
+    <script src="/static/dashboard.js"></script>
+    <div id="deviceModalOverlay" class="dialog-overlay" style="display: none;">
+        <div class="dialog-card" style="width: 640px;">
+            <h2 class="dialog-title">{{ t('devices.button_manage') }} (<span id="deviceModalUsername"></span>)</h2>
+            <div class="dialog-content" style="max-height: 360px; overflow-y: auto;">
+                <table id="deviceModalTable">
+                    <thead>
+                        <tr>
+                            <th>{{ t('devices.col_name') }}</th>
+                            <th>{{ t('devices.col_created') }}</th>
+                            <th>{{ t('common.col_actions') }}</th>
+                        </tr>
+                    </thead>
+                    <tbody id="deviceModalTableBody">
+                        <tr><td colspan="3" class="empty-state">{{ t('common.loading') }}</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="dialog-actions">
+                <button class="dialog-btn dialog-btn-text" onclick="closeDeviceModal()">{{ t('common.button_close') }}</button>
+            </div>
+        </div>
+    </div>
+    <div id="m3DialogOverlay" class="dialog-overlay" style="display: none;">
+        <div class="dialog-card">
+            <h2 class="dialog-title" id="dialogTitle">{{ t('common.dialog_title_default') }}</h2>
+            <div class="dialog-content" id="dialogContent">{{ t('common.dialog_content_default') }}</div>
+            <div id="dialogInputContainer" class="dialog-input-container" style="display: none;">
+                <input type="password" id="dialogInput" class="dialog-input" placeholder="{{ t('users.placeholder_new_password') }}">
+            </div>
+            <div class="dialog-actions">
+                <button class="dialog-btn dialog-btn-text" id="dialogCancelBtn">{{ t('common.button_cancel') }}</button>
+                <button class="dialog-btn dialog-btn-filled" id="dialogConfirmBtn">{{ t('common.button_confirm') }}</button>
+            </div>
+        </div>
+    </div>
+    <div id="toastContainer" class="toast-container"></div>
+</body>
+</html>
