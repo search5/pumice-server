@@ -274,6 +274,53 @@ grpc-web/connect-es 라이브러리는 애초에 client-streaming을 지원하�
   시간. `GET /api/admin/streaming-stats`(`permission='admin'`)와 주기적 로그 요약(`main.py`의
   `log_streaming_upload_stats`)으로 노출됩니다.
 
+## 서버 플러그인
+
+퍼블리시 페이지가 렌더링할 수 있는 것을 확장하기 위한 서버 사이드 플러그인의 발견/활성화
+생명주기입니다 — 완전히 서버 로컬입니다: vault에서 동기화되는 내용이 전혀 아닙니다. 현재는
+인프라만 갖춰진 상태입니다 — 퍼블리시 렌더러 연동이 아직 없어서, 활성화된 플러그인이라도 실제로
+퍼블리시된 페이지에 아무 영향을 주지 않습니다. 이 부분을 실제 플러그인 로직과 동시에 설계하지
+않아도 되도록, 먼저 따로 갖춰둔 것입니다.
+
+런타임 설치 단계는 의도적으로 없습니다. 플러그인 코드는 웹 서버 자신과 완전히 같은 파이썬
+프로세스 안에서 돌기 때문에, 플러그인을 추가하는 것은 다른 서버 의존성을 추가하는 것과 똑같은
+무게를 가집니다 — 관리자 대시보드로 업로드하는 게 아니라 `pyproject.toml`에 선언되고 Docker
+이미지 빌드 시점에 포함되어, 이 서버가 의존하는 다른 모든 것과 동일한 검토/빌드/재배포 경로를
+거칩니다. 이는 곧 플러그인 자신의 의존성도 (직접 번들링할 필요 없이) 빌드 시점에 `uv`로 제대로
+해석된다는 뜻이기도 합니다.
+
+### 플러그인 만들기
+
+플러그인은 `pumice_server.plugins` 그룹에 entry point를 선언한 평범한 파이썬 패키지입니다:
+
+```toml
+# pyproject.toml
+[project]
+name = "harang-immich"
+version = "0.1.0"
+description = "퍼블리시된 페이지에서 harang-immich 임베드를 해석합니다."
+
+[project.entry-points."pumice_server.plugins"]
+harang-immich = "harang_immich_plugin:resolve"
+```
+
+### 서버에 추가하기
+
+pumice-server의 평범한 의존성으로 추가하고(`uv add harang-immich-plugin`, 또는
+`[tool.uv.sources]`를 통한 경로/git 소스) 이미지를 다시 빌드하면 됩니다. `discover_plugins()`
+(`src/pumice_server/plugin_registry.py`)는 pytest나 Flask가 자기 플러그인을 찾는 것과 같은
+방식 — 표준 라이브러리 자체의 플러그인 발견 메커니즘인
+`importlib.metadata.entry_points(group="pumice_server.plugins")` — 로 찾아냅니다.
+pumice-server만의 특별한 게 없고, 위의 entry point 선언 외에 따로 설정할 것도 없습니다.
+
+### 활성화하기
+
+활성화는 관리자가 대신 해주는 것이 아니라 셀프 서비스입니다 — 로그인한 각 계정이 **마이페이지**에서
+설치된 플러그인을 스스로 켜고 끕니다. 범위는 vault 단위가 아니라 소유자 계정 단위로만 정해집니다 —
+플러그인을 켜면 그 계정이 소유한 모든 vault에 적용됩니다. vault별 토글이 없는 이유는, 플러그인이
+실제로 필요로 하는 vault가 어떤 것인지는 이미 퍼블리시 요청 자체의
+경로(`/publish/{username}/{vault_id}/...`)에서 알 수 있기 때문입니다.
+
 ## 후원
 
 이 프로젝트를 후원하고 싶으시면 search5@gmail.com으로 연락해주세요. 후원해주시면 개발에 더 많은

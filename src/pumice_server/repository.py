@@ -87,6 +87,22 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
+    def enable_plugin(self, owner_username: str, plugin_id: str, enabled_at_ms: int) -> None:
+        pass
+
+    @abstractmethod
+    def disable_plugin(self, owner_username: str, plugin_id: str) -> None:
+        pass
+
+    @abstractmethod
+    def list_enabled_plugins(self, owner_username: str) -> list:
+        pass
+
+    @abstractmethod
+    def list_all_enabled_plugins(self) -> list:
+        pass
+
+    @abstractmethod
     def create_user(self, username: str, password_hash: str) -> bool:
         pass
 
@@ -204,6 +220,21 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             Column("created_at_ms", BigInteger, nullable=False),
         )
         Index("idx_device_tokens_username", self._device_tokens.c.username)
+
+        # Which server-side publish plugins (plugin_registry.py) are turned on for a given
+        # owner -- a plugin can be baked into the server image (declared as a build-time
+        # pumice-server dependency, discoverable via discover_plugins()) without being enabled
+        # anywhere; a row here is what actually lets it run, and each owner enables it for
+        # themselves (self-service, not an admin action). Scoped by owner_username only,
+        # not owner+vault: once on for an account it applies
+        # across every vault that account owns -- the vault a plugin resolver needs is already
+        # known from the publish request's own path (/publish/{username}/{vault_id}/...) at the
+        # point a plugin would actually run, so there's nothing to look up per-vault here.
+        self._plugin_enablement = Table("plugin_enablement", self._meta,
+            Column("owner_username", String(100), primary_key=True),
+            Column("plugin_id", String(255), primary_key=True),
+            Column("enabled_at_ms", BigInteger, nullable=False),
+        )
 
     def init_db(self) -> None:
         # Runs before the owner-scoping migration below: file_metadata/published_files may still
@@ -452,6 +483,44 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 )
             ).fetchall()
             return [{"path": r.path, "hash": r.content_hash} for r in rows]
+
+    def enable_plugin(self, owner_username: str, plugin_id: str, enabled_at_ms: int) -> None:
+        with self.engine.begin() as conn:
+            self._upsert(conn, self._plugin_enablement, {
+                "owner_username": owner_username,
+                "plugin_id": plugin_id,
+                "enabled_at_ms": enabled_at_ms,
+            }, ["owner_username", "plugin_id"])
+
+    def disable_plugin(self, owner_username: str, plugin_id: str) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                delete(self._plugin_enablement).where(
+                    self._plugin_enablement.c.owner_username == owner_username,
+                    self._plugin_enablement.c.plugin_id == plugin_id,
+                )
+            )
+
+    def list_enabled_plugins(self, owner_username: str) -> list:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(self._plugin_enablement).where(
+                    self._plugin_enablement.c.owner_username == owner_username,
+                )
+            ).fetchall()
+            return [{"plugin_id": r.plugin_id, "enabled_at_ms": r.enabled_at_ms} for r in rows]
+
+    def list_all_enabled_plugins(self) -> list:
+        with self.engine.connect() as conn:
+            rows = conn.execute(select(self._plugin_enablement)).fetchall()
+            return [
+                {
+                    "owner_username": r.owner_username,
+                    "plugin_id": r.plugin_id,
+                    "enabled_at_ms": r.enabled_at_ms,
+                }
+                for r in rows
+            ]
 
     def create_user(self, username: str, password_hash: str, name: Optional[str] = None, email: Optional[str] = None, is_admin: bool = False) -> bool:
         with self.engine.begin() as conn:

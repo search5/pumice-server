@@ -140,6 +140,36 @@
       "confirm_content": "이 디바이스의 동기화 인증을 폐기하시겠습니까?\n해당 기기는 다시 로그인해야 동기화할 수 있습니다.",
       "msg_revoke_success": "디바이스가 폐기되었습니다.",
       "msg_revoke_failed_prefix": "디바이스 폐기 실패: "
+    },
+    "plugins": {
+      "title": "서버 플러그인 관리",
+      "desc": "이 서버 이미지에 빌드 시점에 포함된 퍼블리시 전용 플러그인 목록입니다. 여기서 설치/삭제는 할 수 없으며, 새 플러그인을 추가하려면 서버 의존성으로 등록하고 이미지를 다시 빌드해야 합니다. 활성화는 각 사용자가 마이페이지에서 직접 합니다. (관리자 권한)",
+      "section_installed": "설치된 플러그인",
+      "col_id": "ID",
+      "col_name": "이름",
+      "col_version": "버전",
+      "col_description": "설명",
+      "empty_no_plugins": "이 서버 이미지에 포함된 플러그인이 없습니다.",
+      "section_enabled": "계정별 활성화 현황",
+      "col_owner": "소유자",
+      "col_enabled_at": "활성화 시각",
+      "empty_no_enabled": "활성화한 사용자가 없습니다."
+    },
+    "myplugins": {
+      "heading": "서버 플러그인",
+      "col_id": "ID",
+      "col_description": "설명",
+      "col_version": "버전",
+      "col_status": "상태",
+      "status_enabled": "활성화됨",
+      "status_disabled": "비활성화됨",
+      "button_enable": "활성화",
+      "button_disable": "비활성화",
+      "empty_no_plugins": "설치된 플러그인이 없습니다.",
+      "msg_enable_success": "플러그인을 활성화했습니다.",
+      "msg_enable_failed_prefix": "활성화 실패: ",
+      "msg_disable_success": "플러그인을 비활성화했습니다.",
+      "msg_disable_failed_prefix": "비활성화 실패: "
     }
   }
 }

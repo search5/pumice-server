@@ -140,6 +140,36 @@
       "confirm_content": "Revoke this device's sync credential?\nThe device will need to log in again to sync.",
       "msg_revoke_success": "Device revoked.",
       "msg_revoke_failed_prefix": "Failed to revoke device: "
+    },
+    "plugins": {
+      "title": "Server Plugin Management",
+      "desc": "Publish-only plugins baked into this server image at build time. There's no install/remove here -- adding a new plugin means declaring it as a server dependency and rebuilding the image. Each user enables plugins for themselves on their My Page. (Admin only)",
+      "section_installed": "Installed plugins",
+      "col_id": "ID",
+      "col_name": "Name",
+      "col_version": "Version",
+      "col_description": "Description",
+      "empty_no_plugins": "No plugins are baked into this server image.",
+      "section_enabled": "Per-account enablement",
+      "col_owner": "Owner",
+      "col_enabled_at": "Enabled at",
+      "empty_no_enabled": "No one has enabled a plugin yet."
+    },
+    "myplugins": {
+      "heading": "Server plugins",
+      "col_id": "ID",
+      "col_description": "Description",
+      "col_version": "Version",
+      "col_status": "Status",
+      "status_enabled": "Enabled",
+      "status_disabled": "Disabled",
+      "button_enable": "Enable",
+      "button_disable": "Disable",
+      "empty_no_plugins": "No plugins installed.",
+      "msg_enable_success": "Plugin enabled.",
+      "msg_enable_failed_prefix": "Failed to enable: ",
+      "msg_disable_success": "Plugin disabled.",
+      "msg_disable_failed_prefix": "Failed to disable: "
     }
   }
 }

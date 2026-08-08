@@ -11,6 +11,8 @@ from pyramid.config import Configurator
 from pyramid.response import Response
 from pyramid.view import view_config
 
+from .plugin_registry import discover_plugins
+
 logger = logging.getLogger("pumice_server.web")
 
 # ─── i18n ────────────────────────────────────────────────────────────────
@@ -1323,6 +1325,40 @@ def dashboard_page_view(request):
                     </table>
                 </div>
             </div>
+
+            <div class="card" style="max-width: 600px; background: var(--md-sys-color-surface-container); margin-top: 20px;">
+                <div style="font-weight: 600; font-size: 16px; margin-bottom: 20px; color: var(--text-primary);">""")
+    parts.append(t('myplugins.heading', lang))
+    parts.append("""</div>
+                <div class="table-container">
+                    <table id="myPluginsTable">
+                        <thead>
+                            <tr>
+                                <th>""")
+    parts.append(t('myplugins.col_id', lang))
+    parts.append("""</th>
+                                <th>""")
+    parts.append(t('myplugins.col_description', lang))
+    parts.append("""</th>
+                                <th>""")
+    parts.append(t('myplugins.col_version', lang))
+    parts.append("""</th>
+                                <th>""")
+    parts.append(t('myplugins.col_status', lang))
+    parts.append("""</th>
+                                <th>""")
+    parts.append(t('common.col_actions', lang))
+    parts.append("""</th>
+                            </tr>
+                        </thead>
+                        <tbody id="myPluginsTableBody">
+                            <tr><td colspan="5" class="empty-state">""")
+    parts.append(t('common.loading', lang))
+    parts.append("""</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
         <!-- 탭 2: Vault 동기화 관리 -->""")
@@ -1490,6 +1526,73 @@ def dashboard_page_view(request):
             </div>
             <div id="usersPagination" class="pagination-bar"></div>
         </div>
+
+        <!-- 탭 5: 서버 플러그인 관리 (관리자 전용) -->
+        <div id="tab-plugins" class="tab-content">
+            <div class="header">
+                <h1>""")
+    parts.append(t('plugins.title', lang))
+    parts.append("""</h1>
+                <p>""")
+    parts.append(t('plugins.desc', lang))
+    parts.append("""</p>
+            </div>
+
+            <div style="font-weight: 600; font-size: 15px; margin: 10px 0;">""")
+    parts.append(t('plugins.section_installed', lang))
+    parts.append("""</div>
+            <div class="table-container">
+                <table id="pluginsInstalledTable">
+                    <thead>
+                        <tr>
+                            <th>""")
+    parts.append(t('plugins.col_id', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('plugins.col_name', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('plugins.col_version', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('plugins.col_description', lang))
+    parts.append("""</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pluginsInstalledTableBody">
+                        <tr><td colspan="4" class="empty-state">""")
+    parts.append(t('common.loading', lang))
+    parts.append("""</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div style="font-weight: 600; font-size: 15px; margin: 20px 0 10px;">""")
+    parts.append(t('plugins.section_enabled', lang))
+    parts.append("""</div>
+            <div class="table-container">
+                <table id="pluginsEnabledTable">
+                    <thead>
+                        <tr>
+                            <th>""")
+    parts.append(t('plugins.col_owner', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('plugins.col_id', lang))
+    parts.append("""</th>
+                            <th>""")
+    parts.append(t('plugins.col_enabled_at', lang))
+    parts.append("""</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pluginsEnabledTableBody">
+                        <tr><td colspan="3" class="empty-state">""")
+    parts.append(t('common.loading', lang))
+    parts.append("""</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -1551,6 +1654,12 @@ def dashboard_page_view(request):
             li.setAttribute("onclick", "switchTab('users')");
             li.innerText = t("nav.users");
             menu.appendChild(li);
+
+            const pluginsLi = document.createElement("li");
+            pluginsLi.className = "nav-item";
+            pluginsLi.setAttribute("onclick", "switchTab('plugins')");
+            pluginsLi.innerText = t("plugins.title");
+            menu.appendChild(pluginsLi);
         }
 
 
@@ -1573,12 +1682,15 @@ def dashboard_page_view(request):
             } else if (tabId === 'mypage') {
                 loadMyProfile();
                 loadMyDevices();
+                loadMyPlugins();
             } else if (tabId === 'sync') {
                 refreshVaultList();
             } else if (tabId === 'publish') {
                 refreshSiteList();
             } else if (tabId === 'users') {
                 loadUsersList(1);
+            } else if (tabId === 'plugins') {
+                loadPluginsTab();
             }
         }
 
@@ -2093,6 +2205,95 @@ def dashboard_page_view(request):
                 loadUsersList(1);
             } else {
                 showToast(t("users.msg_create_failed_prefix") + (res ? res.error : t("common.unknown_error")));
+            }
+        }
+
+        // 서버 플러그인 관리 (스켈레톤) -- 업로드된 .whl을 data_dir/plugins/<id>/에 풀어서
+        // 나열만 한다 -- 무엇이 설치돼있는지는 이 서버 이미지가 빌드될 때 이미 정해져 있다
+        // (pyproject.toml의 일반 의존성 + [project.entry-points."pumice_server.plugins"]).
+        // 관리자도 여기서 설치/삭제를 할 수 없다. "활성화"는 관리자가 아니라 각 로그인 사용자
+        // 본인이 자기 계정에 대해서만 하는 셀프 서비스이다 (아래 loadMyPlugins/toggleMyPlugin,
+        // 마이페이지 탭 소속) -- 이 화면의 "활성화 현황" 표는 읽기 전용이다.
+        async function loadPluginsTab() {
+            const data = await fetchAPI("/api/admin/plugins");
+            if (!data) return;
+
+            const installedBody = document.getElementById("pluginsInstalledTableBody");
+            if (data.installed && data.installed.length > 0) {
+                installedBody.innerHTML = "";
+                data.installed.forEach(p => {
+                    const tr = document.createElement("tr");
+                    tr.innerHTML = `
+                        <td>${p.id}</td>
+                        <td>${p.name}</td>
+                        <td>${p.version}</td>
+                        <td>${p.description}</td>
+                    `;
+                    installedBody.appendChild(tr);
+                });
+            } else {
+                installedBody.innerHTML = `<tr><td colspan="4" class="empty-state">${t("plugins.empty_no_plugins")}</td></tr>`;
+            }
+
+            const enabledBody = document.getElementById("pluginsEnabledTableBody");
+            if (data.enabled && data.enabled.length > 0) {
+                enabledBody.innerHTML = "";
+                data.enabled.forEach(reg => {
+                    const tr = document.createElement("tr");
+                    const enabledAt = reg.enabled_at_ms ? new Date(reg.enabled_at_ms).toLocaleString() : "-";
+                    tr.innerHTML = `
+                        <td>${reg.owner_username}</td>
+                        <td>${reg.plugin_id}</td>
+                        <td>${enabledAt}</td>
+                    `;
+                    enabledBody.appendChild(tr);
+                });
+            } else {
+                enabledBody.innerHTML = `<tr><td colspan="3" class="empty-state">${t("plugins.empty_no_enabled")}</td></tr>`;
+            }
+        }
+
+        // 마이페이지의 "플러그인" 카드 -- 로그인한 사용자가 설치된 플러그인 중 자기 계정에
+        // 켜고 끌 것을 스스로 고른다. 관리자가 대신 눌러주는 방식이 아니다.
+        async function loadMyPlugins() {
+            const data = await fetchAPI("/api/user/plugins");
+            if (!data) return;
+
+            const body = document.getElementById("myPluginsTableBody");
+            if (data.installed && data.installed.length > 0) {
+                body.innerHTML = "";
+                data.installed.forEach(p => {
+                    const tr = document.createElement("tr");
+                    const statusLabel = p.enabled ? t("myplugins.status_enabled") : t("myplugins.status_disabled");
+                    const buttonLabel = p.enabled ? t("myplugins.button_disable") : t("myplugins.button_enable");
+                    tr.innerHTML = `
+                        <td>${p.id}</td>
+                        <td>${p.description}</td>
+                        <td>${p.version}</td>
+                        <td>${statusLabel}</td>
+                        <td><button class="btn-sm" onclick="toggleMyPlugin('${p.id}', ${p.enabled})">${buttonLabel}</button></td>
+                    `;
+                    body.appendChild(tr);
+                });
+            } else {
+                body.innerHTML = `<tr><td colspan="5" class="empty-state">${t("myplugins.empty_no_plugins")}</td></tr>`;
+            }
+        }
+
+        async function toggleMyPlugin(pluginId, currentlyEnabled) {
+            const url = currentlyEnabled ? "/api/user/plugins/disable" : "/api/user/plugins/enable";
+            const res = await fetchAPI(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ plugin_id: pluginId })
+            });
+
+            if (res && res.ok) {
+                showToast(currentlyEnabled ? t("myplugins.msg_disable_success") : t("myplugins.msg_enable_success"));
+                loadMyPlugins();
+            } else {
+                const prefix = currentlyEnabled ? t("myplugins.msg_disable_failed_prefix") : t("myplugins.msg_enable_failed_prefix");
+                showToast(prefix + (res ? res.error : t("common.unknown_error")));
             }
         }
 
@@ -3358,6 +3559,87 @@ def admin_user_create_view(request):
         logger.error(f"Failed to create user: {e}")
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
 
+# ─── Server-side publish plugins (skeleton) ─────────────────────────────────
+# Discovery logic lives in plugin_registry.py (no Twisted/Pyramid dependency, see its own
+# module docstring). There's no admin "install" action here at all -- a plugin is baked into
+# the server's Docker image at build time, as a regular pumice-server dependency, so whatever
+# discover_plugins() finds is simply whatever the running image was built with. *Enabling* a
+# discovered plugin is the only runtime action, and it's self-service: each logged-in account
+# turns plugins on/off for itself (see the user_plugin_* views further down,
+# permission='authenticated'), same as any other per-account setting on this server. No plugin
+# actually runs anything yet -- there's no publish-renderer integration in this pass, just
+# discovery + enable/disable bookkeeping.
+
+@view_config(route_name='admin_plugins', renderer='json', permission='admin')
+def admin_plugins_view(request):
+    manifests = discover_plugins()
+    return {
+        "installed": [
+            {
+                "id": m.plugin_id,
+                "name": m.plugin_id,
+                "version": m.version,
+                "description": m.description,
+            }
+            for m in manifests
+        ],
+        "enabled": request.repository.list_all_enabled_plugins(),
+    }
+
+@view_config(route_name='user_plugins', renderer='json', permission='authenticated')
+def user_plugins_view(request):
+    username = request.identity["username"]
+    manifests = discover_plugins()
+    enabled_ids = {p["plugin_id"] for p in request.repository.list_enabled_plugins(username)}
+    return {
+        "installed": [
+            {
+                "id": m.plugin_id,
+                "name": m.plugin_id,
+                "version": m.version,
+                "description": m.description,
+                "enabled": m.plugin_id in enabled_ids,
+            }
+            for m in manifests
+        ],
+    }
+
+@view_config(route_name='user_plugin_enable', renderer='json', permission='authenticated')
+def user_plugin_enable_view(request):
+    username = request.identity["username"]
+    try:
+        body = request.json_body
+        plugin_id = body.get("plugin_id")
+        if not plugin_id:
+            return Response(status=400, body=json.dumps({"error": "Missing plugin_id"}).encode("utf-8"), content_type="application/json")
+
+        manifests = discover_plugins()
+        if plugin_id not in {m.plugin_id for m in manifests}:
+            return Response(status=400, body=json.dumps({"error": f"Plugin '{plugin_id}' is not installed"}).encode("utf-8"), content_type="application/json")
+
+        request.repository.enable_plugin(username, plugin_id, int(time.time() * 1000))
+        logger.info(f"User '{username}' enabled plugin '{plugin_id}' for themselves")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Failed to enable plugin: {e}")
+        return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
+
+@view_config(route_name='user_plugin_disable', renderer='json', permission='authenticated')
+def user_plugin_disable_view(request):
+    username = request.identity["username"]
+    try:
+        body = request.json_body
+        plugin_id = body.get("plugin_id")
+        if not plugin_id:
+            return Response(status=400, body=json.dumps({"error": "Missing plugin_id"}).encode("utf-8"), content_type="application/json")
+
+        request.repository.disable_plugin(username, plugin_id)
+        logger.info(f"User '{username}' disabled plugin '{plugin_id}' for themselves")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Failed to disable plugin: {e}")
+        return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
+
 @view_config(route_name='admin_user_devices', renderer='json', permission='admin')
 def admin_user_devices_view(request):
     target_username = request.matchdict.get("username")
@@ -3516,6 +3798,10 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.add_route('admin_vault_files', '/api/admin/vaults/{vault_id}', factory=VaultContext)
     config.add_route('admin_published', '/api/admin/published')
     config.add_route('admin_streaming_stats', '/api/admin/streaming-stats')
+    config.add_route('admin_plugins', '/api/admin/plugins')
+    config.add_route('user_plugins', '/api/user/plugins')
+    config.add_route('user_plugin_enable', '/api/user/plugins/enable')
+    config.add_route('user_plugin_disable', '/api/user/plugins/disable')
     config.add_route('get_token_info', '/api/token/info')
     config.add_route('get_history', '/api/history', factory=VaultContext)
     config.add_route('download_history', '/api/history/download', factory=VaultContext)

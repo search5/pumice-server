@@ -278,6 +278,56 @@ Guarantees:
   Exposed via `GET /api/admin/streaming-stats` (`permission='admin'`) and a periodic log summary
   (`main.py`'s `log_streaming_upload_stats`).
 
+## Server plugins
+
+Server-side plugins for the publish page — a discover/enable lifecycle for extending what a
+published page can render, entirely server-local (nothing about it is synced from a vault).
+This is currently infrastructure only — there's no publish-renderer integration yet, so an
+enabled plugin doesn't actually do anything to a published page. It exists so that piece can be
+built later without also having to design discovery/enablement machinery at the same time.
+
+There is deliberately no runtime install step. A plugin's code runs inside the very same Python
+process as the web server itself, so adding one is exactly as consequential as adding any other
+server dependency — it's declared in `pyproject.toml` and baked into the Docker image at build
+time, going through the same review/build/redeploy path as everything else this server depends
+on, rather than being something uploaded through the admin dashboard. That also means a
+plugin's own dependencies get real resolution at build time (via `uv`), unlike a hand-unpacked
+wheel would.
+
+### Building a plugin
+
+A plugin is an ordinary Python package that declares an entry point in the
+`pumice_server.plugins` group:
+
+```toml
+# pyproject.toml
+[project]
+name = "harang-immich"
+version = "0.1.0"
+description = "Resolves harang-immich embeds on published pages."
+
+[project.entry-points."pumice_server.plugins"]
+harang-immich = "harang_immich_plugin:resolve"
+```
+
+### Adding it to the server
+
+Add it as a normal pumice-server dependency (`uv add harang-immich-plugin`, or a path/git
+source via `[tool.uv.sources]`) and rebuild the image. `discover_plugins()`
+(`src/pumice_server/plugin_registry.py`) finds it the same way pytest or Flask find their own
+plugins — via `importlib.metadata.entry_points(group="pumice_server.plugins")`, the standard
+library's own plugin-discovery mechanism. There's nothing pumice-server-specific about it, and
+nothing to configure beyond the entry point declaration above.
+
+### Enabling
+
+Enabling is self-service, not something an admin does on a user's behalf — every logged-in
+account turns a discovered plugin on/off for itself, from its own **My Page**. It's scoped by
+owner account only, not per-vault — turning a plugin on applies to every vault that account
+owns. There's no per-vault toggle, because whatever vault a plugin ends up needing is already
+known from the publish request's own path (`/publish/{username}/{vault_id}/...`) at the point
+the plugin would actually run.
+
 ## Support
 
 If you'd like to sponsor this project, reach out at search5@gmail.com. Sponsorships make a real
