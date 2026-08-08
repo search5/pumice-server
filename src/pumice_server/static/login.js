@@ -58,6 +58,9 @@ themeToggleBtn.addEventListener("click", () => {
 const params = new URLSearchParams(window.location.search);
 const deviceRedirect = params.get("redirect");
 const deviceName = params.get("device_name");
+// Where to land after a normal (non-device-pairing) login -- e.g. the OAuth /oauth/authorize
+// consent screen, which bounces here first when there's no session cookie yet.
+const nextParam = params.get("next");
 
 if (deviceRedirect) {
     cardSubtitle.innerText = t("login.subtitle_device");
@@ -112,7 +115,11 @@ form.addEventListener("submit", async (e) => {
             localStorage.setItem("sync_username", data.username || data.email);
             localStorage.setItem("sync_is_admin", data.is_admin);
 
-            window.location.href = "/dashboard";
+            // `next` must be a same-origin relative path (starts with exactly one "/", never
+            // "//" or a "scheme://") -- otherwise a crafted ?next= could redirect a
+            // freshly-authenticated session to an attacker-controlled origin.
+            const isSafeNext = nextParam && nextParam.startsWith("/") && !nextParam.startsWith("//") && !nextParam.includes("://");
+            window.location.href = isSafeNext ? nextParam : "/dashboard";
         } else {
             alertEl.className = "alert alert-error";
             alertEl.innerText = data.error || t("login.msg_fail");

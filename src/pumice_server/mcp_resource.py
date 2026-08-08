@@ -125,6 +125,15 @@ class McpResource(Resource):
         self._cors_headers(request)
         request.setResponseCode(status)
         request.setHeader(b"Content-Type", b"application/json")
+        if status == 401:
+            # RFC 9728 discovery hint: an MCP client with no (or an expired) credential learns
+            # where to find this server's OAuth protected-resource metadata from here, which is
+            # what lets "just paste the server URL" bootstrap into a browser-based auth flow
+            # instead of the client having no idea auth is even possible.
+            scheme = "https" if request.isSecure() else "http"
+            host = (request.getHeader(b"host") or b"").decode("utf-8", errors="replace")
+            resource_metadata_url = f"{scheme}://{host}/.well-known/oauth-protected-resource"
+            request.setHeader(b"WWW-Authenticate", f'Bearer resource_metadata="{resource_metadata_url}"'.encode("utf-8"))
         body = json.dumps({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": message}}).encode(
             "utf-8"
         )

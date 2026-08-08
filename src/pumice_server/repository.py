@@ -127,6 +127,14 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
+    def create_oauth_client(self, client_id: str, client_name: str, redirect_uris: list, created_at_ms: int) -> None:
+        pass
+
+    @abstractmethod
+    def get_oauth_client(self, client_id: str) -> Optional[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
     def get_vaults_by_owner(self, owner_username: str) -> list:
         pass
 
@@ -220,6 +228,20 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             Column("created_at_ms", BigInteger, nullable=False),
         )
         Index("idx_device_tokens_username", self._device_tokens.c.username)
+
+        # OAuth 2.1 dynamic client registration (RFC 7591) for the MCP browser-auth flow -- an
+        # MCP client (Claude Code/Desktop, ...) self-registers here before ever asking a user to
+        # approve anything, so "just paste the server URL" works without anyone manually handing
+        # out a client_id out of band. Public clients only (PKCE, no client_secret), so there's
+        # nothing sensitive in this table. redirect_uris is stored JSON-encoded since a client
+        # can register more than one (e.g. several loopback ports it might bind its local
+        # callback server to).
+        self._oauth_clients = Table("oauth_clients", self._meta,
+            Column("client_id", String(64), primary_key=True),
+            Column("client_name", String(200), nullable=True),
+            Column("redirect_uris", Text, nullable=False),
+            Column("created_at_ms", BigInteger, nullable=False),
+        )
 
         # Which server-side publish plugins (plugin_registry.py) are turned on for a given
         # owner -- a plugin can be baked into the server image (declared as a build-time
@@ -571,6 +593,26 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
     def delete_device_token(self, token: str) -> None:
         with self.engine.begin() as conn:
             conn.execute(delete(self._device_tokens).where(self._device_tokens.c.token == token))
+
+    def create_oauth_client(self, client_id: str, client_name: str, redirect_uris: list, created_at_ms: int) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(insert(self._oauth_clients).values(
+                client_id=client_id,
+                client_name=client_name,
+                redirect_uris=json.dumps(redirect_uris),
+                created_at_ms=created_at_ms,
+            ))
+
+    def get_oauth_client(self, client_id: str) -> Optional[Dict[str, Any]]:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._oauth_clients).where(self._oauth_clients.c.client_id == client_id)
+            ).fetchone()
+            if not row:
+                return None
+            data = dict(row._mapping)
+            data["redirect_uris"] = json.loads(data["redirect_uris"])
+            return data
 
     def get_vaults_by_owner(self, owner_username: str) -> list:
         with self.engine.connect() as conn:

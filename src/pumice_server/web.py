@@ -13,6 +13,7 @@ from pyramid.response import Response
 from pyramid.view import view_config
 
 from .plugin_registry import discover_plugins
+from . import oauth_server
 
 logger = logging.getLogger("pumice_server.web")
 
@@ -484,6 +485,174 @@ def get_token_info(request):
         "username": user_info["username"] if user_info else None,
         "database_connected": request.repository is not None,
         "server_time": int(time.time() * 1000)
+    }
+
+# ─── OAuth 2.1 authorization server for the MCP browser-auth flow ──────────────────────────
+# Implements exactly the subset the MCP Authorization spec needs so an MCP client (Claude
+# Code/Desktop, ...) can go from "just the server URL" to a working credential without the user
+# ever manually creating/copying a device token: RFC 8414 authorization-server metadata, RFC
+# 9728 protected-resource metadata, RFC 7591 dynamic client registration, and the
+# authorization_code + PKCE grant. See oauth_server.py for the actual crypto/state logic; these
+# views are thin HTTP glue over it. What comes out the other end of a successful flow is a
+# perfectly ordinary device_token row (create_device_token -- the same thing the dashboard's
+# "create a new device" button and a real username+password login both produce) -- OAuth here
+# is only the browser-consent wrapper around minting one, not a parallel credential system, and
+# nothing about /mcp's own auth check changes at all.
+
+_authorization_codes = oauth_server.AuthorizationCodeStore()
+
+def _oauth_issuer(request) -> str:
+    return f"{request.scheme}://{request.host}"
+
+@view_config(route_name='oauth_protected_resource_metadata', renderer='json', permission=NO_PERMISSION_REQUIRED)
+def oauth_protected_resource_metadata_view(request):
+    issuer = _oauth_issuer(request)
+    return {
+        "resource": f"{issuer}/mcp",
+        "authorization_servers": [issuer],
+    }
+
+@view_config(route_name='oauth_authorization_server_metadata', renderer='json', permission=NO_PERMISSION_REQUIRED)
+def oauth_authorization_server_metadata_view(request):
+    issuer = _oauth_issuer(request)
+    return {
+        "issuer": issuer,
+        "authorization_endpoint": f"{issuer}/oauth/authorize",
+        "token_endpoint": f"{issuer}/oauth/token",
+        "registration_endpoint": f"{issuer}/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    }
+
+@view_config(route_name='oauth_register', renderer='json', request_method='POST', permission=NO_PERMISSION_REQUIRED)
+def oauth_register_view(request):
+    # Public clients only (PKCE, no client_secret) -- an MCP client self-registers here the
+    # first time it sees this server, with no admin action and nothing secret handed back.
+    try:
+        body = request.json_body
+    except Exception:
+        body = {}
+
+    redirect_uris = body.get("redirect_uris")
+    if not redirect_uris or not isinstance(redirect_uris, list):
+        return Response(status=400, body=json.dumps({"error": "invalid_client_metadata", "error_description": "redirect_uris is required"}).encode("utf-8"), content_type="application/json")
+
+    client_id = oauth_server.generate_client_id()
+    client_name = body.get("client_name") or "Unnamed MCP client"
+    request.repository.create_oauth_client(client_id, client_name, redirect_uris, int(time.time() * 1000))
+    logger.info(f"OAuth client registered: '{client_name}' ({client_id})")
+    return {
+        "client_id": client_id,
+        "client_name": client_name,
+        "redirect_uris": redirect_uris,
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    }
+
+def _validate_authorize_request(repository, client_id, redirect_uri, response_type, code_challenge, code_challenge_method):
+    if response_type != "code":
+        return "unsupported_response_type"
+    if code_challenge_method != "S256":
+        return "invalid_request: code_challenge_method must be S256"
+    if not code_challenge:
+        return "invalid_request: missing code_challenge"
+    if not client_id:
+        return "invalid_request: missing client_id"
+    client = repository.get_oauth_client(client_id)
+    if not client:
+        return "invalid_client"
+    if redirect_uri not in client["redirect_uris"]:
+        return "invalid_request: redirect_uri not registered for this client"
+    return None
+
+@view_config(route_name='oauth_authorize', request_method='GET', renderer='templates/oauth_authorize.jinja2', permission=NO_PERMISSION_REQUIRED)
+def oauth_authorize_view(request):
+    # Not logged in yet: bounce through the ordinary login page, same session cookie as
+    # everything else, then come straight back here with every original query param intact.
+    if request.identity is None:
+        return HTTPFound(location="/login?next=" + quote(request.url, safe=""))
+
+    lang = detect_lang(request)
+    client_id = request.params.get("client_id")
+    redirect_uri = request.params.get("redirect_uri")
+    response_type = request.params.get("response_type")
+    code_challenge = request.params.get("code_challenge")
+    code_challenge_method = request.params.get("code_challenge_method")
+    state = request.params.get("state", "")
+
+    error = _validate_authorize_request(request.repository, client_id, redirect_uri, response_type, code_challenge, code_challenge_method)
+    if error:
+        return Response(status=400, body=error, content_type="text/plain")
+
+    client = request.repository.get_oauth_client(client_id)
+    return {
+        'lang': lang, 't': lambda key, **params: t(key, lang, **params),
+        'client_name': client['client_name'],
+        'username': request.identity['username'],
+        'client_id': client_id, 'redirect_uri': redirect_uri,
+        'code_challenge': code_challenge, 'state': state,
+    }
+
+@view_config(route_name='oauth_authorize', request_method='POST', permission='authenticated')
+def oauth_authorize_submit_view(request):
+    username = request.identity['username']
+    client_id = request.POST.get("client_id")
+    redirect_uri = request.POST.get("redirect_uri")
+    code_challenge = request.POST.get("code_challenge")
+    state = request.POST.get("state", "")
+    approved = request.POST.get("approve") == "1"
+
+    client = request.repository.get_oauth_client(client_id)
+    if not client or redirect_uri not in client["redirect_uris"]:
+        return Response(status=400, body="invalid_request")
+
+    if not approved:
+        location = f"{redirect_uri}?error=access_denied" + (f"&state={quote(state)}" if state else "")
+        return HTTPFound(location=location)
+
+    code = _authorization_codes.issue(username=username, client_id=client_id, redirect_uri=redirect_uri, code_challenge=code_challenge)
+    logger.info(f"User '{username}' approved OAuth client '{client_id}'.")
+    location = f"{redirect_uri}?code={quote(code)}" + (f"&state={quote(state)}" if state else "")
+    return HTTPFound(location=location)
+
+@view_config(route_name='oauth_token', renderer='json', request_method='POST', permission=NO_PERMISSION_REQUIRED)
+def oauth_token_view(request):
+    # RFC 6749: token requests are application/x-www-form-urlencoded, not JSON -- request.POST
+    # (not json_body) is the correct read here.
+    params = request.POST
+    if params.get("grant_type") != "authorization_code":
+        return Response(status=400, body=json.dumps({"error": "unsupported_grant_type"}).encode("utf-8"), content_type="application/json")
+
+    # Validate everything against a read-only peek() first -- only a fully successful request
+    # is allowed to actually burn the code (consume(), below). A wrong code_verifier or
+    # mismatched client_id/redirect_uri must fail without invalidating the code, or a single
+    # bad guess/retry would permanently lock the legitimate client out of its own valid exchange.
+    code = params.get("code")
+    entry = _authorization_codes.peek(code) if code else None
+    if not entry:
+        return Response(status=400, body=json.dumps({"error": "invalid_grant"}).encode("utf-8"), content_type="application/json")
+
+    if entry["client_id"] != params.get("client_id") or entry["redirect_uri"] != params.get("redirect_uri"):
+        return Response(status=400, body=json.dumps({"error": "invalid_grant"}).encode("utf-8"), content_type="application/json")
+
+    if not oauth_server.verify_pkce(params.get("code_verifier") or "", entry["code_challenge"]):
+        return Response(status=400, body=json.dumps({"error": "invalid_grant", "error_description": "PKCE verification failed"}).encode("utf-8"), content_type="application/json")
+
+    _authorization_codes.consume(code)
+
+    client = request.repository.get_oauth_client(entry["client_id"])
+    device_name = (client["client_name"] if client else None) or "OAuth client"
+
+    access_token = secrets.token_hex(32)
+    request.repository.create_device_token(access_token, entry["username"], device_name, int(time.time() * 1000))
+    logger.info(f"OAuth token issued for user '{entry['username']}' via client '{entry['client_id']}'.")
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
     }
 
 # 1. API for looking up a file's backup version history
@@ -1458,6 +1627,11 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.add_route('user_plugin_enable', '/api/user/plugins/enable')
     config.add_route('user_plugin_disable', '/api/user/plugins/disable')
     config.add_route('get_token_info', '/api/token/info')
+    config.add_route('oauth_protected_resource_metadata', '/.well-known/oauth-protected-resource')
+    config.add_route('oauth_authorization_server_metadata', '/.well-known/oauth-authorization-server')
+    config.add_route('oauth_register', '/oauth/register')
+    config.add_route('oauth_authorize', '/oauth/authorize')
+    config.add_route('oauth_token', '/oauth/token')
     config.add_route('get_history', '/api/history', factory=VaultContext)
     config.add_route('download_history', '/api/history/download', factory=VaultContext)
     config.add_route('restore_history', '/api/history/restore', factory=VaultContext)

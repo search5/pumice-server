@@ -504,3 +504,21 @@ msgstr "복사되었습니다."
 
 msgid "common.msg_copy_manual"
 msgstr "선택된 내용을 직접 복사(Ctrl+C)해 주세요."
+
+msgid "oauth.page_title"
+msgstr "접근 승인"
+
+msgid "oauth.approve_heading"
+msgstr "접근 요청"
+
+msgid "oauth.approve_desc"
+msgstr "'{{client_name}}'이(가) '{{username}}' 계정으로 이 서버에 접근하려고 합니다."
+
+msgid "oauth.approve_warning"
+msgstr "신뢰할 수 있는 애플리케이션에만 승인해 주세요."
+
+msgid "oauth.button_approve"
+msgstr "승인"
+
+msgid "oauth.button_deny"
+msgstr "거부"

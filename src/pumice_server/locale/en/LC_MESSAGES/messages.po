@@ -510,3 +510,21 @@ msgstr "Copied to clipboard."
 
 msgid "common.msg_copy_manual"
 msgstr "Text selected -- copy it manually (Ctrl+C)."
+
+msgid "oauth.page_title"
+msgstr "Approve access"
+
+msgid "oauth.approve_heading"
+msgstr "Access request"
+
+msgid "oauth.approve_desc"
+msgstr "'{{client_name}}' wants to access this server as '{{username}}'."
+
+msgid "oauth.approve_warning"
+msgstr "Only approve this if you trust the application."
+
+msgid "oauth.button_approve"
+msgstr "Approve"
+
+msgid "oauth.button_deny"
+msgstr "Deny"

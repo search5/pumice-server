@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ t('oauth.page_title') }}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --md-sys-color-primary: #a8c7fa;
+            --md-sys-color-on-primary: #062e6f;
+            --md-sys-color-surface: #121318;
+            --md-sys-color-surface-container: #1f2025;
+            --md-sys-color-on-surface: #e2e2e9;
+            --md-sys-color-on-surface-variant: #c4c6d0;
+            --md-sys-color-outline: #8e9099;
+            --md-sys-color-error: #ffb4ab;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: var(--md-sys-color-surface);
+            color: var(--md-sys-color-on-surface);
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .card {
+            background-color: var(--md-sys-color-surface-container);
+            border-radius: 28px;
+            padding: 40px;
+            width: 100%;
+            max-width: 440px;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .logo {
+            font-family: 'Outfit', sans-serif;
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--md-sys-color-primary);
+            letter-spacing: -0.5px;
+            margin-bottom: 24px;
+        }
+        h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+        p {
+            font-size: 14px;
+            line-height: 1.6;
+            color: var(--md-sys-color-on-surface-variant);
+            margin-bottom: 12px;
+        }
+        .warning {
+            font-size: 12px;
+            color: var(--md-sys-color-error);
+            margin-bottom: 28px;
+        }
+        .actions {
+            display: flex;
+            gap: 12px;
+        }
+        button {
+            flex: 1;
+            border: none;
+            border-radius: 100px;
+            padding: 14px;
+            font-size: 15px;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            transition: opacity 0.2s ease;
+        }
+        button:hover { opacity: 0.9; }
+        .btn-approve {
+            background-color: var(--md-sys-color-primary);
+            color: var(--md-sys-color-on-primary);
+        }
+        .btn-deny {
+            background-color: transparent;
+            border: 1px solid var(--md-sys-color-outline);
+            color: var(--md-sys-color-on-surface);
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="logo">Obsidian Sync</div>
+        <h1>{{ t('oauth.approve_heading') }}</h1>
+        <p>{{ t('oauth.approve_desc', client_name=client_name, username=username) }}</p>
+        <p class="warning">{{ t('oauth.approve_warning') }}</p>
+        <form method="POST" action="/oauth/authorize">
+            <input type="hidden" name="client_id" value="{{ client_id }}">
+            <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
+            <input type="hidden" name="code_challenge" value="{{ code_challenge }}">
+            <input type="hidden" name="state" value="{{ state }}">
+            <div class="actions">
+                <button type="submit" name="approve" value="0" class="btn-deny">{{ t('oauth.button_deny') }}</button>
+                <button type="submit" name="approve" value="1" class="btn-approve">{{ t('oauth.button_approve') }}</button>
+            </div>
+        </form>
+    </div>
+</body>
+</html>

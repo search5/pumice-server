@@ -89,3 +89,22 @@ def test_list_all_enabled_plugins_returns_every_registration(repo):
 
 def test_list_all_enabled_plugins_is_empty_initially(repo):
     assert repo.list_all_enabled_plugins() == []
+
+
+# oauth_clients -- dynamic client registration (RFC 7591) for the MCP browser-auth flow. Public
+# clients only (PKCE, no secret), so redirect_uris round-tripping correctly is the main thing
+# worth a real SQLite-backed test here (it's the one column that isn't a plain scalar).
+
+def test_get_oauth_client_returns_none_when_not_registered(repo):
+    assert repo.get_oauth_client("no-such-client") is None
+
+
+def test_create_oauth_client_then_get_round_trips_redirect_uris(repo):
+    repo.create_oauth_client("client-1", "Claude", ["http://localhost:1234/callback", "http://localhost:5678/callback"], 1000)
+
+    client = repo.get_oauth_client("client-1")
+
+    assert client["client_id"] == "client-1"
+    assert client["client_name"] == "Claude"
+    assert client["redirect_uris"] == ["http://localhost:1234/callback", "http://localhost:5678/callback"]
+    assert client["created_at_ms"] == 1000

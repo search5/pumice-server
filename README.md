@@ -184,6 +184,25 @@ everything else — no separate MCP-specific credential.
 
 ### Connecting a client
 
+**Clients that support MCP's OAuth flow** (Claude Code, Claude Desktop, ...) need nothing but
+the URL:
+
+```
+https://your-server/mcp
+```
+
+The client discovers `/.well-known/oauth-protected-resource` and
+`/.well-known/oauth-authorization-server`, self-registers (RFC 7591 dynamic client
+registration), and opens a browser to `/oauth/authorize`. If you're already logged in there
+(same session cookie as the dashboard), it's a single "Approve" click; otherwise it bounces
+through the ordinary login page first. What comes out the other end is a normal device token
+(PKCE-protected authorization_code exchange, no refresh tokens -- device tokens don't expire, so
+there's nothing to refresh) -- it shows up in **My Page → Devices** like any other, named after
+the client that requested it, and can be revoked from there at any time.
+
+**Clients that don't** can still be pointed at the same endpoint with a device token supplied
+directly:
+
 ```json
 {
   "mcpServers": {
@@ -196,9 +215,10 @@ everything else — no separate MCP-specific credential.
 }
 ```
 
-Any device token works here — the same one the Obsidian plugin or a browser session already uses
-(see "Accounts and authentication" above). A client sees only vaults belonging to that token's
-account, same as everywhere else in this server.
+Any device token works here — the same one the Obsidian plugin, a browser session, or the
+dashboard's "create a new device" button already uses (see "Accounts and authentication" above).
+A client sees only vaults belonging to that token's account, same as everywhere else in this
+server.
 
 ### Tools
 
