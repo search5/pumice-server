@@ -320,6 +320,7 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 pass  # the column already exists
 
         self._migrate_to_owner_scoped_schema()
+        self._migrate_plugin_enablement_to_vault_scoped_schema()
 
     def _migrate_to_owner_scoped_schema(self) -> None:
         """One-time, idempotent migration from the old vault_id-only schema to the
@@ -390,6 +391,28 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                     f"Owner-scoping migration for {name} failed -- table may be in an inconsistent "
                     f"state, restore from backup if so: {e}"
                 )
+
+    def _migrate_plugin_enablement_to_vault_scoped_schema(self) -> None:
+        """One-time, idempotent migration from the old (owner_username, plugin_id) primary key to
+        the current (owner_username, vault_id, plugin_id) one. vault_id joined the primary key,
+        so like file_metadata/published_files above, this can't be a plain ALTER TABLE -- but
+        unlike those, there's no sibling table (vault_owner) that says which vault_id an old
+        owner-scoped-only row was meant for: under the old schema, enabling a plugin for an owner
+        applied to every vault that owner had, so there's no single correct vault_id to backfill
+        with. Rather than guess, the (unrecoverable) old rows are dropped -- every vault that had
+        a plugin enabled under the old schema just needs to re-enable it, this time genuinely
+        scoped to the vault(s) that actually use it.
+        """
+        inspector = inspect(self.engine)
+        if "vault_id" in [c["name"] for c in inspector.get_columns("plugin_enablement")]:
+            return  # already migrated
+        try:
+            with self.engine.begin() as conn:
+                conn.exec_driver_sql("DROP TABLE plugin_enablement")
+                self._plugin_enablement.create(conn)
+                logger.info("Migrated plugin_enablement to the vault-scoped schema (old rows dropped -- re-enable per vault).")
+        except Exception as e:
+            logger.error(f"plugin_enablement vault-scoping migration failed (non-fatal): {e}")
 
     def _upsert(self, conn, table: Table, record: dict, pk_cols: list) -> None:
         pk_filter = [table.c[col] == record[col] for col in pk_cols]

@@ -108,6 +108,47 @@ def test_list_all_enabled_plugins_is_empty_initially(repo):
     assert repo.list_all_enabled_plugins() == []
 
 
+def test_init_db_migrates_a_pre_vault_scoped_plugin_enablement_table():
+    # Simulates upgrading a real deployment that predates vault-scoping: plugin_enablement
+    # existed with the old (owner_username, plugin_id) primary key, no vault_id column at all.
+    # create_all() only creates missing tables -- it never alters an existing one -- so without
+    # an explicit migration step, init_db() (and every query against plugin_enablement after it)
+    # crashes with "no such column: plugin_enablement.vault_id" on a real pre-existing deployment.
+    # __init__ already calls init_db() once (creating the current, vault-scoped schema) -- so to
+    # simulate "this on-disk database was last touched by old code", the table is dropped and
+    # recreated with the old shape afterwards, then init_db() is called again explicitly, exactly
+    # as a real restart against a real pre-existing old-schema database would.
+    r = SqlAlchemyMetadataRepository("sqlite:///:memory:")
+    with r.engine.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE plugin_enablement")
+        conn.exec_driver_sql(
+            "CREATE TABLE plugin_enablement ("
+            "owner_username VARCHAR(100) NOT NULL, "
+            "plugin_id VARCHAR(255) NOT NULL, "
+            "enabled_at_ms BIGINT NOT NULL, "
+            "PRIMARY KEY (owner_username, plugin_id))"
+        )
+        conn.exec_driver_sql("INSERT INTO plugin_enablement VALUES ('alice', 'old-plugin', 1000)")
+
+    r.init_db()  # must not raise
+
+    # The old schema has no way to know which vault(s) 'alice' meant -- there's no correct
+    # per-vault value to backfill, so the old (unrecoverable) row is dropped rather than faked.
+    assert r.list_all_enabled_plugins() == []
+
+    # And the table now genuinely supports vault-scoped enablement going forward.
+    r.enable_plugin("alice", "vault-1", "new-plugin", 2000)
+    assert r.list_enabled_plugins("alice", "vault-1") == [{"plugin_id": "new-plugin", "enabled_at_ms": 2000}]
+
+
+def test_init_db_is_a_no_op_for_an_already_vault_scoped_plugin_enablement_table(repo):
+    repo.enable_plugin("alice", "vault-1", "some-plugin", 1000)
+
+    repo.init_db()  # calling init_db() again (e.g. a second startup) must not disturb existing data
+
+    assert repo.list_enabled_plugins("alice", "vault-1") == [{"plugin_id": "some-plugin", "enabled_at_ms": 1000}]
+
+
 # oauth_clients -- dynamic client registration (RFC 7591) for the MCP browser-auth flow. Public
 # clients only (PKCE, no secret), so redirect_uris round-tripping correctly is the main thing
 # worth a real SQLite-backed test here (it's the one column that isn't a plain scalar).
