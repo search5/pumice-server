@@ -320,64 +320,45 @@ Guarantees:
 
 ## Server plugins
 
-Server-side plugins for the publish page — a discover/enable/run lifecycle for extending what a
-published page can render, entirely server-local (nothing about it is synced from a vault).
+Server-side plugins for the publish page — a discover/enable/configure/run lifecycle for
+extending what a published page can render, entirely server-local (nothing about it is synced
+from a vault). The core has zero built-in knowledge of any plugin's own embed syntax — a plugin
+is handed a published note's whole content and is responsible for finding and transforming its
+own syntax within it.
 
 There is deliberately no runtime install step. A plugin's code runs inside the very same Python
 process as the web server itself, so adding one is exactly as consequential as adding any other
 server dependency — it's declared in `pyproject.toml` and baked into the Docker image at build
 time, going through the same review/build/redeploy path as everything else this server depends
-on, rather than being something uploaded through the admin dashboard. That also means a
-plugin's own dependencies get real resolution at build time (via `uv`), unlike a hand-unpacked
-wheel would.
+on, rather than being something uploaded through the admin dashboard.
 
-### Building a plugin
-
-A plugin is an ordinary Python package that declares an entry point in the
-`pumice_server.plugins` group:
+A plugin declares itself with an entry point:
 
 ```toml
-# pyproject.toml
-[project]
-name = "harang-immich"
-version = "0.1.0"
-description = "Resolves harang-immich embeds on published pages."
-
 [project.entry-points."pumice_server.plugins"]
-harang-immich = "harang_immich_plugin:resolve"
+pumice-plugin-immich = "pumice_plugin_immich:resolve"
 ```
 
-That entry point must resolve to a callable with this signature:
+resolving to a text-in, text-out transformer:
 
 ```python
-def resolve(content: str, *, owner_username: str, vault_id: str) -> str:
+def resolve(content: str, *, owner_username: str, vault_id: str, config_entries: dict) -> str:
     ...
 ```
 
-It's a plain text-in, text-out transformer — given the note's processed markdown (frontmatter
-stripped, wikilinks already resolved to real `<a>`/`<img>` tags), return it with the plugin's
-own embed syntax resolved into real markdown/HTML. It runs before the markdown-to-HTML pass, so
-returning literal HTML tags works the same way `[[wikilinks]]` resolution already does. Raising
-an exception (or the entry point failing to import in the first place) just skips that plugin
-for that render — logged, not surfaced to the visitor — a bug in one plugin, or an upstream
-dependency it calls out to being down, must never turn a public publish page into a 500.
+run on the note's processed markdown (frontmatter stripped, wikilinks already resolved), right
+before the markdown-to-HTML pass. `config_entries` carries whatever per-vault settings the vault
+owner has entered for it, if the plugin optionally declares a `CONFIG_FIELDS` schema — real
+labeled form fields, not a raw JSON textarea, without pumice-server ever learning what they mean.
+Enabling and configuring both happen self-service, per vault (not per account), from the vault
+owner's **Publish** tab — the same way Obsidian itself scopes plugins per vault.
 
-### Adding it to the server
-
-Add it as a normal pumice-server dependency (`uv add harang-immich-plugin`, or a path/git
-source via `[tool.uv.sources]`) and rebuild the image. `discover_plugins()`
-(`src/pumice_server/plugin_registry.py`) finds it the same way pytest or Flask find their own
-plugins — via `importlib.metadata.entry_points(group="pumice_server.plugins")`, the standard
-library's own plugin-discovery mechanism. There's nothing pumice-server-specific about it, and
-nothing to configure beyond the entry point declaration above.
-
-### Enabling
-
-Enabling is self-service and scoped per vault, not per account — from the **Publish** tab, for
-whichever vault is currently selected, not from My Page. This mirrors how Obsidian itself scopes
-plugins per vault rather than per account: a vault that actually has Immich embeds can have
-harang-immich turned on without it also running (and needlessly scanning for syntax that'll
-never appear) over every other vault the same account happens to own.
+Each plugin's result is cached (survives restarts, warmed eagerly on upload, self-healing after a
+transient failure) so a page view never has to redo expensive work — see
+[`docs/PLUGIN_DEVELOPMENT.md`](docs/PLUGIN_DEVELOPMENT.md) for the full contract, the caching
+behavior's implications for how you write `resolve()`, config, testing, and a checklist —
+required reading before building one. `pumice-plugin-immich` is a complete real-world example to
+read alongside it.
 
 ## Support
 

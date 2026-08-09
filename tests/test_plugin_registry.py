@@ -12,6 +12,13 @@ import pytest
 
 from pumice_server.plugin_registry import ENTRY_POINT_GROUP, discover_plugins
 
+# discover_plugins() scans the whole environment, not just what a test adds to sys.path -- so in
+# a dev venv that has a real plugin installed (e.g. pumice-plugin-immich, as an editable
+# dependency), that plugin genuinely and correctly shows up here too. Captured once, before any
+# test's sys_path_dir fixture runs, so tests can assert "what did *this test* add" rather than
+# wrongly assuming the environment has zero plugins installed.
+_AMBIENT_PLUGIN_IDS = {m.plugin_id for m in discover_plugins()}
+
 
 def _install_fake_distribution(
     target_dir,
@@ -55,10 +62,10 @@ def test_discover_plugins_finds_an_installed_entry_point(sys_path_dir):
     _install_fake_distribution(sys_path_dir)
 
     manifests = discover_plugins()
+    new_ids = {m.plugin_id for m in manifests} - _AMBIENT_PLUGIN_IDS
 
-    assert len(manifests) == 1
-    manifest = manifests[0]
-    assert manifest.plugin_id == "fake-plugin"
+    assert new_ids == {"fake-plugin"}
+    manifest = next(m for m in manifests if m.plugin_id == "fake-plugin")
     assert manifest.version == "0.1.0"
     assert manifest.description == "A fake plugin for testing."
     assert manifest.entry_point == "fakeplugin:resolve"
@@ -67,7 +74,7 @@ def test_discover_plugins_finds_an_installed_entry_point(sys_path_dir):
 def test_discover_plugins_ignores_distributions_without_the_entry_point_group(sys_path_dir):
     _install_fake_distribution(sys_path_dir, entry_point=None)
 
-    assert discover_plugins() == []
+    assert {m.plugin_id for m in discover_plugins()} == _AMBIENT_PLUGIN_IDS
 
 
 def test_discover_plugins_finds_multiple_installed_plugins(sys_path_dir):
@@ -81,9 +88,10 @@ def test_discover_plugins_finds_multiple_installed_plugins(sys_path_dir):
     )
 
     manifests = discover_plugins()
+    new_ids = {m.plugin_id for m in manifests} - _AMBIENT_PLUGIN_IDS
 
-    assert sorted(m.plugin_id for m in manifests) == ["plugin-a", "plugin-b"]
+    assert new_ids == {"plugin-a", "plugin-b"}
 
 
-def test_discover_plugins_is_empty_when_nothing_declares_the_group(sys_path_dir):
-    assert discover_plugins() == []
+def test_discover_plugins_adds_nothing_when_nothing_declares_the_group(sys_path_dir):
+    assert {m.plugin_id for m in discover_plugins()} == _AMBIENT_PLUGIN_IDS

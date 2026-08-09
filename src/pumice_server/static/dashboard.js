@@ -675,12 +675,17 @@
 
         // 퍼블리시 탭의 "플러그인" 표 -- 선택된 vault에 대해서만, vault 소유자가 설치된
         // 플러그인 중 켜고 끌 것을 스스로 고른다. 계정 전체 설정이 아니라 이 vault만의 설정.
+        // 마지막으로 불러온 목록을 저장해뒀다가, 설정 모달을 열 때(config_fields/config_entries가
+        // 필요) 다시 fetch하지 않고 여기서 바로 찾아 쓴다.
+        let lastLoadedSitePlugins = [];
+
         async function loadSitePlugins() {
             const select = document.getElementById("siteSelect");
             const siteId = select.value;
             const body = document.getElementById("publishPluginsTableBody");
             if (!siteId) {
                 body.innerHTML = `<tr><td colspan="5" class="empty-state">${t("publish.empty_select_site")}</td></tr>`;
+                lastLoadedSitePlugins = [];
                 return;
             }
             body.innerHTML = `<tr><td colspan="5" class="empty-state">${t("common.loading")}</td></tr>`;
@@ -690,23 +695,146 @@
             });
             if (!data) return;
 
-            if (data.installed && data.installed.length > 0) {
+            lastLoadedSitePlugins = data.installed || [];
+
+            if (lastLoadedSitePlugins.length > 0) {
                 body.innerHTML = "";
-                data.installed.forEach(p => {
+                lastLoadedSitePlugins.forEach(p => {
                     const tr = document.createElement("tr");
                     const statusLabel = p.enabled ? t("myplugins.status_enabled") : t("myplugins.status_disabled");
                     const buttonLabel = p.enabled ? t("myplugins.button_disable") : t("myplugins.button_enable");
+                    const settingsButton = p.config_fields
+                        ? `<button class="btn-sm" onclick="openPluginConfigModal('${p.id}')">${t("plugins.config_button_settings")}</button>`
+                        : "";
                     tr.innerHTML = `
                         <td>${p.id}</td>
                         <td>${p.description}</td>
                         <td>${p.version}</td>
                         <td>${statusLabel}</td>
-                        <td><button class="btn-sm" onclick="toggleSitePlugin('${p.id}', ${p.enabled})">${buttonLabel}</button></td>
+                        <td>
+                            <button class="btn-sm" onclick="toggleSitePlugin('${p.id}', ${p.enabled})">${buttonLabel}</button>
+                            ${settingsButton}
+                        </td>
                     `;
                     body.appendChild(tr);
                 });
             } else {
                 body.innerHTML = `<tr><td colspan="5" class="empty-state">${t("myplugins.empty_no_plugins")}</td></tr>`;
+            }
+        }
+
+        // 플러그인 설정 모달 -- 플러그인이 선언한 CONFIG_FIELDS 스키마로 실제 라벨 붙은 입력
+        // 폼을 만든다(JSON 텍스트박스가 아니라). pumice-server 코어는 필드가 무엇을 뜻하는지
+        // 전혀 모른 채로, 스키마에 있는 대로만 렌더링한다.
+        let currentPluginConfigPluginId = null;
+
+        function openPluginConfigModal(pluginId) {
+            const plugin = lastLoadedSitePlugins.find(p => p.id === pluginId);
+            if (!plugin) return;
+
+            currentPluginConfigPluginId = pluginId;
+            document.getElementById("pluginConfigModalPluginId").innerText = pluginId;
+            renderPluginConfigModalContent(plugin.config_fields, plugin.config_entries || {});
+
+            const overlay = document.getElementById("pluginConfigModalOverlay");
+            overlay.style.display = "flex";
+            setTimeout(() => overlay.classList.add("show"), 10);
+        }
+
+        function closePluginConfigModal() {
+            const overlay = document.getElementById("pluginConfigModalOverlay");
+            overlay.classList.remove("show");
+            setTimeout(() => { overlay.style.display = "none"; }, 250);
+        }
+
+        function renderPluginConfigModalContent(configFields, configEntries) {
+            const container = document.getElementById("pluginConfigModalContent");
+            const entryIds = Object.keys(configEntries);
+            const displayFields = configFields.filter(f => f.type !== "password");
+            let html = "";
+
+            if (entryIds.length > 0) {
+                html += `<table style="margin-bottom: 24px;"><thead><tr><th>${t("plugins.config_col_entry_id")}</th>`;
+                displayFields.forEach(f => { html += `<th>${f.label}</th>`; });
+                html += `<th>${t("common.col_actions")}</th></tr></thead><tbody>`;
+                entryIds.forEach(entryId => {
+                    const values = configEntries[entryId];
+                    html += `<tr><td>${entryId}</td>`;
+                    displayFields.forEach(f => { html += `<td>${values[f.key] !== undefined ? values[f.key] : ""}</td>`; });
+                    html += `<td><button class="btn-sm" onclick="deletePluginConfigEntry('${entryId}')">${t("common.button_delete")}</button></td></tr>`;
+                });
+                html += `</tbody></table>`;
+            }
+
+            html += `<div style="font-weight: 600; font-size: 15px; margin-bottom: 15px; color: var(--text-primary);">${t("plugins.config_add_heading")}</div>`;
+            html += `<div style="margin-bottom: 18px;">
+                <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">${t("plugins.config_entry_id_label")}</label>
+                <input type="text" id="pluginConfigEntryId" placeholder="${t("plugins.config_entry_id_placeholder")}" style="width: 100%; background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">
+            </div>`;
+
+            configFields.forEach(f => {
+                const inputType = f.type === "password" ? "password" : "text";
+                html += `<div style="margin-bottom: 18px;">
+                    <label style="display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; color: var(--text-primary);">${f.label}</label>
+                    <input type="${inputType}" class="plugin-config-field-input" data-config-key="${f.key}" style="width: 100%; background: transparent; border: 1px solid var(--md-sys-color-outline); color: var(--text-primary); padding: 12px 16px; border-radius: 12px; font-size: 14px; outline: none;">`;
+                if (f.type === "password") {
+                    html += `<div style="font-size: 11px; color: var(--text-muted); margin-top: 6px;">${t("plugins.config_password_hint")}</div>`;
+                }
+                html += `</div>`;
+            });
+
+            html += `<div style="display: flex; justify-content: flex-end;">
+                <button class="btn" onclick="savePluginConfigEntry()" style="width: auto;">${t("common.button_save")}</button>
+            </div>`;
+
+            container.innerHTML = html;
+        }
+
+        async function savePluginConfigEntry() {
+            const entryId = document.getElementById("pluginConfigEntryId").value.trim();
+            if (!entryId) {
+                showToast(t("plugins.config_msg_entry_id_required"));
+                return;
+            }
+            const siteId = document.getElementById("siteSelect").value;
+            const values = {};
+            document.querySelectorAll(".plugin-config-field-input").forEach(input => {
+                values[input.getAttribute("data-config-key")] = input.value;
+            });
+
+            const res = await fetchAPI("/api/publish/plugins/config/save", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "obs-id": siteId },
+                body: JSON.stringify({ plugin_id: currentPluginConfigPluginId, entry_id: entryId, values })
+            });
+
+            if (res && res.ok) {
+                showToast(t("plugins.config_msg_save_success"));
+                closePluginConfigModal();
+                loadSitePlugins();
+            } else {
+                showToast(t("plugins.config_msg_save_failed_prefix") + (res ? res.error : t("common.unknown_error")));
+            }
+        }
+
+        async function deletePluginConfigEntry(entryId) {
+            const siteId = document.getElementById("siteSelect").value;
+            const res = await fetchAPI("/api/publish/plugins/config/delete", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "obs-id": siteId },
+                body: JSON.stringify({ plugin_id: currentPluginConfigPluginId, entry_id: entryId })
+            });
+
+            if (res && res.ok) {
+                showToast(t("plugins.config_msg_delete_success"));
+                const plugin = lastLoadedSitePlugins.find(p => p.id === currentPluginConfigPluginId);
+                if (plugin) {
+                    delete plugin.config_entries[entryId];
+                    renderPluginConfigModalContent(plugin.config_fields, plugin.config_entries || {});
+                }
+                loadSitePlugins();
+            } else {
+                showToast(t("plugins.config_msg_delete_failed_prefix") + (res ? res.error : t("common.unknown_error")));
             }
         }
 

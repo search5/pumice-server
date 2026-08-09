@@ -874,6 +874,15 @@
             </div>
         </div>
     </div>
+    <div id="pluginConfigModalOverlay" class="dialog-overlay" style="display: none;">
+        <div class="dialog-card" style="width: 640px;">
+            <h2 class="dialog-title"><span id="pluginConfigModalPluginId"></span></h2>
+            <div class="dialog-content" id="pluginConfigModalContent" style="max-height: 420px; overflow-y: auto;"></div>
+            <div class="dialog-actions">
+                <button class="dialog-btn dialog-btn-text" onclick="closePluginConfigModal()">{{ t('common.button_close') }}</button>
+            </div>
+        </div>
+    </div>
     <div id="m3DialogOverlay" class="dialog-overlay" style="display: none;">
         <div class="dialog-card">
             <h2 class="dialog-title" id="dialogTitle">{{ t('common.dialog_title_default') }}</h2>

@@ -2,9 +2,12 @@
 enable, via Python's standard entry-point mechanism (the `pumice_server.plugins` group,
 resolved through `importlib.metadata.entry_points`).
 
+See ../../docs/PLUGIN_DEVELOPMENT.md for the full plugin-author guide (the contract, config,
+caching behavior, testing, a checklist). The summary:
+
 Plugins are NOT installed at runtime -- there's no admin upload flow. A plugin is baked into
 the server's Docker image at build time, as a regular dependency of pumice-server itself (e.g.
-`uv add harang-immich-plugin` in this repo, then rebuild the image). That's deliberate, not a
+`uv add pumice-plugin-immich` in this repo, then rebuild the image). That's deliberate, not a
 limitation worked around elsewhere: a plugin's code runs inside the very same Python process as
 the web server, so installing one is exactly as consequential as installing any other server
 dependency, and goes through the same review/build/redeploy path as everything else this server
@@ -16,11 +19,34 @@ A plugin declares itself by adding an entry point to the `pumice_server.plugins`
 own pyproject.toml:
 
     [project.entry-points."pumice_server.plugins"]
-    harang-immich = "harang_immich_plugin:resolve"
+    pumice-plugin-immich = "pumice_plugin_immich:resolve"
 
 Once that package is a build-time dependency of pumice-server, discover_plugins() finds it the
 same way pytest/Flask/etc. find their own plugins -- nothing pumice-server-specific about the
 mechanism itself.
+
+A plugin that needs its own persistent config (e.g. pumice-plugin-immich's Immich
+server_url/token, entered once per vault and read back on every publish render -- see
+plugin_config_crypto.py) can optionally also declare a second entry point, in the
+`pumice_server.plugin_config_fields` group, pointing at a plain list describing the fields to
+collect:
+
+    [project.entry-points."pumice_server.plugin_config_fields"]
+    pumice-plugin-immich = "pumice_plugin_immich:CONFIG_FIELDS"
+
+    # in pumice_plugin_immich/__init__.py:
+    CONFIG_FIELDS = [
+        {"key": "server_url", "label": "Immich server URL", "type": "text"},
+        {"key": "token", "label": "Immich API key", "type": "password"},
+    ]
+
+This is what lets the Publish tab render a real labeled form (text vs. password inputs) instead
+of a raw JSON textarea, without pumice-server's own code knowing anything about what fields any
+particular plugin actually needs -- it just renders whatever schema the plugin declares. This is
+resolved lazily via plugin_loader.py's load_plugin_config_fields(), not here, for the same
+reason `resolve` itself is loaded lazily rather than at discovery time: reading it means
+importing the plugin's module, a side effect discover_plugins() should not have just to answer
+"what's installed".
 """
 from __future__ import annotations
 
@@ -28,6 +54,7 @@ from dataclasses import dataclass
 from importlib.metadata import entry_points
 
 ENTRY_POINT_GROUP = "pumice_server.plugins"
+CONFIG_FIELDS_ENTRY_POINT_GROUP = "pumice_server.plugin_config_fields"
 
 
 @dataclass(frozen=True)

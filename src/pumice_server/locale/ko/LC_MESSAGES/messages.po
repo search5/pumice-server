@@ -525,3 +525,36 @@ msgstr "거부"
 
 msgid "plugins.col_vault"
 msgstr "Vault"
+
+msgid "plugins.config_button_settings"
+msgstr "설정"
+
+msgid "plugins.config_col_entry_id"
+msgstr "ID"
+
+msgid "plugins.config_add_heading"
+msgstr "새 항목 추가"
+
+msgid "plugins.config_entry_id_label"
+msgstr "항목 ID"
+
+msgid "plugins.config_entry_id_placeholder"
+msgstr "예: 옵시디언 플러그인 설정의 프로필 ID"
+
+msgid "plugins.config_password_hint"
+msgstr "비워두면 기존 값이 유지됩니다."
+
+msgid "plugins.config_msg_entry_id_required"
+msgstr "항목 ID를 입력해 주세요."
+
+msgid "plugins.config_msg_save_success"
+msgstr "저장되었습니다."
+
+msgid "plugins.config_msg_save_failed_prefix"
+msgstr "저장 실패: "
+
+msgid "plugins.config_msg_delete_success"
+msgstr "삭제되었습니다."
+
+msgid "plugins.config_msg_delete_failed_prefix"
+msgstr "삭제 실패: "

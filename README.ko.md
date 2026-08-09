@@ -314,62 +314,44 @@ grpc-web/connect-es 라이브러리는 애초에 client-streaming을 지원하�
 
 ## 서버 플러그인
 
-퍼블리시 페이지가 렌더링할 수 있는 것을 확장하기 위한 서버 사이드 플러그인의 발견/활성화/실행
-생명주기입니다 — 완전히 서버 로컬입니다: vault에서 동기화되는 내용이 전혀 아닙니다.
+퍼블리시 페이지가 렌더링할 수 있는 것을 확장하기 위한 서버 사이드 플러그인의
+발견/활성화/설정/실행 생명주기입니다 — 완전히 서버 로컬입니다: vault에서 동기화되는 내용이
+전혀 아닙니다. 코어는 어떤 플러그인의 임베드 문법도 내장 지식으로 알지 못합니다 — 플러그인은
+퍼블리시된 노트의 전체 콘텐츠를 통째로 넘겨받아서, 그 안에서 자기 문법을 스스로 찾아 변환할
+책임이 있습니다.
 
 런타임 설치 단계는 의도적으로 없습니다. 플러그인 코드는 웹 서버 자신과 완전히 같은 파이썬
 프로세스 안에서 돌기 때문에, 플러그인을 추가하는 것은 다른 서버 의존성을 추가하는 것과 똑같은
 무게를 가집니다 — 관리자 대시보드로 업로드하는 게 아니라 `pyproject.toml`에 선언되고 Docker
 이미지 빌드 시점에 포함되어, 이 서버가 의존하는 다른 모든 것과 동일한 검토/빌드/재배포 경로를
-거칩니다. 이는 곧 플러그인 자신의 의존성도 (직접 번들링할 필요 없이) 빌드 시점에 `uv`로 제대로
-해석된다는 뜻이기도 합니다.
+거칩니다.
 
-### 플러그인 만들기
-
-플러그인은 `pumice_server.plugins` 그룹에 entry point를 선언한 평범한 파이썬 패키지입니다:
+플러그인은 entry point로 자기 존재를 선언합니다:
 
 ```toml
-# pyproject.toml
-[project]
-name = "harang-immich"
-version = "0.1.0"
-description = "퍼블리시된 페이지에서 harang-immich 임베드를 해석합니다."
-
 [project.entry-points."pumice_server.plugins"]
-harang-immich = "harang_immich_plugin:resolve"
+pumice-plugin-immich = "pumice_plugin_immich:resolve"
 ```
 
-그 entry point는 아래 시그니처의 호출 가능한 객체로 resolve돼야 합니다:
+이건 텍스트 입력/텍스트 출력 변환기로 resolve됩니다:
 
 ```python
-def resolve(content: str, *, owner_username: str, vault_id: str) -> str:
+def resolve(content: str, *, owner_username: str, vault_id: str, config_entries: dict) -> str:
     ...
 ```
 
-단순한 텍스트 입력/텍스트 출력 변환기입니다 — 노트의 가공된 마크다운(frontmatter는 제거되고
-위키링크는 이미 실제 `<a>`/`<img>` 태그로 해석된 상태)을 받아서, 플러그인 자신의 임베드 문법을
-실제 마크다운/HTML로 바꿔서 반환합니다. 마크다운→HTML 변환 전에 실행되므로, 실제 HTML 태그를
-그대로 반환해도 `[[위키링크]]` 해석과 똑같은 방식으로 동작합니다. 예외를 던지거나(entry point
-자체를 import하는 데 실패해도 마찬가지) 그 렌더링에서 그 플러그인만 건너뜁니다 — 로그만
-남기고 방문자에게는 드러나지 않습니다. 플러그인 하나의 버그나, 그 플러그인이 호출하는 외부
-의존성이 다운된 것 때문에 공개 퍼블리시 페이지가 500 에러가 나면 안 되기 때문입니다.
+노트의 가공된 마크다운(frontmatter 제거, 위키링크 이미 해석됨) 위에서, 마크다운→HTML 변환
+직전에 실행됩니다. `config_entries`는 플러그인이 선택적으로 `CONFIG_FIELDS` 스키마를 선언했다면
+vault 소유자가 입력해둔 vault별 설정을 담고 있습니다 — 실제 라벨 붙은 폼 필드이지 JSON
+텍스트박스가 아니며, pumice-server는 그 의미를 전혀 모른 채로 렌더링만 합니다. 활성화와 설정
+둘 다 셀프 서비스이고, 계정이 아니라 vault별로(vault 소유자의 **퍼블리시** 탭에서) 이뤄집니다 —
+옵시디언 자체가 플러그인을 vault마다 범위 정하는 것과 같은 방식입니다.
 
-### 서버에 추가하기
-
-pumice-server의 평범한 의존성으로 추가하고(`uv add harang-immich-plugin`, 또는
-`[tool.uv.sources]`를 통한 경로/git 소스) 이미지를 다시 빌드하면 됩니다. `discover_plugins()`
-(`src/pumice_server/plugin_registry.py`)는 pytest나 Flask가 자기 플러그인을 찾는 것과 같은
-방식 — 표준 라이브러리 자체의 플러그인 발견 메커니즘인
-`importlib.metadata.entry_points(group="pumice_server.plugins")` — 로 찾아냅니다.
-pumice-server만의 특별한 게 없고, 위의 entry point 선언 외에 따로 설정할 것도 없습니다.
-
-### 활성화하기
-
-활성화는 셀프 서비스이고, 계정이 아니라 **vault 단위로 범위가 정해집니다** — 마이페이지가 아니라
-**퍼블리시** 탭에서, 지금 선택된 vault에 대해서만 켜고 끕니다. 옵시디언 자체가 플러그인을
-계정이 아니라 vault마다 범위를 정하는 것과 같은 방식입니다: 실제로 Immich 임베드가 있는 vault만
-harang-immich를 켜두면 되고, 같은 계정이 소유한 (그 문법이 나올 일이 전혀 없는) 다른 vault에서
-불필요하게 문법을 스캔하지 않아도 됩니다.
+각 플러그인의 결과는 캐싱됩니다(재시작해도 유지, 업로드 시점에 미리 예열, 일시적 실패 후
+자가 치유) — 그래서 페이지 조회가 비싼 작업을 매번 반복하지 않습니다. 전체 계약, 이 캐싱
+동작이 `resolve()` 작성 방식에 미치는 영향, 설정, 테스트, 체크리스트는
+[`docs/PLUGIN_DEVELOPMENT.ko.md`](docs/PLUGIN_DEVELOPMENT.ko.md)를 참고하세요 — 플러그인을
+만들기 전에 꼭 읽어야 합니다. `pumice-plugin-immich`가 같이 읽기 좋은 완전한 실제 예시입니다.
 
 ## 후원
 

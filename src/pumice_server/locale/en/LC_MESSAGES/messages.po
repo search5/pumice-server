@@ -531,3 +531,36 @@ msgstr "Deny"
 
 msgid "plugins.col_vault"
 msgstr "Vault"
+
+msgid "plugins.config_button_settings"
+msgstr "Settings"
+
+msgid "plugins.config_col_entry_id"
+msgstr "ID"
+
+msgid "plugins.config_add_heading"
+msgstr "Add a new entry"
+
+msgid "plugins.config_entry_id_label"
+msgstr "Entry ID"
+
+msgid "plugins.config_entry_id_placeholder"
+msgstr "e.g. the profile ID from the Obsidian plugin's settings"
+
+msgid "plugins.config_password_hint"
+msgstr "Leave blank to keep the current value."
+
+msgid "plugins.config_msg_entry_id_required"
+msgstr "Please enter an entry ID."
+
+msgid "plugins.config_msg_save_success"
+msgstr "Saved."
+
+msgid "plugins.config_msg_save_failed_prefix"
+msgstr "Failed to save: "
+
+msgid "plugins.config_msg_delete_success"
+msgstr "Deleted."
+
+msgid "plugins.config_msg_delete_failed_prefix"
+msgstr "Failed to delete: "

@@ -13,7 +13,9 @@ from pyramid.response import Response
 from pyramid.view import view_config
 
 from .plugin_registry import discover_plugins
-from .plugin_loader import run_enabled_plugins
+from .plugin_loader import load_plugin_config_fields, run_enabled_plugins
+from .plugin_config_crypto import PluginConfigEncryptionError, decrypt_json, encrypt_json
+from .plugin_resolve_disk_cache import make_disk_cache
 from . import oauth_server
 
 logger = logging.getLogger("pumice_server.web")
@@ -889,11 +891,43 @@ def publish_upload_view(request):
             
         request.repository.add_published_file(request.context.owner, vault_id, path, obs_hash)
         logger.info(f"Published file saved: vault={vault_id}, path={path}, hash={obs_hash}")
-        
+
+        _warm_plugin_resolve_cache(request, username, vault_id, dest_file_path, data_dir)
+
         return {"ok": True}
     except Exception as e:
         logger.error(f"HTTP publish_upload failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+def _warm_plugin_resolve_cache(request, owner: str, vault_id: str, file_path: str, data_dir: str) -> None:
+    """Eagerly resolves this note's enabled plugins right after upload and persists the result
+    to the disk cache (see publish_view/plugin_resolve_disk_cache.py), so a freshly-published
+    note's first real visitor doesn't have to wait on -- or risk a slow/down -- external
+    dependency a plugin calls out to (e.g. pumice-plugin-immich fetching a photo from Immich).
+    Purely a latency optimization: the same cache already gets populated lazily at view time on
+    a miss, so anything going wrong here (plugin down, disk error, whatever) must never fail the
+    upload itself -- worst case, the first view just resolves it live instead, same as if this
+    warming step didn't run at all.
+    """
+    try:
+        if os.path.splitext(file_path)[1].lower() in _PUBLISH_MEDIA_MIME_TYPES:
+            return
+
+        enabled_plugin_ids = [p["plugin_id"] for p in request.repository.list_enabled_plugins(owner, vault_id)]
+        if not enabled_plugin_ids:
+            return
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            md_content = f.read()
+        processed_md = parse_wikilinks(strip_frontmatter(md_content), owner, vault_id)
+        plugin_configs = _load_decrypted_plugin_configs(request, owner, vault_id, enabled_plugin_ids)
+        cache_get, cache_set = make_disk_cache(data_dir)
+        run_enabled_plugins(
+            processed_md, enabled_plugin_ids, owner_username=owner, vault_id=vault_id, plugin_configs=plugin_configs,
+            cache_get=cache_get, cache_set=cache_set,
+        )
+    except Exception as e:
+        logger.error(f"Failed to eagerly warm plugin resolve cache for vault '{vault_id}': {e}")
 
 @view_config(route_name='publish_remove', renderer='json', permission='vault-access')
 def publish_remove_view(request):
@@ -959,11 +993,40 @@ def publish_download_view(request):
         logger.error(f"HTTP publish_download failed: {e}")
         return Response(str(e), status=500)
 
+_PUBLISH_MEDIA_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".pdf": "application/pdf",
+    ".mp4": "video/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+}
+
 def _published_file_hrefs(username: str, vault_id: str, files: list) -> dict:
     return {
         f: f'/publish/{quote(username, safe="")}/{quote(vault_id, safe="")}/{quote(f, safe="/")}'
         for f in files
     }
+
+def _load_decrypted_plugin_configs(request, owner: str, vault_id: str, enabled_plugin_ids: list) -> dict:
+    """{plugin_id: {entry_id: decrypted_config_dict}} for every plugin in enabled_plugin_ids --
+    the shape run_enabled_plugins()'s plugin_configs expects. Shared between publish_view (live
+    render) and publish_upload_view (eager cache warm on upload) so there's one place that knows
+    how a plugin's stored config gets decrypted."""
+    plugin_configs = {}
+    for plugin_id in enabled_plugin_ids:
+        entries = {}
+        for entry_id, row in request.repository.get_plugin_config_entries(owner, vault_id, plugin_id).items():
+            try:
+                entries[entry_id] = decrypt_json(row["config_blob_b64"])
+            except PluginConfigEncryptionError as e:
+                logger.error(f"Failed to decrypt config entry '{entry_id}' for plugin '{plugin_id}' on vault '{vault_id}': {e}")
+        plugin_configs[plugin_id] = entries
+    return plugin_configs
 
 @view_config(route_name='publish_view', permission=NO_PERMISSION_REQUIRED, renderer='templates/publish_page.jinja2')
 def publish_view(request):
@@ -1010,21 +1073,9 @@ def publish_view(request):
             
     _, ext = os.path.splitext(file_path)
     ext = ext.lower()
-    
-    if ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf", ".mp4", ".mp3", ".wav"]:
-        mime_types = {
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-            ".svg": "image/svg+xml",
-            ".pdf": "application/pdf",
-            ".mp4": "video/mp4",
-            ".mp3": "audio/mpeg",
-            ".wav": "audio/wav"
-        }
-        content_type = mime_types.get(ext, "application/octet-stream")
+
+    if ext in _PUBLISH_MEDIA_MIME_TYPES:
+        content_type = _PUBLISH_MEDIA_MIME_TYPES.get(ext, "application/octet-stream")
         with open(file_path, "rb") as f:
             return Response(body=f.read(), content_type=content_type)
             
@@ -1038,7 +1089,12 @@ def publish_view(request):
 
     enabled_plugin_ids = [p["plugin_id"] for p in request.repository.list_enabled_plugins(username, vault_id)]
     if enabled_plugin_ids:
-        processed_md = run_enabled_plugins(processed_md, enabled_plugin_ids, owner_username=username, vault_id=vault_id)
+        plugin_configs = _load_decrypted_plugin_configs(request, username, vault_id, enabled_plugin_ids)
+        cache_get, cache_set = make_disk_cache(data_dir)
+        processed_md = run_enabled_plugins(
+            processed_md, enabled_plugin_ids, owner_username=username, vault_id=vault_id, plugin_configs=plugin_configs,
+            cache_get=cache_get, cache_set=cache_set,
+        )
 
     import markdown
     html_content = markdown.markdown(processed_md, extensions=['extra', 'codehilite', 'toc'])
@@ -1391,6 +1447,25 @@ def admin_plugins_view(request):
         "enabled": request.repository.list_all_enabled_plugins(),
     }
 
+def _plugin_config_entries_for_display(request, owner, vault_id, plugin_id, config_fields):
+    # Password-type fields are never sent back to the browser once saved -- the settings form
+    # shows them blank (see publish_plugin_config_save_view's merge-on-blank rule), so a
+    # decrypted password is never round-tripped back out over the wire after the moment it was
+    # first entered.
+    if not config_fields:
+        return {}
+    password_keys = {f["key"] for f in config_fields if f.get("type") == "password"}
+    raw_entries = request.repository.get_plugin_config_entries(owner, vault_id, plugin_id)
+    result = {}
+    for entry_id, row in raw_entries.items():
+        try:
+            values = decrypt_json(row["config_blob_b64"])
+        except PluginConfigEncryptionError as e:
+            logger.error(f"Failed to decrypt plugin config entry '{entry_id}' for plugin '{plugin_id}': {e}")
+            continue
+        result[entry_id] = {k: v for k, v in values.items() if k not in password_keys}
+    return result
+
 @view_config(route_name='publish_plugins', renderer='json', permission='vault-access')
 def publish_plugins_view(request):
     # Vault-scoped, not account-scoped -- lives in the publish tab next to the vault's other
@@ -1401,18 +1476,19 @@ def publish_plugins_view(request):
     owner = request.context.owner
     manifests = discover_plugins()
     enabled_ids = {p["plugin_id"] for p in request.repository.list_enabled_plugins(owner, vault_id)}
-    return {
-        "installed": [
-            {
-                "id": m.plugin_id,
-                "name": m.plugin_id,
-                "version": m.version,
-                "description": m.description,
-                "enabled": m.plugin_id in enabled_ids,
-            }
-            for m in manifests
-        ],
-    }
+    installed = []
+    for m in manifests:
+        config_fields = load_plugin_config_fields(m.plugin_id)
+        installed.append({
+            "id": m.plugin_id,
+            "name": m.plugin_id,
+            "version": m.version,
+            "description": m.description,
+            "enabled": m.plugin_id in enabled_ids,
+            "config_fields": config_fields,
+            "config_entries": _plugin_config_entries_for_display(request, owner, vault_id, m.plugin_id, config_fields),
+        })
+    return {"installed": installed}
 
 @view_config(route_name='publish_plugin_enable', renderer='json', permission='vault-access')
 def publish_plugin_enable_view(request):
@@ -1450,6 +1526,71 @@ def publish_plugin_disable_view(request):
         return {"ok": True}
     except Exception as e:
         logger.error(f"Failed to disable plugin: {e}")
+        return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
+
+@view_config(route_name='publish_plugin_config_save', renderer='json', permission='vault-access')
+def publish_plugin_config_save_view(request):
+    vault_id = request.context.vault_id
+    owner = request.context.owner
+    try:
+        body = request.json_body
+        plugin_id = body.get("plugin_id")
+        entry_id = (body.get("entry_id") or "").strip()
+        values = body.get("values") or {}
+        if not plugin_id or not entry_id:
+            return Response(status=400, body=json.dumps({"error": "Missing plugin_id or entry_id"}).encode("utf-8"), content_type="application/json")
+
+        config_fields = load_plugin_config_fields(plugin_id)
+        if not config_fields:
+            return Response(status=400, body=json.dumps({"error": f"Plugin '{plugin_id}' does not declare any config fields"}).encode("utf-8"), content_type="application/json")
+
+        # A blank password field means "keep whatever's already stored" -- the form never shows
+        # a saved password back to the browser (see _plugin_config_entries_for_display), so
+        # there's no other value it could resubmit for a field the vault owner didn't touch.
+        existing_raw = request.repository.get_plugin_config_entries(owner, vault_id, plugin_id).get(entry_id)
+        existing_values = {}
+        if existing_raw:
+            try:
+                existing_values = decrypt_json(existing_raw["config_blob_b64"])
+            except PluginConfigEncryptionError:
+                existing_values = {}
+
+        merged = dict(existing_values)
+        for field in config_fields:
+            key = field["key"]
+            if key not in values:
+                continue
+            new_value = values[key]
+            if field.get("type") == "password" and not new_value:
+                continue
+            merged[key] = new_value
+
+        blob = encrypt_json(merged)
+        request.repository.set_plugin_config_entry(owner, vault_id, plugin_id, entry_id, blob, int(time.time() * 1000))
+        logger.info(f"User '{owner}' saved config entry '{entry_id}' for plugin '{plugin_id}' on vault '{vault_id}'")
+        return {"ok": True}
+    except PluginConfigEncryptionError as e:
+        return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
+    except Exception as e:
+        logger.error(f"Failed to save plugin config: {e}")
+        return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
+
+@view_config(route_name='publish_plugin_config_delete', renderer='json', permission='vault-access')
+def publish_plugin_config_delete_view(request):
+    vault_id = request.context.vault_id
+    owner = request.context.owner
+    try:
+        body = request.json_body
+        plugin_id = body.get("plugin_id")
+        entry_id = body.get("entry_id")
+        if not plugin_id or not entry_id:
+            return Response(status=400, body=json.dumps({"error": "Missing plugin_id or entry_id"}).encode("utf-8"), content_type="application/json")
+
+        request.repository.delete_plugin_config_entry(owner, vault_id, plugin_id, entry_id)
+        logger.info(f"User '{owner}' deleted config entry '{entry_id}' for plugin '{plugin_id}' on vault '{vault_id}'")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Failed to delete plugin config entry: {e}")
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
 
 @view_config(route_name='admin_user_devices', renderer='json', permission='admin')
@@ -1656,6 +1797,8 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.add_route('publish_plugins', '/api/publish/plugins', factory=VaultContext)
     config.add_route('publish_plugin_enable', '/api/publish/plugins/enable', factory=VaultContext)
     config.add_route('publish_plugin_disable', '/api/publish/plugins/disable', factory=VaultContext)
+    config.add_route('publish_plugin_config_save', '/api/publish/plugins/config/save', factory=VaultContext)
+    config.add_route('publish_plugin_config_delete', '/api/publish/plugins/config/delete', factory=VaultContext)
     # Register the specific /publish/share/* routes before the wildcard /publish/{vault_id}/{path:.*}
     config.add_route('publish_share_list', '/publish/share/list', factory=VaultContext)
     config.add_route('publish_share_invite', '/publish/share/invite', factory=VaultContext)

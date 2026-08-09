@@ -135,6 +135,18 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
+    def set_plugin_config_entry(self, owner_username: str, vault_id: str, plugin_id: str, entry_id: str, config_blob_b64: str, updated_at_ms: int) -> None:
+        pass
+
+    @abstractmethod
+    def get_plugin_config_entries(self, owner_username: str, vault_id: str, plugin_id: str) -> dict:
+        pass
+
+    @abstractmethod
+    def delete_plugin_config_entry(self, owner_username: str, vault_id: str, plugin_id: str, entry_id: str) -> None:
+        pass
+
+    @abstractmethod
     def get_vaults_by_owner(self, owner_username: str) -> list:
         pass
 
@@ -248,9 +260,9 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         # pumice-server dependency, discoverable via discover_plugins()) without being enabled
         # anywhere; a row here is what actually lets it run when that vault gets published.
         # Scoped by (owner_username, vault_id, plugin_id), mirroring how Obsidian itself scopes
-        # plugins per vault, not per account -- a user might have harang-immich enabled in one
+        # plugins per vault, not per account -- a user might have pumice-plugin-immich enabled in one
         # vault (where they actually embed Immich photos) but not in an unrelated vault they
-        # also own, and publishing that second vault must never run harang-immich's syntax
+        # also own, and publishing that second vault must never run pumice-plugin-immich's syntax
         # resolution over it just because the account has the plugin on elsewhere. This was
         # originally scoped by owner_username alone; reverted after realizing that reasoning
         # only holds for *installation* (a server-wide, account-independent concept -- the code
@@ -262,6 +274,28 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             Column("vault_id", String(255), primary_key=True),
             Column("plugin_id", String(255), primary_key=True),
             Column("enabled_at_ms", BigInteger, nullable=False),
+        )
+
+        # Generic, opaque-to-the-repository config storage for whatever a plugin needs to
+        # persist -- e.g. pumice-plugin-immich's own Immich server_url/token, entered
+        # once server-side and read back on every publish render (see plugin_config_crypto.py).
+        # The repository never sees plaintext or knows the shape of what's stored; config_blob
+        # is already-encrypted, base64-encoded text by the time it gets here. Stored as TEXT
+        # rather than a binary column since this codebase supports several DB backends
+        # (sqlite/mysql/mariadb/postgresql/cubrid) and binary-column handling isn't uniformly
+        # reliable across all of their drivers -- base64's size overhead is irrelevant for a
+        # blob this small. Scoped by (owner_username, vault_id, plugin_id, entry_id): entry_id
+        # lets one plugin store more than one named config (pumice-plugin-immich's multiple
+        # "profiles"), and the rest mirrors plugin_enablement's per-vault scope for the same
+        # reason -- a plugin's config for one vault has nothing to do with a different vault the
+        # same owner happens to have.
+        self._plugin_config = Table("plugin_config", self._meta,
+            Column("owner_username", String(100), primary_key=True),
+            Column("vault_id", String(255), primary_key=True),
+            Column("plugin_id", String(255), primary_key=True),
+            Column("entry_id", String(255), primary_key=True),
+            Column("config_blob", Text, nullable=False),
+            Column("updated_at_ms", BigInteger, nullable=False),
         )
 
     def init_db(self) -> None:
@@ -623,6 +657,42 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             data = dict(row._mapping)
             data["redirect_uris"] = json.loads(data["redirect_uris"])
             return data
+
+    def set_plugin_config_entry(self, owner_username: str, vault_id: str, plugin_id: str, entry_id: str, config_blob_b64: str, updated_at_ms: int) -> None:
+        with self.engine.begin() as conn:
+            self._upsert(conn, self._plugin_config, {
+                "owner_username": owner_username,
+                "vault_id": vault_id,
+                "plugin_id": plugin_id,
+                "entry_id": entry_id,
+                "config_blob": config_blob_b64,
+                "updated_at_ms": updated_at_ms,
+            }, ["owner_username", "vault_id", "plugin_id", "entry_id"])
+
+    def get_plugin_config_entries(self, owner_username: str, vault_id: str, plugin_id: str) -> dict:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(self._plugin_config).where(
+                    self._plugin_config.c.owner_username == owner_username,
+                    self._plugin_config.c.vault_id == vault_id,
+                    self._plugin_config.c.plugin_id == plugin_id,
+                )
+            ).fetchall()
+            return {
+                r.entry_id: {"config_blob_b64": r.config_blob, "updated_at_ms": r.updated_at_ms}
+                for r in rows
+            }
+
+    def delete_plugin_config_entry(self, owner_username: str, vault_id: str, plugin_id: str, entry_id: str) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                delete(self._plugin_config).where(
+                    self._plugin_config.c.owner_username == owner_username,
+                    self._plugin_config.c.vault_id == vault_id,
+                    self._plugin_config.c.plugin_id == plugin_id,
+                    self._plugin_config.c.entry_id == entry_id,
+                )
+            )
 
     def get_vaults_by_owner(self, owner_username: str) -> list:
         with self.engine.connect() as conn:
