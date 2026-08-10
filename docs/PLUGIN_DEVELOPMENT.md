@@ -98,7 +98,7 @@ def resolve(content: str, *, owner_username: str, vault_id: str, config_entries:
    dependency. A failure here is logged and silently ignored; the upload itself always succeeds
    regardless of what your plugin does.
 2. **On view** (`GET /publish/...`) — lazily, only on a cache miss (see
-   [Caching](#5-caching-and-what-it-means-for-you)).
+   [Caching](#6-caching-and-what-it-means-for-you)).
 
 Both call sites pass identical arguments for the same content — write `resolve()` as a pure
 function of its inputs and you don't need to think about which call site you're in.
@@ -157,7 +157,56 @@ mean. It just renders whatever schema you declare.
 If you don't declare `CONFIG_FIELDS`, `config_entries` is always `{}` and there's no settings UI
 for your plugin at all — fine for a plugin that needs no configuration.
 
-## 5. Caching and what it means for you
+## 5. Autofill (optional)
+
+Some of what your `CONFIG_FIELDS` ask for may not actually be a secret — and may already be
+sitting in a vault-synced file. pumice-plugin-immich's `server_url` and profile id are a good
+example: the harang-immich Obsidian plugin already writes both, in plain text, into
+`.obsidian/plugins/harang-immich/data.json` (only the actual Immich API key is kept out, in
+`secretStorage`) — and that file is just an ordinary vault file, already synced to and stored by
+pumice-server like any other. Making the vault owner hand-copy a URL and guess an `entry_id` that
+happens to match a UUID sitting right there in their own vault is needless busywork. Two more
+optional entry points let a plugin suggest values instead:
+
+```toml
+[project.entry-points."pumice_server.plugin_autofill_paths"]
+my-plugin = "my_plugin:AUTOFILL_PATHS"
+
+[project.entry-points."pumice_server.plugin_autofill"]
+my-plugin = "my_plugin:suggest_autofill"
+```
+
+```python
+AUTOFILL_PATHS = [".obsidian/plugins/other-plugin/data.json"]
+
+def suggest_autofill(vault_files: dict) -> list:
+    raw = vault_files.get(AUTOFILL_PATHS[0])
+    if not raw:
+        return []
+    ...
+    return [{"entry_id": "...", "label": "...", "values": {"server_url": "..."}}, ...]
+```
+
+- **`AUTOFILL_PATHS`** names which vault-relative files you want read — nothing else.
+  pumice-server reads exactly those files (relative to the vault's own root) and nothing more; a
+  missing or unreadable one just maps to `None` in `vault_files`, same as any other
+  best-effort-only pumice-server call.
+- **`suggest_autofill(vault_files)`** gets `{relative_path: content_or_None}` for the paths you
+  declared, and returns a list of `{"entry_id", "label", "values"}` suggestions. The Publish
+  tab's settings modal fetches this when opened and shows each as a one-click fill-in for
+  `entry_id` plus whichever fields you suggested — the vault owner still has to type any actual
+  secret themselves (a password-typed `CONFIG_FIELDS` key in `values` is stripped server-side
+  regardless of what you return, since a plugin has no legitimate way to have derived a real
+  secret from a non-secret vault file).
+- Both entry points are optional and independent of everything else — not declaring them just
+  means no suggestions, never a broken settings modal (missing/broken/raising is always treated
+  as "no suggestions available", exactly like `CONFIG_FIELDS`'s own failure handling).
+- This couples your plugin to another plugin's *storage format*, which is otherwise something
+  this whole contract deliberately avoids (see [The mental model](#1-the-mental-model)) — only
+  reach for autofill when there's a real, stable, already-synced source of non-secret data to
+  read, and expect to keep it in sync if that other plugin's data shape changes.
+
+## 6. Caching and what it means for you
 
 A published page has no server-side HTML cache of its own — every view re-parses the note from
 scratch. What *is* cached is each plugin's `resolve()` output, keyed by
@@ -189,7 +238,7 @@ Practical implications:
 - Keep external calls reasonably bounded (a short timeout) — a slow `resolve()` blocks either an
   upload response or a page render.
 
-## 6. Testing your plugin
+## 7. Testing your plugin
 
 TDD is the expected workflow in this codebase (see the main repo's own test suite for the style),
 and it applies just as much to plugins:
@@ -211,7 +260,7 @@ locally with your package added as an editable dependency (`uv add --editable ..
 exercise the real HTTP flow: enable the plugin for a vault, save a config entry, publish a note,
 fetch the rendered page.
 
-## 7. Installing into pumice-server
+## 8. Installing into pumice-server
 
 For local development, add it as an editable path dependency:
 
@@ -232,7 +281,7 @@ a private index, etc.) instead of a local path, and rebuild the Docker image. `d
 Flask use for their own plugins. There's nothing to configure beyond the entry point declarations
 above.
 
-## 8. Enabling and using it
+## 9. Enabling and using it
 
 Enabling is self-service and scoped **per vault**, not per account — from the vault owner's
 **Publish** tab, for whichever vault is selected, not from My Page. This mirrors how Obsidian
@@ -244,7 +293,7 @@ If your plugin declared `CONFIG_FIELDS`, the vault owner also adds one or more n
 entries from the same tab before your plugin can do anything useful — see
 [Config](#4-config-optional).
 
-## 9. Checklist before shipping
+## 10. Checklist before shipping
 
 - [ ] `resolve()` never raises for an expected failure mode (missing config, unreachable
       service, malformed embed) — it catches and degrades gracefully instead.

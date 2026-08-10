@@ -851,7 +851,7 @@
     <script>
         const I18N = {{ i18n_json | safe }};
     </script>
-    <script src="/static/dashboard.js"></script>
+    <script src="/static/dashboard.js?v={{ dashboard_js_version }}"></script>
     <div id="deviceModalOverlay" class="dialog-overlay" style="display: none;">
         <div class="dialog-card" style="width: 640px;">
             <h2 class="dialog-title">{{ t('devices.button_manage') }} (<span id="deviceModalUsername"></span>)</h2>
@@ -877,9 +877,10 @@
     <div id="pluginConfigModalOverlay" class="dialog-overlay" style="display: none;">
         <div class="dialog-card" style="width: 640px;">
             <h2 class="dialog-title"><span id="pluginConfigModalPluginId"></span></h2>
-            <div class="dialog-content" id="pluginConfigModalContent" style="max-height: 420px; overflow-y: auto;"></div>
+            <div class="dialog-content" id="pluginConfigModalContent" style="max-height: 70vh; overflow-y: auto;"></div>
             <div class="dialog-actions">
                 <button class="dialog-btn dialog-btn-text" onclick="closePluginConfigModal()">{{ t('common.button_close') }}</button>
+                <button class="dialog-btn dialog-btn-filled" onclick="savePluginConfigEntry()">{{ t('common.button_save') }}</button>
             </div>
         </div>
     </div>

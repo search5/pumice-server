@@ -35,6 +35,9 @@ msgstr "확인"
 msgid "common.button_delete"
 msgstr "삭제"
 
+msgid "common.button_save"
+msgstr "저장"
+
 msgid "common.button_next"
 msgstr "다음"
 
@@ -528,6 +531,12 @@ msgstr "Vault"
 
 msgid "plugins.config_button_settings"
 msgstr "설정"
+
+msgid "plugins.config_autofill_heading"
+msgstr "이 vault에서 발견됨"
+
+msgid "plugins.config_autofill_button_prefix"
+msgstr "사용: "
 
 msgid "plugins.config_col_entry_id"
 msgstr "ID"

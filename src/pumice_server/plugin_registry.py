@@ -47,6 +47,36 @@ resolved lazily via plugin_loader.py's load_plugin_config_fields(), not here, fo
 reason `resolve` itself is loaded lazily rather than at discovery time: reading it means
 importing the plugin's module, a side effect discover_plugins() should not have just to answer
 "what's installed".
+
+A plugin can optionally go one step further and suggest config values instead of leaving every
+field blank: some of what it needs may already be sitting, unencrypted, in a vault-synced file --
+e.g. pumice-plugin-immich's own server_url isn't a secret, and the harang-immich Obsidian plugin
+already writes it (plus a stable per-profile id) into
+`.obsidian/plugins/harang-immich/data.json`, which is just an ordinary file pumice-server already
+syncs and stores. Declaring two more entry points opts into this:
+
+    [project.entry-points."pumice_server.plugin_autofill_paths"]
+    pumice-plugin-immich = "pumice_plugin_immich:AUTOFILL_PATHS"
+
+    [project.entry-points."pumice_server.plugin_autofill"]
+    pumice-plugin-immich = "pumice_plugin_immich:suggest_autofill"
+
+    # in pumice_plugin_immich/__init__.py:
+    AUTOFILL_PATHS = [".obsidian/plugins/harang-immich/data.json"]
+
+    def suggest_autofill(vault_files: dict) -> list:
+        ...  # reads vault_files[AUTOFILL_PATHS[0]], returns [{"entry_id", "label", "values"}, ...]
+
+AUTOFILL_PATHS names which vault-relative files the plugin wants to read (nothing else --
+pumice-server never hands a plugin unrestricted vault access); pumice-server reads exactly those
+files (a missing/unreadable one just maps to None) and passes their contents to suggest_autofill()
+as {relative_path: content}. The Publish tab's settings modal calls this when opened and offers
+the suggestions as one-click fill-ins, so the vault owner doesn't have to hand-copy something
+that's already sitting in their own synced vault. A `"password"`-typed CONFIG_FIELDS key is
+stripped from suggested values regardless of what the plugin returns (a plugin has no business
+suggesting a secret it can't legitimately have derived from a non-secret vault file) -- and
+either entry point being undeclared, unloadable, or raising just means no suggestions, never a
+broken settings modal.
 """
 from __future__ import annotations
 
@@ -55,6 +85,8 @@ from importlib.metadata import entry_points
 
 ENTRY_POINT_GROUP = "pumice_server.plugins"
 CONFIG_FIELDS_ENTRY_POINT_GROUP = "pumice_server.plugin_config_fields"
+AUTOFILL_PATHS_ENTRY_POINT_GROUP = "pumice_server.plugin_autofill_paths"
+AUTOFILL_ENTRY_POINT_GROUP = "pumice_server.plugin_autofill"
 
 
 @dataclass(frozen=True)

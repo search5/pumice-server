@@ -93,7 +93,7 @@ def resolve(content: str, *, owner_username: str, vault_id: str, config_entries:
    시도해서, 실제 첫 방문자가 플러그인의 외부 의존성을 기다리거나 그 위험을 감수하지 않게
    합니다. 여기서 실패해도 로그만 남고 조용히 무시됩니다 — 업로드 자체는 플러그인이 뭘 하든
    항상 성공합니다.
-2. **조회 시점** (`GET /publish/...`) — 캐시 미스일 때만 지연 호출됩니다([캐싱](#5-캐싱과-그게-플러그인에-의미하는-것) 참고).
+2. **조회 시점** (`GET /publish/...`) — 캐시 미스일 때만 지연 호출됩니다([캐싱](#6-캐싱과-그게-플러그인에-의미하는-것) 참고).
 
 두 호출 지점 모두 같은 콘텐츠에 대해 동일한 인자를 넘깁니다 — `resolve()`를 입력에 대한 순수
 함수로만 작성하면 어느 호출 지점인지 신경 쓸 필요가 없습니다.
@@ -151,7 +151,56 @@ JSON 텍스트박스가 아닙니다 — 그러면서도 pumice-server 자체 �
 `CONFIG_FIELDS`를 선언하지 않으면 `config_entries`는 항상 `{}`이고 당신의 플러그인을 위한 설정
 UI 자체가 없습니다 — 설정이 전혀 필요 없는 플러그인이라면 이걸로 충분합니다.
 
-## 5. 캐싱과 그게 플러그인에 의미하는 것
+## 5. 자동 채움(선택)
+
+`CONFIG_FIELDS`가 요구하는 값 중 일부는 사실 비밀값이 아니고, 이미 vault 동기화 파일 안에
+들어있을 수도 있습니다. pumice-plugin-immich의 `server_url`과 프로필 id가 좋은 예시입니다 —
+harang-immich 옵시디언 플러그인이 이미 이 둘을 평문으로
+`.obsidian/plugins/harang-immich/data.json`에 써두고 있고(진짜 Immich API 키만 `secretStorage`에
+따로 있음), 그 파일은 그냥 pumice-server가 이미 동기화하고 저장하고 있는 평범한 vault 파일일
+뿐입니다. vault 소유자가 자기 vault 안에 이미 있는 UUID를 보고 URL을 손으로 다시 옮겨 적고
+`entry_id`를 그거랑 맞춰 추측하게 만드는 건 불필요한 수고입니다. 두 개의 추가 선택적 entry
+point로 플러그인이 값을 직접 제안할 수 있습니다:
+
+```toml
+[project.entry-points."pumice_server.plugin_autofill_paths"]
+my-plugin = "my_plugin:AUTOFILL_PATHS"
+
+[project.entry-points."pumice_server.plugin_autofill"]
+my-plugin = "my_plugin:suggest_autofill"
+```
+
+```python
+AUTOFILL_PATHS = [".obsidian/plugins/other-plugin/data.json"]
+
+def suggest_autofill(vault_files: dict) -> list:
+    raw = vault_files.get(AUTOFILL_PATHS[0])
+    if not raw:
+        return []
+    ...
+    return [{"entry_id": "...", "label": "...", "values": {"server_url": "..."}}, ...]
+```
+
+- **`AUTOFILL_PATHS`**는 읽고 싶은 vault-relative 파일 목록을 선언합니다 — 그 외엔 아무것도
+  없습니다. pumice-server는 정확히 그 파일들만(vault 루트 기준 상대경로로) 읽고, 없거나 읽을 수
+  없는 파일은 `vault_files`에서 그냥 `None`으로 매핑됩니다 — pumice-server의 다른 best-effort
+  호출들과 마찬가지로.
+- **`suggest_autofill(vault_files)`**는 선언한 경로들에 대해 `{relative_path: content_또는_None}`
+  을 받아서, `{"entry_id", "label", "values"}` 형태의 제안 리스트를 반환합니다. Publish 탭의
+  설정 모달이 열릴 때 이걸 호출해서 각 제안을 `entry_id`와 당신이 제안한 필드들을 채워주는
+  원클릭 버튼으로 보여줍니다 — 실제 비밀값은 여전히 vault 소유자가 직접 입력해야 합니다
+  (`values` 안에 `password` 타입 `CONFIG_FIELDS` 키가 있어도 무엇을 반환하든 서버 쪽에서
+  제거됩니다 — 플러그인이 비밀이 아닌 vault 파일에서 진짜 비밀값을 정당하게 얻어낼 방법은
+  없으니까요).
+- 두 entry point 모두 선택적이고 서로 독립적입니다 — 선언하지 않으면 그냥 제안이 없을 뿐,
+  설정 모달이 깨지는 일은 없습니다(누락/로드 실패/예외 전부 "제안 없음"으로 처리되는 건
+  `CONFIG_FIELDS`의 실패 처리 방식과 동일합니다).
+- 이건 당신의 플러그인을 다른 플러그인의 *저장 포맷*에 결합시키는 것이고, 이 계약 전체가
+  원래 피하려는 것([사고 모델](#1-사고-모델) 참고)이라, 이미 동기화되어 있는 안정적인 비밀
+  아닌 데이터 소스가 진짜로 있을 때만 쓰세요 — 그 다른 플러그인의 데이터 형식이 바뀌면 같이
+  맞춰줘야 한다는 것도 감안하시고요.
+
+## 6. 캐싱과 그게 플러그인에 의미하는 것
 
 퍼블리시된 페이지는 자체 서버사이드 HTML 캐시가 없습니다 — 조회할 때마다 노트를 처음부터 다시
 파싱합니다. 대신 캐싱되는 건 각 플러그인의 `resolve()` 출력이고, `(owner, vault, plugin_id,
@@ -181,7 +230,7 @@ content, config)`로 키가 결정됩니다 — `plugin_loader.py`와 `plugin_re
 - 외부 호출은 적당히 짧은 타임아웃으로 제한하세요 — `resolve()`가 느리면 업로드 응답이나 페이지
   렌더링이 그만큼 막힙니다.
 
-## 6. 플러그인 테스트하기
+## 7. 플러그인 테스트하기
 
 이 코드베이스에서는 TDD가 기본 작업 방식이고(메인 저장소 자체 테스트 스위트의 스타일 참고),
 플러그인에도 똑같이 적용됩니다:
@@ -203,7 +252,7 @@ content, config)`로 키가 결정됩니다 — `plugin_loader.py`와 `plugin_re
 직접 돌려보세요: vault에 플러그인을 활성화하고, 설정 항목을 저장하고, 노트를 퍼블리시하고,
 렌더링된 페이지를 조회.
 
-## 7. pumice-server에 설치하기
+## 8. pumice-server에 설치하기
 
 로컬 개발 시에는 editable 경로 의존성으로 추가하세요:
 
@@ -224,7 +273,7 @@ uv add my-plugin
 Flask가 자기 플러그인을 찾는 것과 같은 메커니즘입니다. 위의 entry point 선언 외에 따로 설정할
 건 없습니다.
 
-## 8. 활성화하고 사용하기
+## 9. 활성화하고 사용하기
 
 활성화는 셀프 서비스이고 계정이 아니라 **vault 단위**로 범위가 정해집니다 — 마이페이지가 아니라
 vault 소유자의 **퍼블리시** 탭에서, 지금 선택된 vault에 대해서만. 이건 옵시디언 자체가 플러그인을
@@ -235,7 +284,7 @@ vault 소유자의 **퍼블리시** 탭에서, 지금 선택된 vault에 대해�
 `CONFIG_FIELDS`를 선언했다면, vault 소유자는 같은 탭에서 플러그인이 실제로 뭔가 하려면 필요한
 이름 붙은 설정 항목을 하나 이상 추가해야 합니다 — [설정](#4-설정선택) 참고.
 
-## 9. 배포 전 체크리스트
+## 10. 배포 전 체크리스트
 
 - [ ] `resolve()`가 예상 가능한 실패(설정 없음, 서비스 접근 불가, 잘못된 형식의 임베드)에
       대해 절대 예외를 던지지 않는다 — 대신 스스로 잡고 우아하게 성능 저하 처리한다.

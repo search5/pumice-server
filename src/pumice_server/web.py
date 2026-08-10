@@ -13,9 +13,10 @@ from pyramid.response import Response
 from pyramid.view import view_config
 
 from .plugin_registry import discover_plugins
-from .plugin_loader import load_plugin_config_fields, run_enabled_plugins
+from .plugin_loader import load_plugin_autofill_paths, load_plugin_config_fields, run_enabled_plugins, suggest_plugin_autofill
 from .plugin_config_crypto import PluginConfigEncryptionError, decrypt_json, encrypt_json
 from .plugin_resolve_disk_cache import make_disk_cache
+from .plugin_autofill import read_vault_files, sanitize_autofill_suggestions
 from . import oauth_server
 
 logger = logging.getLogger("pumice_server.web")
@@ -323,6 +324,19 @@ def ping_view(request):
         "timestamp_ms": int(time.time() * 1000)
     }
 
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+def _static_version(filename: str) -> str:
+    # A static <script src> with no cache-busting means a browser that already cached an old
+    # copy can keep using it indefinitely (Last-Modified alone doesn't force revalidation) --
+    # this file's own mtime as a query param means the URL only changes when the file actually
+    # does, so a real edit is always picked up on the next page load without needing a hard
+    # refresh, while an unchanged file still gets cached normally.
+    try:
+        return str(int(os.path.getmtime(os.path.join(_STATIC_DIR, filename))))
+    except OSError:
+        return "0"
+
 @view_config(route_name='login_page', permission=NO_PERMISSION_REQUIRED, renderer='templates/login.jinja2')
 def login_page_view(request):
     lang = detect_lang(request)
@@ -333,6 +347,7 @@ def login_page_view(request):
         # <script> tag (e.g. a value containing "</script>") -- there's no other untrusted input
         # here, translations are our own locale/*.json files, but this is free insurance.
         'i18n_json': json.dumps(get_locale_dict(lang), ensure_ascii=False).replace('</', '<\\/'),
+        'login_js_version': _static_version('login.js'),
     }
 
 @view_config(route_name='dashboard_page', permission=NO_PERMISSION_REQUIRED, renderer='templates/dashboard.jinja2')
@@ -343,6 +358,7 @@ def dashboard_page_view(request):
         't': lambda key, **params: t(key, lang, **params),
         # See login_page_view's identical comment -- same '</' guard, same reasoning.
         'i18n_json': json.dumps(get_locale_dict(lang), ensure_ascii=False).replace('</', '<\\/'),
+        'dashboard_js_version': _static_version('dashboard.js'),
     }
 
 @view_config(route_name='admin_vaults', renderer='json', permission='authenticated')
@@ -1593,6 +1609,37 @@ def publish_plugin_config_delete_view(request):
         logger.error(f"Failed to delete plugin config entry: {e}")
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
 
+@view_config(route_name='publish_plugin_autofill', renderer='json', permission='vault-access')
+def publish_plugin_autofill_view(request):
+    # Best-effort, always 200 with (possibly empty) suggestions -- autofill is a convenience on
+    # top of manually filling in the settings form, never something the modal opening should be
+    # blocked on. See plugin_registry.py's docstring and docs/PLUGIN_DEVELOPMENT.md for the
+    # mechanism: a plugin declares which of its OWN vault-relative files it wants read (e.g.
+    # another plugin's already-synced, non-secret data.json) and a function to turn their
+    # contents into suggested config entries.
+    vault_id = request.context.vault_id
+    owner = request.context.owner
+    try:
+        body = request.json_body
+        plugin_id = body.get("plugin_id")
+        if not plugin_id:
+            return Response(status=400, body=json.dumps({"error": "Missing plugin_id"}).encode("utf-8"), content_type="application/json")
+
+        paths = load_plugin_autofill_paths(plugin_id)
+        if not paths:
+            return {"suggestions": []}
+
+        data_dir = request.registry.settings.get("data_dir")
+        vault_path = get_vault_path(data_dir, owner, vault_id)
+        vault_files = read_vault_files(vault_path, paths)
+
+        suggestions = suggest_plugin_autofill(plugin_id, vault_files)
+        config_fields = load_plugin_config_fields(plugin_id) or []
+        return {"suggestions": sanitize_autofill_suggestions(suggestions, config_fields)}
+    except Exception as e:
+        logger.error(f"Failed to compute plugin autofill suggestions: {e}")
+        return {"suggestions": []}
+
 @view_config(route_name='admin_user_devices', renderer='json', permission='admin')
 def admin_user_devices_view(request):
     target_username = request.matchdict.get("username")
@@ -1799,6 +1846,7 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.add_route('publish_plugin_disable', '/api/publish/plugins/disable', factory=VaultContext)
     config.add_route('publish_plugin_config_save', '/api/publish/plugins/config/save', factory=VaultContext)
     config.add_route('publish_plugin_config_delete', '/api/publish/plugins/config/delete', factory=VaultContext)
+    config.add_route('publish_plugin_autofill', '/api/publish/plugins/autofill', factory=VaultContext)
     # Register the specific /publish/share/* routes before the wildcard /publish/{vault_id}/{path:.*}
     config.add_route('publish_share_list', '/publish/share/list', factory=VaultContext)
     config.add_route('publish_share_invite', '/publish/share/invite', factory=VaultContext)

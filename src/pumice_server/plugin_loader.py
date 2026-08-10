@@ -22,7 +22,7 @@ import json
 import logging
 from importlib.metadata import entry_points
 
-from .plugin_registry import CONFIG_FIELDS_ENTRY_POINT_GROUP, ENTRY_POINT_GROUP
+from .plugin_registry import AUTOFILL_ENTRY_POINT_GROUP, AUTOFILL_PATHS_ENTRY_POINT_GROUP, CONFIG_FIELDS_ENTRY_POINT_GROUP, ENTRY_POINT_GROUP
 
 logger = logging.getLogger("pumice_server.plugin_loader")
 
@@ -76,6 +76,45 @@ def load_plugin_config_fields(plugin_id: str) -> list | None:
     except Exception as e:
         logger.error(f"Plugin '{plugin_id}' declares config fields but they failed to load: {e}")
         return None
+
+
+def load_plugin_autofill_paths(plugin_id: str) -> list:
+    """Optional list of vault-relative file paths a plugin wants read for autofill suggestions
+    (see suggest_plugin_autofill below). Returns [] if the plugin doesn't declare this (most
+    won't) or if loading it fails for any reason -- like load_plugin_config_fields(), a broken or
+    missing declaration just means no suggestions, never an error surfaced anywhere.
+    """
+    matches = [ep for ep in entry_points(group=AUTOFILL_PATHS_ENTRY_POINT_GROUP) if ep.name == plugin_id]
+    if not matches:
+        return []
+
+    entry_point = matches[0]
+    try:
+        return entry_point.load()
+    except Exception as e:
+        logger.error(f"Plugin '{plugin_id}' declares autofill paths but they failed to load: {e}")
+        return []
+
+
+def suggest_plugin_autofill(plugin_id: str, vault_files: dict) -> list:
+    """Best-effort: loads the plugin's declared suggest_autofill(vault_files) -> list function
+    (see load_plugin_autofill_paths above for how vault_files gets populated) and calls it.
+    Returns [] if the plugin doesn't declare this, if loading it fails, if it raises, or if it
+    returns something other than a list -- autofill is a pure UX nicety layered on top of manual
+    config entry, so nothing about it is allowed to break the settings modal that calls this.
+    """
+    matches = [ep for ep in entry_points(group=AUTOFILL_ENTRY_POINT_GROUP) if ep.name == plugin_id]
+    if not matches:
+        return []
+
+    entry_point = matches[0]
+    try:
+        fn = entry_point.load()
+        result = fn(vault_files)
+    except Exception as e:
+        logger.error(f"Plugin '{plugin_id}' autofill suggestion failed: {e}")
+        return []
+    return result if isinstance(result, list) else []
 
 
 def run_enabled_plugins(

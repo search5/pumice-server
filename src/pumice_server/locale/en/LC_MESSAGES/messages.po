@@ -35,6 +35,9 @@ msgstr "Confirm"
 msgid "common.button_delete"
 msgstr "Delete"
 
+msgid "common.button_save"
+msgstr "Save"
+
 msgid "common.button_next"
 msgstr "Next"
 
@@ -534,6 +537,12 @@ msgstr "Vault"
 
 msgid "plugins.config_button_settings"
 msgstr "Settings"
+
+msgid "plugins.config_autofill_heading"
+msgstr "Found in this vault"
+
+msgid "plugins.config_autofill_button_prefix"
+msgstr "Use: "
 
 msgid "plugins.config_col_entry_id"
 msgstr "ID"

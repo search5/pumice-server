@@ -4,8 +4,11 @@ import sys
 
 import pytest
 
-from pumice_server.plugin_loader import PluginLoadError, load_plugin_config_fields, load_plugin_entry_point, run_enabled_plugins
-from pumice_server.plugin_registry import CONFIG_FIELDS_ENTRY_POINT_GROUP, ENTRY_POINT_GROUP
+from pumice_server.plugin_loader import (
+    PluginLoadError, load_plugin_autofill_paths, load_plugin_config_fields, load_plugin_entry_point,
+    run_enabled_plugins, suggest_plugin_autofill,
+)
+from pumice_server.plugin_registry import AUTOFILL_ENTRY_POINT_GROUP, AUTOFILL_PATHS_ENTRY_POINT_GROUP, CONFIG_FIELDS_ENTRY_POINT_GROUP, ENTRY_POINT_GROUP
 
 
 def _dict_cache():
@@ -397,3 +400,148 @@ def test_load_plugin_config_fields_returns_none_when_target_is_broken(sys_path_d
         )
 
     assert load_plugin_config_fields("broken-plugin") is None
+
+
+# load_plugin_autofill_paths / suggest_plugin_autofill -- the optional mechanism that lets a
+# plugin suggest config values instead of leaving a fresh settings entry blank, by reading a
+# small, plugin-declared set of vault-relative files (e.g. another plugin's own data.json) that
+# happen to already hold non-secret data the vault owner would otherwise have to hand-copy.
+
+def _install_fake_plugin_with_autofill(target_dir, plugin_id="fake-plugin", module_name="fakeplugin_autofill", declare_paths=True, declare_fn=True):
+    module_dir = os.path.join(target_dir, module_name)
+    os.makedirs(module_dir)
+    with open(os.path.join(module_dir, "__init__.py"), "w") as f:
+        f.write(
+            "def resolve(content, **kwargs):\n    return content\n\n"
+            "AUTOFILL_PATHS = ['.obsidian/plugins/other-plugin/data.json']\n\n"
+            "def suggest_autofill(vault_files):\n"
+            "    raw = vault_files.get('.obsidian/plugins/other-plugin/data.json')\n"
+            "    if not raw:\n"
+            "        return []\n"
+            "    import json\n"
+            "    data = json.loads(raw)\n"
+            "    return [{'entry_id': p['id'], 'label': p['name'], 'values': {'server_url': p['serverUrl']}} for p in data['profiles']]\n"
+        )
+
+    dist_info = os.path.join(target_dir, f"{module_name}-0.1.0.dist-info")
+    os.makedirs(dist_info)
+    with open(os.path.join(dist_info, "METADATA"), "w") as f:
+        f.write(f"Metadata-Version: 2.1\nName: {plugin_id}\nVersion: 0.1.0\nSummary: A fake plugin.\n")
+    entry_points_txt = f"[{ENTRY_POINT_GROUP}]\n{plugin_id} = {module_name}:resolve\n"
+    if declare_paths:
+        entry_points_txt += f"\n[{AUTOFILL_PATHS_ENTRY_POINT_GROUP}]\n{plugin_id} = {module_name}:AUTOFILL_PATHS\n"
+    if declare_fn:
+        entry_points_txt += f"\n[{AUTOFILL_ENTRY_POINT_GROUP}]\n{plugin_id} = {module_name}:suggest_autofill\n"
+    with open(os.path.join(dist_info, "entry_points.txt"), "w") as f:
+        f.write(entry_points_txt)
+
+
+def test_load_plugin_autofill_paths_returns_the_declared_list(sys_path_dir):
+    _install_fake_plugin_with_autofill(sys_path_dir)
+
+    assert load_plugin_autofill_paths("fake-plugin") == [".obsidian/plugins/other-plugin/data.json"]
+
+
+def test_load_plugin_autofill_paths_returns_empty_when_not_declared(sys_path_dir):
+    _install_fake_plugin_with_autofill(sys_path_dir, declare_paths=False)
+
+    assert load_plugin_autofill_paths("fake-plugin") == []
+
+
+def test_load_plugin_autofill_paths_returns_empty_for_unknown_plugin(sys_path_dir):
+    assert load_plugin_autofill_paths("no-such-plugin") == []
+
+
+def test_load_plugin_autofill_paths_returns_empty_when_target_is_broken(sys_path_dir):
+    module_dir = os.path.join(sys_path_dir, "broken_autofill_paths_mod")
+    os.makedirs(module_dir)
+    with open(os.path.join(module_dir, "__init__.py"), "w") as f:
+        f.write("def resolve(content, **kwargs):\n    return content\n")  # no AUTOFILL_PATHS defined
+
+    dist_info = os.path.join(sys_path_dir, "broken_autofill_paths_mod-0.1.0.dist-info")
+    os.makedirs(dist_info)
+    with open(os.path.join(dist_info, "METADATA"), "w") as f:
+        f.write("Metadata-Version: 2.1\nName: broken-plugin\nVersion: 0.1.0\nSummary: x\n")
+    with open(os.path.join(dist_info, "entry_points.txt"), "w") as f:
+        f.write(
+            f"[{ENTRY_POINT_GROUP}]\nbroken-plugin = broken_autofill_paths_mod:resolve\n\n"
+            f"[{AUTOFILL_PATHS_ENTRY_POINT_GROUP}]\nbroken-plugin = broken_autofill_paths_mod:AUTOFILL_PATHS\n"
+        )
+
+    assert load_plugin_autofill_paths("broken-plugin") == []
+
+
+def test_suggest_plugin_autofill_calls_the_declared_function_with_vault_files(sys_path_dir):
+    _install_fake_plugin_with_autofill(sys_path_dir)
+    vault_files = {
+        ".obsidian/plugins/other-plugin/data.json":
+            '{"profiles": [{"id": "abc-123", "name": "My Profile", "serverUrl": "https://example.com"}]}',
+    }
+
+    result = suggest_plugin_autofill("fake-plugin", vault_files)
+
+    assert result == [{"entry_id": "abc-123", "label": "My Profile", "values": {"server_url": "https://example.com"}}]
+
+
+def test_suggest_plugin_autofill_returns_empty_when_not_declared(sys_path_dir):
+    _install_fake_plugin_with_autofill(sys_path_dir, declare_fn=False)
+
+    assert suggest_plugin_autofill("fake-plugin", {}) == []
+
+
+def test_suggest_plugin_autofill_returns_empty_for_unknown_plugin(sys_path_dir):
+    assert suggest_plugin_autofill("no-such-plugin", {}) == []
+
+
+def test_suggest_plugin_autofill_returns_empty_when_the_declared_file_is_missing(sys_path_dir):
+    _install_fake_plugin_with_autofill(sys_path_dir)
+
+    assert suggest_plugin_autofill("fake-plugin", {}) == []
+
+
+def test_suggest_plugin_autofill_returns_empty_when_the_function_raises(sys_path_dir):
+    _install_fake_plugin_with_autofill(sys_path_dir)
+    vault_files = {".obsidian/plugins/other-plugin/data.json": "not valid json"}
+
+    assert suggest_plugin_autofill("fake-plugin", vault_files) == []
+
+
+def test_suggest_plugin_autofill_returns_empty_when_the_function_returns_a_non_list(sys_path_dir):
+    module_dir = os.path.join(sys_path_dir, "weird_autofill_mod")
+    os.makedirs(module_dir)
+    with open(os.path.join(module_dir, "__init__.py"), "w") as f:
+        f.write(
+            "def resolve(content, **kwargs):\n    return content\n\n"
+            "AUTOFILL_PATHS = []\n\n"
+            "def suggest_autofill(vault_files):\n    return 'not a list'\n"
+        )
+    dist_info = os.path.join(sys_path_dir, "weird_autofill_mod-0.1.0.dist-info")
+    os.makedirs(dist_info)
+    with open(os.path.join(dist_info, "METADATA"), "w") as f:
+        f.write("Metadata-Version: 2.1\nName: weird-plugin\nVersion: 0.1.0\nSummary: x\n")
+    with open(os.path.join(dist_info, "entry_points.txt"), "w") as f:
+        f.write(
+            f"[{ENTRY_POINT_GROUP}]\nweird-plugin = weird_autofill_mod:resolve\n\n"
+            f"[{AUTOFILL_ENTRY_POINT_GROUP}]\nweird-plugin = weird_autofill_mod:suggest_autofill\n"
+        )
+
+    assert suggest_plugin_autofill("weird-plugin", {}) == []
+
+
+def test_suggest_plugin_autofill_returns_empty_when_target_is_broken(sys_path_dir):
+    module_dir = os.path.join(sys_path_dir, "broken_autofill_fn_mod")
+    os.makedirs(module_dir)
+    with open(os.path.join(module_dir, "__init__.py"), "w") as f:
+        f.write("def resolve(content, **kwargs):\n    return content\n")  # no suggest_autofill defined
+
+    dist_info = os.path.join(sys_path_dir, "broken_autofill_fn_mod-0.1.0.dist-info")
+    os.makedirs(dist_info)
+    with open(os.path.join(dist_info, "METADATA"), "w") as f:
+        f.write("Metadata-Version: 2.1\nName: broken-plugin\nVersion: 0.1.0\nSummary: x\n")
+    with open(os.path.join(dist_info, "entry_points.txt"), "w") as f:
+        f.write(
+            f"[{ENTRY_POINT_GROUP}]\nbroken-plugin = broken_autofill_fn_mod:resolve\n\n"
+            f"[{AUTOFILL_ENTRY_POINT_GROUP}]\nbroken-plugin = broken_autofill_fn_mod:suggest_autofill\n"
+        )
+
+    assert suggest_plugin_autofill("broken-plugin", {}) == []

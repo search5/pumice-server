@@ -728,17 +728,39 @@
         // 전혀 모른 채로, 스키마에 있는 대로만 렌더링한다.
         let currentPluginConfigPluginId = null;
 
-        function openPluginConfigModal(pluginId) {
+        async function openPluginConfigModal(pluginId) {
             const plugin = lastLoadedSitePlugins.find(p => p.id === pluginId);
             if (!plugin) return;
 
             currentPluginConfigPluginId = pluginId;
             document.getElementById("pluginConfigModalPluginId").innerText = pluginId;
-            renderPluginConfigModalContent(plugin.config_fields, plugin.config_entries || {});
+
+            // Autofill: some of what this form asks for may already be sitting, non-secret, in
+            // the vault's own synced data (e.g. another plugin's serverUrl + a stable profile
+            // id) -- awaited before the one-and-only render below so a slower fetch never wipes
+            // out anything the vault owner already started typing.
+            const siteId = document.getElementById("siteSelect").value;
+            const autofill = await fetchAPI("/api/publish/plugins/autofill", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "obs-id": siteId },
+                body: JSON.stringify({ plugin_id: pluginId })
+            });
+            const existingIds = new Set(Object.keys(plugin.config_entries || {}));
+            const suggestions = ((autofill && autofill.suggestions) || []).filter(s => !existingIds.has(s.entry_id));
+
+            renderPluginConfigModalContent(plugin.config_fields, plugin.config_entries || {}, suggestions);
 
             const overlay = document.getElementById("pluginConfigModalOverlay");
             overlay.style.display = "flex";
             setTimeout(() => overlay.classList.add("show"), 10);
+        }
+
+        function applyAutofillSuggestion(entryId, values) {
+            document.getElementById("pluginConfigEntryId").value = entryId;
+            document.querySelectorAll(".plugin-config-field-input").forEach(input => {
+                const key = input.getAttribute("data-config-key");
+                if (values[key] !== undefined) input.value = values[key];
+            });
         }
 
         function closePluginConfigModal() {
@@ -747,11 +769,16 @@
             setTimeout(() => { overlay.style.display = "none"; }, 250);
         }
 
-        function renderPluginConfigModalContent(configFields, configEntries) {
+        function renderPluginConfigModalContent(configFields, configEntries, suggestions) {
             const container = document.getElementById("pluginConfigModalContent");
             const entryIds = Object.keys(configEntries);
             const displayFields = configFields.filter(f => f.type !== "password");
             let html = "";
+
+            if (suggestions && suggestions.length > 0) {
+                html += `<div style="font-weight: 600; font-size: 15px; margin-bottom: 10px; color: var(--text-primary);">${t("plugins.config_autofill_heading")}</div>`;
+                html += `<div id="pluginConfigAutofillButtons" style="margin-bottom: 24px; display: flex; flex-direction: column; gap: 8px;"></div>`;
+            }
 
             if (entryIds.length > 0) {
                 html += `<table style="margin-bottom: 24px;"><thead><tr><th>${t("plugins.config_col_entry_id")}</th>`;
@@ -783,11 +810,25 @@
                 html += `</div>`;
             });
 
-            html += `<div style="display: flex; justify-content: flex-end;">
-                <button class="btn" onclick="savePluginConfigEntry()" style="width: auto;">${t("common.button_save")}</button>
-            </div>`;
-
             container.innerHTML = html;
+
+            // Built as real DOM nodes with a closure over each suggestion's actual values --
+            // not interpolated into the HTML string above -- so a vault-supplied profile name
+            // or value (this data ultimately comes from another plugin's synced file, not
+            // something pumice-server itself authored) can never break out into markup.
+            const autofillContainer = document.getElementById("pluginConfigAutofillButtons");
+            if (autofillContainer && suggestions) {
+                suggestions.forEach(s => {
+                    const button = document.createElement("button");
+                    button.type = "button";
+                    button.className = "btn-sm";
+                    button.style.textAlign = "left";
+                    button.style.width = "100%";
+                    button.textContent = t("plugins.config_autofill_button_prefix") + s.label;
+                    button.addEventListener("click", () => applyAutofillSuggestion(s.entry_id, s.values));
+                    autofillContainer.appendChild(button);
+                });
+            }
         }
 
         async function savePluginConfigEntry() {
