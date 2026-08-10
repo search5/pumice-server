@@ -23,7 +23,7 @@ dependencies = [
     "cryptography>=50.0.0",
     "pyramid-jinja2>=2.10.1",
     "babel>=2.18.0",
-    "pumice-plugin-immich",
+    "pumice-plugin-immich>=0.1.0",
 ]
 
 [project.urls]
@@ -38,7 +38,6 @@ build-backend = "uv_build"
 
 [tool.uv.sources]
 sqlalchemy-cubrid = { git = "https://github.com/search5/sqlalchemy_cubrid" }
-pumice-plugin-immich = { path = "../obsidian-plugin/pumice-plugin-immich", editable = true }
 
 [dependency-groups]
 dev = [

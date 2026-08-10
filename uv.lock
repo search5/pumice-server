@@ -738,18 +738,13 @@ wheels = [
 [[package]]
 name = "pumice-plugin-immich"
 version = "0.1.0"
-source = { editable = "../obsidian-plugin/pumice-plugin-immich" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "requests" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "requests", specifier = ">=2.32" }]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "responses", specifier = ">=0.25" },
+sdist = { url = "https://files.pythonhosted.org/packages/3e/70/e40963d97c475654c24f00beca9a3b6b7be3ced6dc3db8a83d6a686ac2d9/pumice_plugin_immich-0.1.0.tar.gz", hash = "sha256:3adf318d22421240ecf10f4a1139adb4e4f9295f02fc7ed5d4e2ff510ca6b85e", size = 16756, upload-time = "2026-08-10T00:20:06.646Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6e/48/cfa1be97a27a3b3d10b56acac37062610bd24beb63e04eab8a64d96a4e48/pumice_plugin_immich-0.1.0-py3-none-any.whl", hash = "sha256:080656806f81c84c7eb950cffe866153bbb2a89e02db228d7ed033e19ed3242f", size = 4906, upload-time = "2026-08-10T00:20:05Z" },
 ]
 
 [[package]]
@@ -791,7 +786,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=2.0.0" },
     { name = "protobuf", specifier = ">=6.33.6" },
     { name = "psycopg2-binary", specifier = ">=2.9" },
-    { name = "pumice-plugin-immich", editable = "../obsidian-plugin/pumice-plugin-immich" },
+    { name = "pumice-plugin-immich", specifier = ">=0.1.0" },
     { name = "pymysql", specifier = ">=1.1" },
     { name = "pyramid", specifier = ">=2.1" },
     { name = "pyramid-jinja2", specifier = ">=2.10.1" },
