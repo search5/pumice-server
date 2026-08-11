@@ -36,13 +36,19 @@ def _backup_file(src_path: str, dst_path: str) -> None:
         shutil.copy2(src_path, dst_path)
 
 class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
-    def __init__(self, data_dir: str, repository: MetadataRepository, change_notifier=None):
+    def __init__(self, data_dir: str, repository: MetadataRepository, change_notifier=None,
+                 download_concurrency: int = 8):
         self.data_dir = data_dir
         self.vaults_dir = os.path.join(data_dir, "vaults")
         self.repository = repository
         # Optional: real usage always passes one (see main.py); tests that don't care about
         # /watch notifications can omit it and these call sites just no-op.
         self.change_notifier = change_notifier
+        # Bounds how many files DownloadFiles streams at once. A DownloadBatchRequest carries
+        # as many paths as the client's whole need-download set for one sync pass -- for a
+        # fresh vault's first sync that can be thousands of files -- and this used to spawn one
+        # unbounded asyncio task per path (see DownloadFiles below).
+        self._download_semaphore = asyncio.Semaphore(download_concurrency)
         os.makedirs(self.vaults_dir, exist_ok=True)
 
     def _verify_vault_access(self, vault_id: str, context) -> str:
@@ -647,69 +653,22 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
         async def stream_file(vault_id: str, rel_path: str) -> None:
             if rel_path.startswith("..") or os.path.isabs(rel_path):
                 return
-            try:
-                owner_username = self._verify_vault_access(vault_id, context)
-                vault_path = self._get_vault_path(owner_username, vault_id)
-            except Exception as e:
-                logger.error(f"DownloadFiles ownership check failed for vault {vault_id}: {e}")
-                return
-
-            file_path = os.path.join(vault_path, rel_path)
-            file_meta = self.repository.load_one(owner_username, vault_id, rel_path)
-
-            if not os.path.exists(file_path) or (file_meta and file_meta.get("is_deleted")):
-                return
-
-            try:
-                stat = os.stat(file_path)
-                mtime_ms = int(stat.st_mtime * 1000)
-                total_bytes = stat.st_size
-                if file_meta:
-                    content_hash = file_meta.get("content_hash")
-                else:
-                    # Rare fallback path (no metadata row yet) — hashing can be slow for large
-                    # files, so keep it off the event loop.
-                    content_hash = await asyncio.to_thread(calculate_sha256, file_path)
-            except Exception as e:
-                logger.error(f"Failed to get file stat for {file_path}: {e}")
-                return
-
-            async with write_lock:
-                await context.write(sync_pb2.FileChunk(header=sync_pb2.ChunkHeader(
-                    vault_id=vault_id,
-                    path=rel_path,
-                    total_bytes=total_bytes,
-                    modified_at_ms=mtime_ms,
-                )))
-
-            sequence = 0
-            try:
-                # Blocking file I/O is offloaded to a worker thread so reading one file doesn't
-                # stall the event loop (and therefore every other concurrent download/RPC).
-                f = await asyncio.to_thread(open, file_path, 'rb')
+            # Caps how many files are being streamed at once (see _download_semaphore) --
+            # without this, a DownloadBatchRequest listing thousands of paths (a fresh vault's
+            # first sync, for example) fanned out into that many concurrent tasks with no limit.
+            async with self._download_semaphore:
                 try:
-                    while True:
-                        data = await asyncio.to_thread(f.read, CHUNK_SIZE)
-                        if not data:
-                            break
-                        async with write_lock:
-                            await context.write(sync_pb2.FileChunk(data=sync_pb2.ChunkData(
-                                path=rel_path,
-                                sequence=sequence,
-                                data=data,
-                            )))
-                        sequence += 1
-                finally:
-                    f.close()
-            except Exception as e:
-                logger.error(f"Error reading file {file_path} for download: {e}")
-                return
-
-            async with write_lock:
-                await context.write(sync_pb2.FileChunk(eof=sync_pb2.ChunkEOF(
-                    path=rel_path,
-                    content_hash=content_hash,
-                )))
+                    await self._stream_download_file(vault_id, rel_path, context, write_lock, CHUNK_SIZE)
+                except Exception as e:
+                    # One file's failure (I/O error, or a write() that raises because the
+                    # underlying connection hiccuped) must never take the rest of the batch
+                    # down with it. It used to: an unguarded write() raising here propagated
+                    # out of asyncio.gather() below and aborted the *entire* DownloadFiles
+                    # call -- and since the client's retry loop only shrinks its retry list on
+                    # a per-file ack, a whole-stream failure left every file in the batch
+                    # (thousands, for a first sync) unaccounted for and therefore re-requested
+                    # identically, and failing identically, on every retry.
+                    logger.error(f"Failed to stream {rel_path} for download: {e}")
 
         tasks = []
         vault_id = request.vault_id
@@ -719,6 +678,64 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
 
         if tasks:
             await asyncio.gather(*tasks)
+
+    async def _stream_download_file(self, vault_id: str, rel_path: str, context, write_lock: asyncio.Lock,
+                                     chunk_size: int) -> None:
+        try:
+            owner_username = self._verify_vault_access(vault_id, context)
+            vault_path = self._get_vault_path(owner_username, vault_id)
+        except Exception as e:
+            logger.error(f"DownloadFiles ownership check failed for vault {vault_id}: {e}")
+            return
+
+        file_path = os.path.join(vault_path, rel_path)
+        file_meta = self.repository.load_one(owner_username, vault_id, rel_path)
+
+        if not os.path.exists(file_path) or (file_meta and file_meta.get("is_deleted")):
+            return
+
+        stat = os.stat(file_path)
+        mtime_ms = int(stat.st_mtime * 1000)
+        total_bytes = stat.st_size
+        if file_meta:
+            content_hash = file_meta.get("content_hash")
+        else:
+            # Rare fallback path (no metadata row yet) — hashing can be slow for large
+            # files, so keep it off the event loop.
+            content_hash = await asyncio.to_thread(calculate_sha256, file_path)
+
+        async with write_lock:
+            await context.write(sync_pb2.FileChunk(header=sync_pb2.ChunkHeader(
+                vault_id=vault_id,
+                path=rel_path,
+                total_bytes=total_bytes,
+                modified_at_ms=mtime_ms,
+            )))
+
+        sequence = 0
+        # Blocking file I/O is offloaded to a worker thread so reading one file doesn't
+        # stall the event loop (and therefore every other concurrent download/RPC).
+        f = await asyncio.to_thread(open, file_path, 'rb')
+        try:
+            while True:
+                data = await asyncio.to_thread(f.read, chunk_size)
+                if not data:
+                    break
+                async with write_lock:
+                    await context.write(sync_pb2.FileChunk(data=sync_pb2.ChunkData(
+                        path=rel_path,
+                        sequence=sequence,
+                        data=data,
+                    )))
+                sequence += 1
+        finally:
+            f.close()
+
+        async with write_lock:
+            await context.write(sync_pb2.FileChunk(eof=sync_pb2.ChunkEOF(
+                path=rel_path,
+                content_hash=content_hash,
+            )))
 
     async def GetFileHistory(self, request, context):
         logger.info(f"gRPC GetFileHistory called: vault_id={request.vault_id}, path={request.path}")
