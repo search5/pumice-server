@@ -1,8 +1,9 @@
-"""ChangeNotifier is a pure pub/sub registry -- no reactor/timeout dependency at all (the SSE
-resource owns the heartbeat/timing concerns separately, see watch_resource.py). subscribe()
-registers a callback that fires on every matching notify_change() call until unsubscribed, since
-one SSE connection needs to receive many notifications over its lifetime (unlike the discarded
-long-polling design's one-shot Deferred). See #10_실시간_변경_알림_구현_계획.md.
+"""ChangeNotifier is a pure pub/sub registry -- no reactor/timeout dependency at all (the WS
+sync resource owns the heartbeat/timing concerns separately, see ws_sync_resource.py).
+subscribe() registers a callback that fires on every matching notify_change() call until
+unsubscribed, since one connection needs to receive many notifications over its lifetime
+(unlike the discarded long-polling design's one-shot Deferred). See
+#10_실시간_변경_알림_구현_계획.md.
 """
 
 from pumice_server.change_notifier import ChangeNotifier

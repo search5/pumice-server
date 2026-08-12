@@ -11,9 +11,7 @@ doesn't support custom headers.
 
 SyncWsSession holds all the per-connection protocol logic and is deliberately independent of
 autobahn/Twisted -- `send` is an injected callable rather than a call to a transport method,
-so it's unit-testable without a real socket (see tests/test_ws_sync_session.py). This mirrors
-NativeServicerContext/WsServicerContext's split in grpc_web_resource.py between transport
-plumbing and business logic.
+so it's unit-testable without a real socket (see tests/test_ws_sync_session.py).
 
 SyncWebSocketProtocol is the thin autobahn glue on top: it owns the actual socket, the
 init-timeout timer, and wires onMessage/onClose to a SyncWsSession instance.
@@ -26,12 +24,12 @@ import time
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import quote
 
-import grpc
 from autobahn.twisted.websocket import WebSocketServerProtocol, WebSocketServerFactory
 from autobahn.twisted.resource import WebSocketResource
 from twisted.internet import reactor as _default_reactor
 
 from . import wire_types
+from .status_codes import StatusCode
 
 logger = logging.getLogger(__name__)
 
@@ -46,27 +44,25 @@ SendFn = Callable[[Dict[str, Any]], None]
 
 
 class WsAborted(Exception):
-    """Raised by WsServicerContext.abort(), mirroring grpc_web_resource.py's Aborted -- kept as
-    a separate class (not imported from there) so this module has no dependency on
-    grpc_web_resource.py, which is slated for removal once the gRPC-Web transport is retired."""
+    """Raised by WsServicerContext.abort() to unwind out of a servicer method while carrying
+    the status code/details that should go into the error op sent back to the client."""
 
-    def __init__(self, code: grpc.StatusCode, details: str):
+    def __init__(self, code: StatusCode, details: str):
         super().__init__(details)
         self.code = code
         self.details = details
 
 
 class WsServicerContext:
-    """grpc.ServicerContext-shaped adapter that lets SyncServiceServicer's existing async
-    methods run completely unmodified over a WS connection. Auth already happened once, in the
-    init handshake (SyncWsSession) -- invocation_metadata() re-synthesizes the equivalent of the
-    old Authorization/x-device-name/x-user-name headers from the session's already-verified
-    identity so _verify_vault_access's per-call token lookup (unchanged) still works exactly as
-    it does for gRPC-Web."""
+    """Adapter that lets SyncServiceServicer's existing async methods run unmodified over a WS
+    connection. Auth already happened once, in the init handshake (SyncWsSession) --
+    invocation_metadata() re-synthesizes the equivalent of an Authorization/x-device-name/
+    x-user-name header set from the session's already-verified identity, so
+    _verify_vault_access's per-call token lookup (unchanged) still works exactly the same."""
 
     def __init__(self, session: "SyncWsSession"):
         self._session = session
-        self.code = grpc.StatusCode.OK
+        self.code = StatusCode.OK
         self.details: Optional[str] = None
 
     def invocation_metadata(self):
@@ -76,7 +72,7 @@ class WsServicerContext:
             ("x-user-name", quote(self._session.user_name)),
         ]
 
-    def abort(self, code: grpc.StatusCode, details: str):
+    def abort(self, code: StatusCode, details: str):
         self.code = code
         self.details = details
         raise WsAborted(code, details)
@@ -90,11 +86,9 @@ class WsServicerContext:
 
 
 # ─── payload <-> wire_types conversion ──────────────────────────────────────────────────────
-# PR5 (pumice's 13_PR5_계획.md): every SyncServiceServicer method this module calls now speaks
-# wire_types dataclasses, not sync_pb2 -- this file has no protobuf dependency left at all.
-# service.py itself still imports sync_pb2/sync_pb2_grpc (Ping/Pong, the servicer base class),
-# left in place until the dead gRPC-Web path that's their only remaining caller is removed.
-# See llm-wiki/ in this repo for the per-method conversion log.
+# PR5 (pumice's 13_PR5_계획.md): every SyncServiceServicer method this module calls speaks
+# wire_types dataclasses -- neither this file nor service.py has any protobuf/grpcio dependency
+# left. See llm-wiki/ in this repo for the per-method conversion log.
 
 
 def _file_meta_from_dict(d: dict) -> "wire_types.FileMeta":

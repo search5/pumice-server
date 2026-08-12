@@ -3,18 +3,16 @@ import os
 import shutil
 import time
 import hashlib
-import grpc
 import logging
 import secrets
 from typing import Dict, Optional
 from urllib.parse import unquote
 
-from . import sync_pb2
-from . import sync_pb2_grpc
 from . import wire_types
 from .change_notifier import did_metadata_change
 from .history_policy import is_history_excluded_path
 from .repository import MetadataRepository
+from .status_codes import StatusCode
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +34,7 @@ def _backup_file(src_path: str, dst_path: str) -> None:
     except OSError:
         shutil.copy2(src_path, dst_path)
 
-class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
+class SyncServiceServicer:
     def __init__(self, data_dir: str, repository: MetadataRepository, change_notifier=None,
                  download_concurrency: int = 8):
         self.data_dir = data_dir
@@ -64,7 +62,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
         metadata = dict(context.invocation_metadata())
         auth_header = metadata.get('authorization', '')
         if not auth_header:
-            context.abort(grpc.StatusCode.UNAUTHENTICATED, "Missing authorization metadata")
+            context.abort(StatusCode.UNAUTHENTICATED, "Missing authorization metadata")
             return ""
 
         if auth_header.startswith('Bearer '):
@@ -74,7 +72,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
 
         device = self.repository.get_device_token(token)
         if not device:
-            context.abort(grpc.StatusCode.UNAUTHENTICATED, "Invalid or missing auth token")
+            context.abort(StatusCode.UNAUTHENTICATED, "Invalid or missing auth token")
             return ""
 
         return device["username"]
@@ -279,19 +277,13 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
         self.repository.save_one(owner_username, vault_id, path, meta)
         return meta
 
-    async def Ping(self, request, context):
-        return sync_pb2.Pong(
-            server_version="0.1.0",
-            timestamp_ms=int(time.time() * 1000)
-        )
-
     async def Delta(self, request, context):
         logger.info(f"gRPC Delta called: vault_id={request.vault_id}, local_files_count={len(request.local_files)}")
         try:
             owner_username = self._verify_vault_access(request.vault_id, context)
             vault_path = self._get_vault_path(owner_username, request.vault_id)
         except ValueError as e:
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+            await context.abort(StatusCode.INVALID_ARGUMENT, str(e))
             return
 
         # 1. Scan and merge the server's current metadata (offloaded to a worker thread —
@@ -776,7 +768,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             return wire_types.HistoryResponse(versions=versions)
         except Exception as e:
             logger.error(f"GetFileHistory failed for {request.path}: {e}")
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            await context.abort(StatusCode.INTERNAL, str(e))
 
     async def DownloadHistoryVersion(self, request, context):
         logger.info(f"gRPC DownloadHistoryVersion called: vault_id={request.vault_id}, history_id={request.history_id}")
@@ -785,12 +777,12 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             owner_username = self._verify_vault_access(request.vault_id, context)
             row = self.repository.get_history_by_id(owner_username, request.history_id)
             if not row:
-                await context.abort(grpc.StatusCode.NOT_FOUND, "History version not found")
+                await context.abort(StatusCode.NOT_FOUND, "History version not found")
                 return
 
             backup_file_path = row["backup_file_path"]
             if not os.path.exists(backup_file_path):
-                await context.abort(grpc.StatusCode.NOT_FOUND, "Backup file not found on disk")
+                await context.abort(StatusCode.NOT_FOUND, "Backup file not found on disk")
                 return
 
             target_path = request.path if request.path else row["path"]
@@ -827,7 +819,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             yield wire_types.FileChunk(eof=eof)
         except Exception as e:
             logger.error(f"DownloadHistoryVersion failed: {e}")
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            await context.abort(StatusCode.INTERNAL, str(e))
 
     async def RestoreHistoryVersion(self, request, context):
         try:

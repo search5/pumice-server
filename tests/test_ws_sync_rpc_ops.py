@@ -1,12 +1,12 @@
 """TDD for the WS delta/restore/history-list ops and the push (ChangeNotifier) wiring --
 PR2 of #11_websocket_동기화_프로토콜_설계.md.
 
-SyncServiceServicer's existing async methods (Delta/GetFileHistory/RestoreHistoryVersion) are
-reused completely unmodified -- these tests exercise the *new* code: JSON payload <-> protobuf
-message conversion, WsServicerContext (invocation_metadata()/abort() synthesized from the
-session's already-authenticated identity instead of a header), and SyncWsSession's dispatch of
-requestId-tagged async ops (as opposed to the synchronous init/ping path covered by
-test_ws_sync_session.py).
+SyncServiceServicer's Delta/GetFileHistory/RestoreHistoryVersion are called through their
+normal (wire_types-speaking, see pumice's 13_PR5_계획.md) interface -- these tests exercise
+the WS-specific glue: JSON payload <-> wire_types conversion, WsServicerContext
+(invocation_metadata()/abort() synthesized from the session's already-authenticated identity
+instead of a header), and SyncWsSession's dispatch of requestId-tagged async ops (as opposed
+to the synchronous init/ping path covered by test_ws_sync_session.py).
 
 Uses the real SqlAlchemyMetadataRepository + SyncServiceServicer (same pattern as
 test_service_delta.py) rather than a fake -- the whole point of this PR is the WS<->servicer
@@ -15,12 +15,12 @@ round trip actually working, not re-verifying business logic those tests already
 
 import asyncio
 
-import grpc
 import pytest
 
 from pumice_server.repository import SqlAlchemyMetadataRepository
 from pumice_server.service import SyncServiceServicer
 from pumice_server.change_notifier import ChangeNotifier
+from pumice_server.status_codes import StatusCode
 from pumice_server.ws_sync_resource import SyncWsSession, WsServicerContext, WsAborted
 
 
@@ -83,9 +83,9 @@ def test_ws_servicer_context_abort_raises_ws_aborted_with_code_and_details():
     context = WsServicerContext(session=object())
 
     with pytest.raises(WsAborted) as exc_info:
-        context.abort(grpc.StatusCode.UNAUTHENTICATED, "nope")
+        context.abort(StatusCode.UNAUTHENTICATED, "nope")
 
-    assert exc_info.value.code == grpc.StatusCode.UNAUTHENTICATED
+    assert exc_info.value.code == StatusCode.UNAUTHENTICATED
     assert exc_info.value.details == "nope"
 
 

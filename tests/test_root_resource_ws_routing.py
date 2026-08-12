@@ -4,7 +4,7 @@ method) rather than a real autobahn WebSocketResource -- RootResource only ever 
 `.render(request)` on whichever sub-resource matches, so that's the entire contract to verify.
 """
 
-from pumice_server.grpc_web_resource import RootResource
+from pumice_server.root_resource import RootResource
 
 
 class FakeResource:
@@ -24,7 +24,6 @@ class FakeRequest:
 
 def make_root_resource(ws_resource):
     return RootResource(
-        sync_resource=FakeResource("sync"),
         fallback_resource=FakeResource("fallback"),
         ws_resource=ws_resource,
     )
@@ -49,6 +48,17 @@ def test_other_paths_are_unaffected_by_ws_resource_being_present():
 
 
 def test_ws_path_falls_through_to_fallback_when_ws_resource_is_absent():
-    root = RootResource(sync_resource=FakeResource("sync"), fallback_resource=FakeResource("fallback"))
+    root = RootResource(fallback_resource=FakeResource("fallback"))
 
     assert root.render(FakeRequest(b"/ws")) == "fallback"
+
+
+def test_mcp_path_is_routed_to_the_mcp_resource():
+    mcp_resource = FakeResource("mcp")
+    root = RootResource(fallback_resource=FakeResource("fallback"), mcp_resource=mcp_resource)
+    request = FakeRequest(b"/mcp")
+
+    result = root.render(request)
+
+    assert result == "mcp"
+    assert mcp_resource.rendered_with is request

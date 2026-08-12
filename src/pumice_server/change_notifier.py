@@ -1,8 +1,9 @@
-"""Pure in-process pub/sub for "something changed in this vault" notifications -- the payload for
-an SSE /watch connection (watch_resource.py). Deliberately has no timeout/reactor dependency at
-all: heartbeats and per-connection timing are the SSE resource's concern, not this registry's.
-Callbacks fire on every matching notify_change() call for as long as they stay subscribed, since
-one SSE connection needs to receive many notifications over its lifetime.
+"""Pure in-process pub/sub for "something changed in this vault" notifications -- the source of
+the WS sync endpoint's server-initiated `push` op (ws_sync_resource.py). Deliberately has no
+timeout/reactor dependency at all: heartbeats and per-connection timing are the WS resource's
+concern, not this registry's. Callbacks fire on every matching notify_change() call for as long
+as they stay subscribed, since one connection needs to receive many notifications over its
+lifetime.
 
 Single-process only: this dict lives in one Twisted reactor's memory. If pumice-server is ever
 scaled to multiple instances, this needs to become a shared broker (e.g. Redis pub/sub) instead --
