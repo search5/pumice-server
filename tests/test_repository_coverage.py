@@ -217,16 +217,15 @@ def test_file_history_backfill_failure_is_caught_and_leaves_owner_username_unbac
     assert row[0] is None
 
 
-def test_file_metadata_recreate_failure_is_caught_but_loses_the_rows(monkeypatch):
-    # Reveals a real gap between the code's comments and its actual behavior: the comment above
-    # this loop in repository.py claims "a failure after the DROP still logs exactly what needs
-    # restoring from a backup," but the except block only logs the exception message -- it never
-    # logs the in-memory `transformed` rows it's holding. And despite the try/except wrapping the
-    # whole `with self.engine.begin() as conn:` block (which would normally roll back on
-    # exception), SQLite's DDL here is not actually rolled back: DROP TABLE + table.create()
-    # persist, so the table ends up recreated with the *new* schema but empty -- the old rows are
-    # gone, and the log has no way to recover them. This is a genuine data-loss risk on a failed
-    # migration, not merely a cosmetic comment inaccuracy.
+def test_file_metadata_recreate_failure_is_recovered_by_restoring_the_pre_migration_table(monkeypatch):
+    # Regression test for a real data-loss bug found via an earlier coverage-driven test pass
+    # (see llm-wiki/11-*.md): the migration used to DROP the old table outright before
+    # recreating it, so a failure partway through (here: the reinsert step) left the table
+    # recreated with the *new* schema but empty -- the old row was simply gone, despite a
+    # (then-inaccurate) comment claiming a failure "logs exactly what needs restoring from a
+    # backup." Fixed via _replace_table_safely, which renames the old table aside instead of
+    # dropping it, so a failure restores the original table -- with its original data intact --
+    # instead of losing it.
     r = SqlAlchemyMetadataRepository("sqlite:///:memory:")
     with r.engine.begin() as conn:
         conn.exec_driver_sql("DROP TABLE file_metadata")
@@ -248,19 +247,29 @@ def test_file_metadata_recreate_failure_is_caught_but_loses_the_rows(monkeypatch
 
     monkeypatch.setattr("pumice_server.repository.insert", boom)
 
-    r.init_db()  # must not raise -- the failure is caught and logged, not propagated
+    r.init_db()  # must not raise -- the failure is caught, logged, and recovered from
 
-    assert sa_inspect(r.engine).has_table("file_metadata")
+    # Restored to the pre-migration (old) schema, original row intact -- not lost.
+    columns = [c["name"] for c in sa_inspect(r.engine).get_columns("file_metadata")]
+    assert columns[0] == "vault_id"
+    with r.engine.connect() as conn:
+        row = conn.exec_driver_sql("SELECT * FROM file_metadata").fetchone()
+    assert tuple(row) == ("vault-1", "a.md", 1, 10, "h", 0)
+    # No leftover backup table from the failed attempt.
+    assert not sa_inspect(r.engine).has_table("file_metadata__migration_backup")
+
+    # The migration retries on the next (non-monkeypatched) startup and now succeeds.
+    monkeypatch.undo()
+    r.init_db()
     assert [c["name"] for c in sa_inspect(r.engine).get_columns("file_metadata")][0] == "owner_username"
-    assert r.load_all("", "vault-1") == {}  # the pre-migration row is simply gone
 
 
-def test_plugin_enablement_recreate_failure_is_caught_but_leaves_the_table_dropped(monkeypatch):
-    # Same shape of failure as above but for _migrate_plugin_enablement_to_vault_scoped_schema:
-    # DROP TABLE succeeds, then table.create() itself fails. The exception is swallowed
-    # (non-fatal per the log message) but the table is left entirely missing -- worse than the
-    # file_metadata case, since every subsequent plugin_enablement call now hits "no such table"
-    # instead of merely losing rows.
+def test_plugin_enablement_recreate_failure_is_recovered_by_restoring_the_pre_migration_table(monkeypatch):
+    # Same shape of regression test as above but for _migrate_plugin_enablement_to_vault_scoped_
+    # schema (see llm-wiki/11-*.md): DROP TABLE used to succeed unconditionally before
+    # table.create() ran, so a failure in create() left plugin_enablement missing entirely --
+    # worse than the file_metadata case, since every subsequent call then hit "no such table."
+    # Fixed the same way: rename aside, only drop the backup once the replacement succeeds.
     r = SqlAlchemyMetadataRepository("sqlite:///:memory:")
     with r.engine.begin() as conn:
         conn.exec_driver_sql("DROP TABLE plugin_enablement")
@@ -276,11 +285,79 @@ def test_plugin_enablement_recreate_failure_is_caught_but_leaves_the_table_dropp
 
     monkeypatch.setattr(r._plugin_enablement, "create", boom)
 
-    r.init_db()  # must not raise
+    r.init_db()  # must not raise -- recovered, not left missing
 
-    assert not sa_inspect(r.engine).has_table("plugin_enablement")
-    with pytest.raises(Exception):
-        r.list_all_enabled_plugins()  # confirms the table is genuinely gone, not just empty
+    assert sa_inspect(r.engine).has_table("plugin_enablement")
+    columns = [c["name"] for c in sa_inspect(r.engine).get_columns("plugin_enablement")]
+    assert "vault_id" not in columns  # still the pre-migration (old) schema
+    with r.engine.connect() as conn:
+        row = conn.exec_driver_sql("SELECT * FROM plugin_enablement").fetchone()
+    assert tuple(row) == ("alice", "old-plugin", 1000)
+    assert not sa_inspect(r.engine).has_table("plugin_enablement__migration_backup")
+
+    # The migration retries on the next (non-monkeypatched) startup and now succeeds.
+    monkeypatch.undo()
+    r.init_db()
+    assert "vault_id" in [c["name"] for c in sa_inspect(r.engine).get_columns("plugin_enablement")]
+
+
+def test_restore_table_backup_drops_a_partial_new_table_before_restoring_the_backup():
+    # Direct test of _restore_table_backup's other branch (not naturally reached by the two
+    # regression tests above, since in practice the failing step there leaves no partial `name`
+    # table behind): a migration attempt that got as far as creating the new-schema table but
+    # failed before dropping the rename-aside backup -- e.g. a crash between _replace_table_
+    # safely's populate() and its final DROP TABLE -- leaves *both* `name` (partial/empty, new
+    # schema) and its backup (old schema, real data) present. Manufacture that exact state
+    # directly and confirm _restore_table_backup drops the partial table and restores the
+    # original, rather than leaving the partial one in place or refusing to touch it.
+    r = SqlAlchemyMetadataRepository("sqlite:///:memory:")  # __init__ already creates the new schema
+    with r.engine.begin() as conn:
+        # Replace with the OLD (pre-migration) schema, standing in for the table as it would
+        # look before any migration attempt, then rename it aside as the migration would.
+        conn.exec_driver_sql("DROP TABLE file_metadata")
+        conn.exec_driver_sql(
+            "CREATE TABLE file_metadata (vault_id VARCHAR(255) NOT NULL, path VARCHAR(500) NOT NULL, "
+            "modified_at_ms BIGINT NOT NULL, size_bytes BIGINT NOT NULL, content_hash VARCHAR(64) NOT NULL, "
+            "is_deleted BOOLEAN NOT NULL, PRIMARY KEY (vault_id, path))"
+        )
+        conn.exec_driver_sql("INSERT INTO file_metadata VALUES ('vault-1', 'a.md', 1, 10, 'h', 0)")
+        conn.exec_driver_sql("ALTER TABLE file_metadata RENAME TO file_metadata__migration_backup")
+        # The "partial new table" -- empty, new (owner_username-first) schema, standing in for a
+        # migration that created the replacement but never got to populate/finish it.
+        conn.exec_driver_sql("CREATE TABLE file_metadata (owner_username VARCHAR(100) NOT NULL, vault_id VARCHAR(255) NOT NULL)")
+
+    r._restore_table_backup("file_metadata")
+
+    assert not sa_inspect(r.engine).has_table("file_metadata__migration_backup")
+    columns = [c["name"] for c in sa_inspect(r.engine).get_columns("file_metadata")]
+    assert columns[0] == "vault_id"  # restored to the original (pre-migration) schema, not the partial new one
+    with r.engine.connect() as conn:
+        row = conn.exec_driver_sql("SELECT * FROM file_metadata").fetchone()
+    assert tuple(row) == ("vault-1", "a.md", 1, 10, "h", 0)
+
+
+def test_restore_table_backup_swallows_its_own_failure_instead_of_raising(monkeypatch, caplog):
+    # If the recovery attempt itself fails (e.g. a disk error mid-ALTER TABLE), it must not raise
+    # out of _restore_table_backup -- callers (both the crash-recovery call at the top of each
+    # migration and the except-block call after a failed one) treat it as best-effort and must
+    # keep going regardless.
+    r = SqlAlchemyMetadataRepository("sqlite:///:memory:")
+    with r.engine.begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE file_metadata RENAME TO file_metadata__migration_backup")
+
+    from sqlalchemy import inspect as real_inspect
+
+    def boom(conn):
+        raise RuntimeError("simulated restore failure")
+
+    monkeypatch.setattr("pumice_server.repository.inspect", boom)
+
+    with caplog.at_level("ERROR"):
+        r._restore_table_backup("file_metadata")  # must not raise
+
+    assert "Failed to restore file_metadata from its migration backup" in caplog.text
+    monkeypatch.setattr("pumice_server.repository.inspect", real_inspect)
+    assert sa_inspect(r.engine).has_table("file_metadata__migration_backup")  # untouched, not restored
 
 
 # ─── migrate_history_on_rename ─────────────────────────────────────────────────────────────────

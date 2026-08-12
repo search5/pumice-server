@@ -3,7 +3,7 @@ from contextlib import contextmanager
 import os
 import json
 import logging
-from typing import Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional
 
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Index, inspect,
@@ -334,6 +334,45 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         self._migrate_to_owner_scoped_schema()
         self._migrate_plugin_enablement_to_vault_scoped_schema()
 
+    def _replace_table_safely(self, conn, name: str, new_table: Table, populate: Callable[[Any], None]) -> None:
+        """Swaps `name`'s table for `new_table` (same name, new schema) without ever risking data
+        loss or a missing table if `populate` fails: the current table is renamed aside first and
+        only dropped after `new_table` has been created and populated successfully. Must be
+        called from within an already-open transaction (`conn`); the caller's except block is
+        responsible for calling `_restore_table_backup(name)` to recover if this raises.
+
+        Fixes two real incidents found via a coverage-driven test pass (see llm-wiki/11-*.md):
+        the previous DROP-then-recreate approach permanently lost the old rows if the reinsert
+        failed after the DROP (SQLite's DDL here isn't rolled back by the enclosing transaction,
+        contrary to what the code's own comment used to claim), and left the table entirely
+        missing if table.create() itself failed after the DROP."""
+        backup_name = f"{name}__migration_backup"
+        conn.exec_driver_sql(f"DROP TABLE IF EXISTS {backup_name}")
+        conn.exec_driver_sql(f"ALTER TABLE {name} RENAME TO {backup_name}")
+        new_table.create(conn)
+        populate(conn)
+        conn.exec_driver_sql(f"DROP TABLE {backup_name}")
+
+    def _restore_table_backup(self, name: str) -> None:
+        """Recovery counterpart to _replace_table_safely: if that raised (or the process crashed
+        mid-migration, before a previous run's except block could even attempt this), this
+        restores the pre-migration table from its rename-aside backup -- dropping whatever
+        partial new table may have been left behind -- so a failed/interrupted migration never
+        leaves `name` missing or its old data unrecoverable; the migration simply retries on the
+        next startup. A no-op if there's no backup to restore from."""
+        backup_name = f"{name}__migration_backup"
+        try:
+            with self.engine.begin() as conn:
+                insp = inspect(conn)
+                if not insp.has_table(backup_name):
+                    return
+                if insp.has_table(name):
+                    conn.exec_driver_sql(f"DROP TABLE {name}")
+                conn.exec_driver_sql(f"ALTER TABLE {backup_name} RENAME TO {name}")
+                logger.info(f"Restored {name} from its pre-migration backup after a failed/interrupted migration.")
+        except Exception as restore_err:
+            logger.error(f"Failed to restore {name} from its migration backup -- manual recovery needed: {restore_err}")
+
     def _migrate_to_owner_scoped_schema(self) -> None:
         """One-time, idempotent migration from the old vault_id-only schema to the
         (owner_username, vault_id) one. Safe to run on every startup: each step first checks
@@ -374,15 +413,19 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
 
         # file_metadata / published_files: owner_username joined the primary key, which most
         # dialects can't add to an existing table via a plain ALTER TABLE -- so these are read out
-        # in full, the table is dropped and recreated from the current (correct) Table definition,
-        # and the transformed rows are written back in. The in-memory copy is held until the
-        # reinsert succeeds, so a failure after the DROP still logs exactly what needs restoring
-        # from a backup.
+        # in full, then _replace_table_safely swaps in a freshly-created table (current schema)
+        # populated with the transformed rows, without ever dropping the original until the
+        # replacement is fully built (see that method's docstring for the incidents this avoids).
         for table, cols in (
             (self._file_metadata, ["vault_id", "path", "modified_at_ms", "size_bytes", "content_hash", "is_deleted"]),
             (self._published_files, ["vault_id", "path", "content_hash"]),
         ):
             name = table.name
+            # Recovers from a hard crash between a previous attempt's rename-aside and its final
+            # drop-the-backup step (the except block below can't run if the process died, not
+            # just raised) -- a no-op if there's nothing to restore.
+            self._restore_table_backup(name)
+            inspector = inspect(self.engine)
             if "owner_username" in [c["name"] for c in inspector.get_columns(name)]:
                 continue  # already migrated
             try:
@@ -393,16 +436,16 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                         {**dict(zip(cols, row)), "owner_username": owners.get(row[0], "")}
                         for row in old_rows
                     ]
-                    conn.exec_driver_sql(f"DROP TABLE {name}")
-                    table.create(conn)
-                    if transformed:
-                        conn.execute(insert(table), transformed)
+
+                    def populate(c, table=table, transformed=transformed) -> None:
+                        if transformed:
+                            c.execute(insert(table), transformed)
+
+                    self._replace_table_safely(conn, name, table, populate)
                     logger.info(f"Migrated {name} to the owner-scoped schema ({len(transformed)} row(s)).")
             except Exception as e:
-                logger.error(
-                    f"Owner-scoping migration for {name} failed -- table may be in an inconsistent "
-                    f"state, restore from backup if so: {e}"
-                )
+                logger.error(f"Owner-scoping migration for {name} failed: {e}")
+                self._restore_table_backup(name)
 
     def _migrate_plugin_enablement_to_vault_scoped_schema(self) -> None:
         """One-time, idempotent migration from the old (owner_username, plugin_id) primary key to
@@ -415,16 +458,23 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         a plugin enabled under the old schema just needs to re-enable it, this time genuinely
         scoped to the vault(s) that actually use it.
         """
+        name = "plugin_enablement"
+        # Recovers from a hard crash mid-migration on a previous startup -- a no-op otherwise.
+        self._restore_table_backup(name)
         inspector = inspect(self.engine)
-        if "vault_id" in [c["name"] for c in inspector.get_columns("plugin_enablement")]:
+        if "vault_id" in [c["name"] for c in inspector.get_columns(name)]:
             return  # already migrated
         try:
             with self.engine.begin() as conn:
-                conn.exec_driver_sql("DROP TABLE plugin_enablement")
-                self._plugin_enablement.create(conn)
+                # Old rows are intentionally discarded on a *successful* migration (see docstring
+                # above) -- _replace_table_safely's rename-aside-then-drop only protects the
+                # failure path (table.create() itself failing used to leave plugin_enablement
+                # missing entirely; see llm-wiki/11-*.md), not the normal no-data-carried-over case.
+                self._replace_table_safely(conn, name, self._plugin_enablement, lambda c: None)
                 logger.info("Migrated plugin_enablement to the vault-scoped schema (old rows dropped -- re-enable per vault).")
         except Exception as e:
-            logger.error(f"plugin_enablement vault-scoping migration failed (non-fatal): {e}")
+            logger.error(f"plugin_enablement vault-scoping migration failed: {e}")
+            self._restore_table_backup(name)
 
     def _upsert(self, conn, table: Table, record: dict, pk_cols: list) -> None:
         pk_filter = [table.c[col] == record[col] for col in pk_cols]
