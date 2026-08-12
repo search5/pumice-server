@@ -184,8 +184,21 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                         "is_deleted": True
                     }
                 else:
-                    # Keep the existing deleted state
-                    merged_files[path] = old_meta
+                    # Keep the existing deleted state -- normalized to the same 5-key shape as
+                    # every other merged_files entry. old_meta came straight from
+                    # repository.load_all(), which returns full DB rows (owner_username,
+                    # vault_id, ...); reusing it verbatim let that extra shape leak into
+                    # Delta()'s sync_pb2.FileMeta(**server_meta) for any tombstone a client
+                    # hadn't caught up to yet ("Protocol message FileMeta has no
+                    # "owner_username" field"). See did_metadata_change's docstring in
+                    # change_notifier.py for the same shape mismatch biting a different caller.
+                    merged_files[path] = {
+                        "path": path,
+                        "modified_at_ms": old_meta["modified_at_ms"],
+                        "size_bytes": old_meta["size_bytes"],
+                        "content_hash": old_meta["content_hash"],
+                        "is_deleted": old_meta["is_deleted"],
+                    }
 
         # Persist the metadata updates
         self.repository.save_all(owner_username, vault_id, merged_files)
