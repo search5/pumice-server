@@ -90,9 +90,11 @@ class WsServicerContext:
         self._session._emit_stream_frame(self._session._active_stream_request_id, _file_chunk_to_frame(message))
 
 
-# ─── payload <-> protobuf conversion (temporary boundary layer -- see PR2 note in
-# #11_websocket_동기화_프로토콜_설계.md: SyncServiceServicer keeps speaking protobuf internally
-# until sync.proto itself is removed in the final PR; only the WS edge translates JSON <-> pb) ──
+# ─── payload <-> wire_types conversion ──────────────────────────────────────────────────────
+# PR5 (pumice's 13_PR5_계획.md) is converting SyncServiceServicer's methods off protobuf one at
+# a time -- Delta/UploadFiles/DownloadFiles/DownloadHistoryVersion already speak wire_types
+# dataclasses; GetFileHistory/RestoreHistoryVersion below still construct sync_pb2 messages
+# until their own conversion lands. See llm-wiki/ in this repo for the per-method log.
 
 
 def _file_meta_from_dict(d: dict) -> "wire_types.FileMeta":
@@ -171,7 +173,7 @@ _REQUEST_HANDLERS: Dict[str, Callable] = {
 # _active_stream_request_id. Non-streaming ops above are unaffected and stay fully multiplexed.
 
 
-def _file_chunk_to_frame(chunk: "sync_pb2.FileChunk"):
+def _file_chunk_to_frame(chunk: "wire_types.FileChunk"):
     """Translates one FileChunk (as already yielded by DownloadFiles/DownloadHistoryVersion,
     unmodified) into a frame to send: ("json", op, payload) for header/eof, or ("binary", bytes)
     for the raw file data -- the data itself, not wrapped in any envelope."""
@@ -194,12 +196,12 @@ async def _handle_download(session: "SyncWsSession", payload: dict) -> None:
     # (see service.py -- it fans the batch out across concurrent per-file tasks, so a plain
     # generator wouldn't preserve per-file ordering the way DownloadHistoryVersion's does).
     # WsServicerContext.write() forwards each one straight to _emit_stream_frame as it happens.
-    request = sync_pb2.DownloadBatchRequest(vault_id=payload.get("vaultId", ""), paths=payload.get("paths", []))
+    request = wire_types.DownloadBatchRequest(vault_id=payload.get("vaultId", ""), paths=payload.get("paths", []))
     await session.servicer.DownloadFiles(request, WsServicerContext(session))
 
 
 async def _stream_history_download(session: "SyncWsSession", payload: dict):
-    request = sync_pb2.HistoryVersionDownloadRequest(
+    request = wire_types.HistoryVersionDownloadRequest(
         vault_id=payload.get("vaultId", ""), path=payload.get("path", ""), history_id=payload.get("historyId", 0),
     )
     async for chunk in session.servicer.DownloadHistoryVersion(request, WsServicerContext(session)):
@@ -233,15 +235,15 @@ class _UploadAccumulator:
         self.files_completed = 0
 
     def add_header(self, path: str, total_bytes: int, modified_at_ms: int) -> None:
-        self.chunks.append(sync_pb2.FileChunk(header=sync_pb2.ChunkHeader(
+        self.chunks.append(wire_types.FileChunk(header=wire_types.ChunkHeader(
             vault_id=self.vault_id, path=path, total_bytes=total_bytes, modified_at_ms=modified_at_ms,
         )))
 
     def add_data(self, path: str, sequence: int, data: bytes) -> None:
-        self.chunks.append(sync_pb2.FileChunk(data=sync_pb2.ChunkData(path=path, sequence=sequence, data=data)))
+        self.chunks.append(wire_types.FileChunk(data=wire_types.ChunkData(path=path, sequence=sequence, data=data)))
 
     def add_eof(self, path: str, content_hash: str) -> None:
-        self.chunks.append(sync_pb2.FileChunk(eof=sync_pb2.ChunkEOF(path=path, content_hash=content_hash)))
+        self.chunks.append(wire_types.FileChunk(eof=wire_types.ChunkEOF(path=path, content_hash=content_hash)))
         self.files_completed += 1
 
     @property
@@ -417,7 +419,7 @@ class SyncWsSession:
 
     async def _finish_upload(self, request_id: int, accumulator: _UploadAccumulator) -> None:
         try:
-            batch = sync_pb2.UploadBatch(chunks=accumulator.chunks)
+            batch = wire_types.UploadBatch(chunks=accumulator.chunks)
             async for ack in self.servicer.UploadFiles(batch, WsServicerContext(self)):
                 self._send({
                     "requestId": request_id,

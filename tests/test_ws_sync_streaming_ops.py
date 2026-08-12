@@ -28,7 +28,7 @@ import pytest
 
 from pumice_server.repository import SqlAlchemyMetadataRepository
 from pumice_server.service import SyncServiceServicer
-from pumice_server import sync_pb2
+from pumice_server import wire_types
 from pumice_server.ws_sync_resource import SyncWsSession, _UploadAccumulator, _file_chunk_to_frame
 
 
@@ -99,26 +99,30 @@ def test_upload_accumulator_builds_file_chunk_protos_in_order():
     acc.add_data("a.md", 0, b"abc")
     acc.add_eof("a.md", "hash-a")
 
+    # WhichOneof() is a deliberate compatibility shim on wire_types.FileChunk (see its
+    # docstring) so this line reads identically to when acc.chunks held sync_pb2.FileChunk.
     kinds = [c.WhichOneof("payload") for c in acc.chunks]
     assert kinds == ["header", "data", "eof"]
     assert acc.chunks[1].data.data == b"abc"
+    # PR5 (pumice's 13_PR5_계획.md): must be plain dataclasses now, not protobuf messages.
+    assert all(isinstance(c, wire_types.FileChunk) for c in acc.chunks)
 
 
 # ─── _file_chunk_to_frame (pure) ────────────────────────────────────────────────────────────
 
 
 def test_file_chunk_to_frame_translates_header():
-    chunk = sync_pb2.FileChunk(header=sync_pb2.ChunkHeader(vault_id="v1", path="a.md", total_bytes=3, modified_at_ms=1000))
+    chunk = wire_types.FileChunk(header=wire_types.ChunkHeader(vault_id="v1", path="a.md", total_bytes=3, modified_at_ms=1000))
     assert _file_chunk_to_frame(chunk) == ("json", "file_chunk_header", {"vaultId": "v1", "path": "a.md", "totalBytes": 3, "modifiedAtMs": 1000})
 
 
 def test_file_chunk_to_frame_translates_data_as_raw_binary():
-    chunk = sync_pb2.FileChunk(data=sync_pb2.ChunkData(path="a.md", sequence=0, data=b"abc"))
+    chunk = wire_types.FileChunk(data=wire_types.ChunkData(path="a.md", sequence=0, data=b"abc"))
     assert _file_chunk_to_frame(chunk) == ("binary", b"abc")
 
 
 def test_file_chunk_to_frame_translates_eof():
-    chunk = sync_pb2.FileChunk(eof=sync_pb2.ChunkEOF(path="a.md", content_hash="deadbeef"))
+    chunk = wire_types.FileChunk(eof=wire_types.ChunkEOF(path="a.md", content_hash="deadbeef"))
     assert _file_chunk_to_frame(chunk) == ("json", "file_chunk_eof", {"path": "a.md", "contentHash": "deadbeef"})
 
 

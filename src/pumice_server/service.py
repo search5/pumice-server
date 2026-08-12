@@ -547,14 +547,14 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                         owner_username = self._verify_vault_access(vault_id, context)
                     except Exception as auth_err:
                         logger.error(f"UploadFiles authorization failed: {auth_err}")
-                        yield sync_pb2.UploadAck(path=header.path, ok=False, error="Authorization failed")
+                        yield wire_types.UploadAck(path=header.path, ok=False, error="Authorization failed")
                         continue
 
                     current_rel_path = os.path.normpath(header.path).replace("\\", "/")
 
                     # Security check: prevent escaping into a parent directory
                     if current_rel_path.startswith("..") or os.path.isabs(current_rel_path):
-                        yield sync_pb2.UploadAck(path=header.path, ok=False, error="Invalid file path")
+                        yield wire_types.UploadAck(path=header.path, ok=False, error="Invalid file path")
                         continue
 
                     vault_path = self._get_vault_path(owner_username, vault_id)
@@ -577,7 +577,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                     try:
                         file_handle = open(current_temp_path, 'wb')
                     except Exception as e:
-                        yield sync_pb2.UploadAck(path=header.path, ok=False, error=f"Failed to create temp file: {e}")
+                        yield wire_types.UploadAck(path=header.path, ok=False, error=f"Failed to create temp file: {e}")
                         current_file_path = None
                         continue
 
@@ -599,7 +599,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                         file_handle = None
                         if os.path.exists(current_temp_path):
                             os.remove(current_temp_path)
-                        yield sync_pb2.UploadAck(path=chunk_path, ok=False, error="Path mismatch in data chunk")
+                        yield wire_types.UploadAck(path=chunk_path, ok=False, error="Path mismatch in data chunk")
                         continue
 
                     file_handle.write(data_payload.data)
@@ -618,7 +618,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                         file_handle = None
                         if os.path.exists(current_temp_path):
                             os.remove(current_temp_path)
-                        yield sync_pb2.UploadAck(path=chunk_path, ok=False, error="Path mismatch in eof chunk")
+                        yield wire_types.UploadAck(path=chunk_path, ok=False, error="Path mismatch in eof chunk")
                         continue
 
                     file_handle.close()
@@ -632,7 +632,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                         logger.error(f"Hash mismatch for {eof_payload.path}: calculated={calculated_hash}, expected={eof_payload.content_hash}")
                         if os.path.exists(current_temp_path):
                             os.remove(current_temp_path)
-                        yield sync_pb2.UploadAck(path=eof_payload.path, ok=False, error="Hash verification failed")
+                        yield wire_types.UploadAck(path=eof_payload.path, ok=False, error="Hash verification failed")
                         continue
 
                     logger.info(f"Hash verified successfully for {eof_payload.path}. Proceeding with file rename and metadata update.")
@@ -649,7 +649,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                         calculated_hash, device_name, user_name,
                         metadata_caches[vault_id], tombstone_indexes[vault_id]
                     )
-                    yield sync_pb2.UploadAck(path=eof_payload.path, ok=ok, error=error)
+                    yield wire_types.UploadAck(path=eof_payload.path, ok=ok, error=error)
 
                     current_file_path = None
                     current_rel_path = None
@@ -727,7 +727,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
         # non-interleaving instead. Concurrent disk reads across files are unaffected -- only the
         # wire emission is serialized per file.
         async with write_lock:
-            await context.write(sync_pb2.FileChunk(header=sync_pb2.ChunkHeader(
+            await context.write(wire_types.FileChunk(header=wire_types.ChunkHeader(
                 vault_id=vault_id,
                 path=rel_path,
                 total_bytes=total_bytes,
@@ -743,7 +743,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                     data = await asyncio.to_thread(f.read, chunk_size)
                     if not data:
                         break
-                    await context.write(sync_pb2.FileChunk(data=sync_pb2.ChunkData(
+                    await context.write(wire_types.FileChunk(data=wire_types.ChunkData(
                         path=rel_path,
                         sequence=sequence,
                         data=data,
@@ -752,7 +752,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             finally:
                 f.close()
 
-            await context.write(sync_pb2.FileChunk(eof=sync_pb2.ChunkEOF(
+            await context.write(wire_types.FileChunk(eof=wire_types.ChunkEOF(
                 path=rel_path,
                 content_hash=content_hash,
             )))
@@ -796,13 +796,13 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             target_path = request.path if request.path else row["path"]
 
             # 1. Send the header
-            header = sync_pb2.ChunkHeader(
+            header = wire_types.ChunkHeader(
                 vault_id=request.vault_id,
                 path=target_path,
                 total_bytes=row["size_bytes"],
                 modified_at_ms=row["modified_at_ms"]
             )
-            yield sync_pb2.FileChunk(header=header)
+            yield wire_types.FileChunk(header=header)
 
             # 2. Send the data
             sequence = 0
@@ -811,20 +811,20 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                     data = f.read(CHUNK_SIZE)
                     if not data:
                         break
-                    chunk_data = sync_pb2.ChunkData(
+                    chunk_data = wire_types.ChunkData(
                         path=target_path,
                         sequence=sequence,
                         data=data
                     )
-                    yield sync_pb2.FileChunk(data=chunk_data)
+                    yield wire_types.FileChunk(data=chunk_data)
                     sequence += 1
 
             # 3. Send the EOF
-            eof = sync_pb2.ChunkEOF(
+            eof = wire_types.ChunkEOF(
                 path=target_path,
                 content_hash=row["content_hash"]
             )
-            yield sync_pb2.FileChunk(eof=eof)
+            yield wire_types.FileChunk(eof=eof)
         except Exception as e:
             logger.error(f"DownloadHistoryVersion failed: {e}")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))

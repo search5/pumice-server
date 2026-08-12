@@ -29,7 +29,7 @@ import os
 
 import pytest
 
-from pumice_server import sync_pb2
+from pumice_server import wire_types
 from pumice_server.service import SyncServiceServicer
 
 
@@ -70,13 +70,16 @@ class FakeContext:
         raise RuntimeError(f"aborted: {details}")
 
     async def write(self, message):
-        if message.HasField("header"):
+        # PR5 (pumice's 13_PR5_계획.md): message is a wire_types.FileChunk (plain dataclass)
+        # now, not a protobuf message, so this checks the field directly instead of HasField().
+        assert isinstance(message, wire_types.FileChunk)
+        if message.header is not None:
             path = message.header.path
             if path in self._fail_paths:
                 raise RuntimeError(f"simulated write failure for {path}")
             self.active.add(path)
             self.max_concurrent = max(self.max_concurrent, len(self.active))
-        elif message.HasField("eof"):
+        elif message.eof is not None:
             self.active.discard(message.eof.path)
         self.written.append(message)
 
@@ -92,11 +95,11 @@ def make_vault(tmp_path, owner="alice", vault_id="vault1", files=None):
 
 
 def paths_with_headers(context):
-    return {m.header.path for m in context.written if m.HasField("header")}
+    return {m.header.path for m in context.written if m.header is not None}
 
 
 def paths_with_eof(context):
-    return {m.eof.path for m in context.written if m.HasField("eof")}
+    return {m.eof.path for m in context.written if m.eof is not None}
 
 
 def test_one_failing_file_does_not_abort_the_whole_batch(tmp_path):
@@ -104,7 +107,7 @@ def test_one_failing_file_does_not_abort_the_whole_batch(tmp_path):
     make_vault(tmp_path, files=files)
     servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=FakeRepository())
     context = FakeContext(fail_paths={"b.md"})
-    request = sync_pb2.DownloadBatchRequest(vault_id="vault1", paths=list(files.keys()))
+    request = wire_types.DownloadBatchRequest(vault_id="vault1", paths=list(files.keys()))
 
     # Must complete without raising -- previously the header-write RuntimeError for "b.md"
     # propagated out of asyncio.gather() and killed the whole DownloadFiles call.
@@ -119,7 +122,7 @@ def test_wire_emission_is_serialized_when_concurrency_limit_is_one(tmp_path):
     make_vault(tmp_path, files=files)
     servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=FakeRepository(), download_concurrency=1)
     context = FakeContext()
-    request = sync_pb2.DownloadBatchRequest(vault_id="vault1", paths=list(files.keys()))
+    request = wire_types.DownloadBatchRequest(vault_id="vault1", paths=list(files.keys()))
 
     asyncio.run(servicer.DownloadFiles(request, context))
 
@@ -135,7 +138,7 @@ def test_wire_emission_is_serialized_even_with_a_higher_read_concurrency_limit(t
     make_vault(tmp_path, files=files)
     servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=FakeRepository(), download_concurrency=4)
     context = FakeContext()
-    request = sync_pb2.DownloadBatchRequest(vault_id="vault1", paths=list(files.keys()))
+    request = wire_types.DownloadBatchRequest(vault_id="vault1", paths=list(files.keys()))
 
     asyncio.run(servicer.DownloadFiles(request, context))
 
@@ -151,25 +154,25 @@ def test_no_two_files_frames_ever_actually_interleave_in_the_emitted_order(tmp_p
     make_vault(tmp_path, files=files)
     servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=FakeRepository(), download_concurrency=4)
     context = FakeContext()
-    request = sync_pb2.DownloadBatchRequest(vault_id="vault1", paths=list(files.keys()))
+    request = wire_types.DownloadBatchRequest(vault_id="vault1", paths=list(files.keys()))
 
     asyncio.run(servicer.DownloadFiles(request, context))
 
     def path_of(message):
-        if message.HasField("header"):
+        if message.header is not None:
             return message.header.path
-        if message.HasField("data"):
+        if message.data is not None:
             return message.data.path
         return message.eof.path
 
     open_path = None
     for message in context.written:
         path = path_of(message)
-        if message.HasField("header"):
+        if message.header is not None:
             assert open_path is None, f"{path}'s header arrived while {open_path} was still open"
             open_path = path
         else:
             assert path == open_path, f"frame for {path} arrived while {open_path} was open"
-            if message.HasField("eof"):
+            if message.eof is not None:
                 open_path = None
     assert open_path is None
