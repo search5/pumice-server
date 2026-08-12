@@ -32,6 +32,7 @@ from autobahn.twisted.resource import WebSocketResource
 from twisted.internet import reactor as _default_reactor
 
 from . import sync_pb2
+from . import wire_types
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +95,8 @@ class WsServicerContext:
 # until sync.proto itself is removed in the final PR; only the WS edge translates JSON <-> pb) ──
 
 
-def _file_meta_from_dict(d: dict) -> "sync_pb2.FileMeta":
-    return sync_pb2.FileMeta(
+def _file_meta_from_dict(d: dict) -> "wire_types.FileMeta":
+    return wire_types.FileMeta(
         path=d.get("path", ""),
         modified_at_ms=d.get("modifiedAtMs", 0),
         size_bytes=d.get("sizeBytes", 0),
@@ -104,7 +105,7 @@ def _file_meta_from_dict(d: dict) -> "sync_pb2.FileMeta":
     )
 
 
-def _file_meta_to_dict(m: "sync_pb2.FileMeta") -> dict:
+def _file_meta_to_dict(m: "wire_types.FileMeta") -> dict:
     return {
         "path": m.path,
         "modifiedAtMs": m.modified_at_ms,
@@ -115,7 +116,7 @@ def _file_meta_to_dict(m: "sync_pb2.FileMeta") -> dict:
 
 
 async def _handle_delta(session: "SyncWsSession", payload: dict):
-    request = sync_pb2.DeltaRequest(
+    request = wire_types.DeltaRequest(
         vault_id=payload.get("vaultId", ""),
         local_files=[_file_meta_from_dict(f) for f in payload.get("localFiles", [])],
     )

@@ -11,6 +11,7 @@ from urllib.parse import unquote
 
 from . import sync_pb2
 from . import sync_pb2_grpc
+from . import wire_types
 from .change_notifier import did_metadata_change
 from .history_policy import is_history_excluded_path
 from .repository import MetadataRepository
@@ -332,7 +333,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                     # Deleted and also absent on the client -> ignore
                     continue
                 # Needs download
-                need_download.append(sync_pb2.FileMeta(**server_meta))
+                need_download.append(wire_types.FileMeta(**server_meta))
 
             else:
                 # Exists on both sides
@@ -361,7 +362,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                 elif s_del and not c_del:
                     # Deleted on the server -> propagate the tombstone to the client (a download
                     # instruction that prompts the client to remove its own file)
-                    need_download.append(sync_pb2.FileMeta(**server_meta))
+                    need_download.append(wire_types.FileMeta(**server_meta))
                     continue
 
                 # 2. Regular files (both sides exist) — compare hashes
@@ -372,13 +373,13 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                         need_upload.append(path)
                     elif s_time > c_time:
                         # Server is newer -> needs download
-                        need_download.append(sync_pb2.FileMeta(**server_meta))
+                        need_download.append(wire_types.FileMeta(**server_meta))
                     else:
                         # Timestamps are exactly equal -> default to uploading the client's version
                         # (a safety pin against ending up out of sync)
                         need_upload.append(path)
 
-        return sync_pb2.DeltaResponse(
+        return wire_types.DeltaResponse(
             need_upload=need_upload,
             need_download=need_download,
             conflicts=[]

@@ -29,7 +29,7 @@ import asyncio
 
 import pytest
 
-from pumice_server import sync_pb2
+from pumice_server import wire_types
 from pumice_server.repository import SqlAlchemyMetadataRepository
 from pumice_server.service import SyncServiceServicer
 
@@ -64,7 +64,7 @@ def test_a_tombstone_kept_across_two_cycles_stays_a_clean_5_key_dict(tmp_path, r
     assert set(second_poll["note.md"].keys()) == CLEAN_KEYS
 
     # The actual regression: constructing the wire message from this dict must not raise.
-    sync_pb2.FileMeta(**second_poll["note.md"])
+    wire_types.FileMeta(**second_poll["note.md"])
 
 
 class FakeContext:
@@ -91,14 +91,45 @@ def test_delta_does_not_crash_when_client_has_not_caught_up_to_a_kept_tombstone(
     servicer._scan_and_merge(str(vault_path), "alice", "vault1")  # deletion first detected+persisted
 
     # The client polls again believing it still has the file (hasn't synced the deletion yet).
-    request = sync_pb2.DeltaRequest(
+    request = wire_types.DeltaRequest(
         vault_id="vault1",
-        local_files=[sync_pb2.FileMeta(path="note.md", modified_at_ms=1, size_bytes=5,
-                                        content_hash="deadbeef", is_deleted=False)],
+        local_files=[wire_types.FileMeta(path="note.md", modified_at_ms=1, size_bytes=5,
+                                          content_hash="deadbeef", is_deleted=False)],
     )
     context = FakeContext()
 
     response = asyncio.run(servicer.Delta(request, context))
 
+    # Delta() must speak wire_types now, not sync_pb2 -- PR5 (see pumice's 13_PR5_계획.md).
+    assert isinstance(response, wire_types.DeltaResponse)
+    assert all(isinstance(m, wire_types.FileMeta) for m in response.need_download)
+
     assert [f.path for f in response.need_download] == ["note.md"]
     assert response.need_download[0].is_deleted is True
+
+
+def test_delta_request_and_response_are_plain_dataclasses_not_protobuf(tmp_path, repo):
+    """Focused regression for the PR5 migration itself -- a minimal happy-path round trip
+    (one client-only file needing upload, one server-only file needing download) asserting
+    purely on the wire_types boundary, independent of the tombstone edge case above."""
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    servicer = make_servicer(tmp_path, repo)
+    vault_path = tmp_path / "vaults" / "alice" / "vault1"
+    vault_path.mkdir(parents=True)
+    (vault_path / "server-only.md").write_text("server side")
+
+    request = wire_types.DeltaRequest(
+        vault_id="vault1",
+        local_files=[wire_types.FileMeta(path="client-only.md", modified_at_ms=1, size_bytes=4,
+                                          content_hash="abc123", is_deleted=False)],
+    )
+    context = FakeContext()
+
+    response = asyncio.run(servicer.Delta(request, context))
+
+    assert isinstance(response, wire_types.DeltaResponse)
+    assert response.need_upload == ["client-only.md"]
+    assert len(response.need_download) == 1
+    downloaded = response.need_download[0]
+    assert isinstance(downloaded, wire_types.FileMeta)
+    assert downloaded.path == "server-only.md"
