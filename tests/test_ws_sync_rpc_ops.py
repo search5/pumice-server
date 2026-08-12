@@ -21,7 +21,7 @@ from pumice_server.repository import SqlAlchemyMetadataRepository
 from pumice_server.service import SyncServiceServicer
 from pumice_server.change_notifier import ChangeNotifier
 from pumice_server.status_codes import StatusCode
-from pumice_server.ws_sync_resource import SyncWsSession, WsServicerContext, WsAborted
+from pumice_server.ws_sync_resource import SyncWebSocketProtocol, SyncWsSession, WsServicerContext, WsAborted
 
 
 @pytest.fixture
@@ -253,12 +253,57 @@ def test_change_notifier_push_reaches_a_subscribed_ws_session(tmp_path, repo):
     pushes = []
 
     def on_authenticated(owner, vault_id):
-        notifier.subscribe(owner, vault_id, lambda: sender({"requestId": 0, "op": "push", "payload": {"vaultId": vault_id}}))
+        notifier.subscribe(
+            owner,
+            vault_id,
+            lambda file_meta: sender({
+                "requestId": 0,
+                "op": "push",
+                "payload": {
+                    "vaultId": vault_id,
+                    "path": file_meta["path"],
+                    "modifiedAtMs": file_meta["modified_at_ms"],
+                    "sizeBytes": file_meta["size_bytes"],
+                    "contentHash": file_meta["content_hash"],
+                    "isDeleted": file_meta["is_deleted"],
+                },
+            }),
+        )
 
     session = SyncWsSession(repo, servicer, sender, on_authenticated=on_authenticated)
     session.handle_text_message('{"requestId":1,"op":"init","payload":{"token":"tok","vaultId":"vault1"}}')
 
-    notifier.notify_change("alice", "vault1")
+    notifier.notify_change("alice", "vault1", {"path": "a.md", "modified_at_ms": 1000, "size_bytes": 5, "content_hash": "h1", "is_deleted": False})
 
     push = sender.find("push")[-1]
-    assert push == {"requestId": 0, "op": "push", "payload": {"vaultId": "vault1"}}
+    assert push == {
+        "requestId": 0,
+        "op": "push",
+        "payload": {"vaultId": "vault1", "path": "a.md", "modifiedAtMs": 1000, "sizeBytes": 5, "contentHash": "h1", "isDeleted": False},
+    }
+
+
+def test_ws_protocol_on_change_sends_push_with_real_file_metadata(tmp_path, repo):
+    """Exercises SyncWebSocketProtocol's actual _on_authenticated/_on_change wiring (not a
+    hand-rolled stand-in like the test above) -- the production code that runs a real WS
+    connection through, see ws_sync_resource.py."""
+    notifier = ChangeNotifier()
+    servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo, change_notifier=notifier)
+    protocol = SyncWebSocketProtocol(repo, servicer, notifier)
+    sent = []
+    protocol._send_json = sent.append
+
+    class FakeSession:
+        vault_id = "vault1"
+
+    protocol._session = FakeSession()
+    protocol._on_authenticated("alice", "vault1")
+
+    file_meta = {"path": "a.md", "modified_at_ms": 1000, "size_bytes": 5, "content_hash": "h1", "is_deleted": False}
+    notifier.notify_change("alice", "vault1", file_meta)
+
+    assert sent == [{
+        "requestId": 0,
+        "op": "push",
+        "payload": {"vaultId": "vault1", "path": "a.md", "modifiedAtMs": 1000, "sizeBytes": 5, "contentHash": "h1", "isDeleted": False},
+    }]

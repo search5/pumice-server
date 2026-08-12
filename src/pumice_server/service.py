@@ -9,7 +9,7 @@ from typing import Dict, Optional
 from urllib.parse import unquote
 
 from . import wire_types
-from .change_notifier import did_metadata_change
+from .change_notifier import diff_changed_files
 from .history_policy import is_history_excluded_path
 from .repository import MetadataRepository
 from .status_codes import StatusCode
@@ -212,9 +212,12 @@ class SyncServiceServicer:
         self.repository.save_all(owner_username, vault_id, merged_files)
         # Delta calls this on every sync/poll cycle regardless of whether anything actually
         # changed, so this must be gated -- an unconditional notify would make a client's own
-        # no-op poll re-notify itself (and every other watcher) every single cycle.
-        if self.change_notifier is not None and did_metadata_change(metadata_files, merged_files):
-            self.change_notifier.notify_change(owner_username, vault_id)
+        # no-op poll re-notify itself (and every other watcher) every single cycle. One
+        # notify_change() per actually-changed file (not one per whole scan) so a push carries
+        # that file's own metadata, matching real Obsidian Sync -- see diff_changed_files.
+        if self.change_notifier is not None:
+            for changed_path, changed_meta in diff_changed_files(metadata_files, merged_files).items():
+                self.change_notifier.notify_change(owner_username, vault_id, changed_meta)
         return merged_files
 
     def _delete_on_server(self, vault_path: str, owner_username: str, vault_id: str, path: str,
@@ -486,13 +489,14 @@ class SyncServiceServicer:
             if backup_file_path:
                 logger.info(f"Backup version created for {current_rel_path} -> {backup_file_path}")
 
-            # A successful upload is an unconditional change -- no need for did_metadata_change()
+            # A successful upload is an unconditional change -- no need for diff_changed_files()
             # here the way _scan_and_merge() needs it (this path only runs when a file's content
-            # actually differs, never as a no-op poll). Fires once per file in a batch upload;
-            # harmless -- syncNow() on the receiving end already coalesces concurrent/rapid calls
-            # (main.ts's isSyncing/syncQueuedWhileRunning guard).
+            # actually differs, never as a no-op poll). Fires once per file in a batch upload,
+            # carrying that file's own metadata; harmless -- syncNow() on the receiving end
+            # already coalesces concurrent/rapid calls (main.ts's isSyncing/syncQueuedWhileRunning
+            # guard).
             if self.change_notifier is not None:
-                self.change_notifier.notify_change(owner_username, vault_id)
+                self.change_notifier.notify_change(owner_username, vault_id, meta)
 
             # Keep the in-memory cache in sync so later files in this same batch see this
             # file's new state without a DB round trip.
@@ -899,7 +903,7 @@ class SyncServiceServicer:
             self.repository.save_one(owner_username, request.vault_id, target_path, meta)
 
             if self.change_notifier is not None:
-                self.change_notifier.notify_change(owner_username, request.vault_id)
+                self.change_notifier.notify_change(owner_username, request.vault_id, meta)
 
             # Record the restored state itself as a new change version in history (reusing the
             # existing path for the physical backup)

@@ -549,9 +549,20 @@ class SyncWebSocketProtocol(WebSocketServerProtocol):
         if self._change_notifier is not None:
             self._unsubscribe = self._change_notifier.subscribe(owner_username, vault_id, self._on_change)
 
-    def _on_change(self) -> None:
+    def _on_change(self, file_meta: dict) -> None:
         assert self._session is not None
-        self._send_json({"requestId": 0, "op": "push", "payload": {"vaultId": self._session.vault_id}})
+        self._send_json({
+            "requestId": 0,
+            "op": "push",
+            "payload": {
+                "vaultId": self._session.vault_id,
+                "path": file_meta["path"],
+                "modifiedAtMs": file_meta["modified_at_ms"],
+                "sizeBytes": file_meta["size_bytes"],
+                "contentHash": file_meta["content_hash"],
+                "isDeleted": file_meta["is_deleted"],
+            },
+        })
 
     def _on_init_timeout(self):
         if not self._session or not self._session.authenticated:
