@@ -797,7 +797,9 @@ class SyncServiceServicer:
                     size_bytes=row["size_bytes"],
                     content_hash=row["content_hash"],
                     device_name=row.get("device_name", "Unknown Device"),
-                    user_name=row.get("user_name", "Unknown User")
+                    user_name=row.get("user_name", "Unknown User"),
+                    deleted=bool(row.get("deleted", False)),
+                    related_path=row.get("related_path"),
                 ))
             return wire_types.HistoryResponse(versions=versions)
         except Exception as e:

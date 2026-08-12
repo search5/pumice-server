@@ -147,6 +147,8 @@ def test_history_then_restore_round_trip(tmp_path, repo):
     assert history_res["requestId"] == 4
     [version] = history_res["payload"]["versions"]
     assert version["contentHash"]
+    assert version["deleted"] is False
+    assert version["relatedPath"] is None
     history_id = version["historyId"]
 
     # _backup_file hard-links rather than copies (see service.py) -- an in-place write here

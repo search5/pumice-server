@@ -135,6 +135,8 @@ async def _handle_history(session: "SyncWsSession", payload: dict):
                 "contentHash": v.content_hash,
                 "deviceName": v.device_name,
                 "userName": v.user_name,
+                "deleted": v.deleted,
+                "relatedPath": v.related_path,
             }
             for v in response.versions
         ],

@@ -128,6 +128,12 @@ class HistoryVersion:
     content_hash: str
     device_name: str = "Unknown Device"
     user_name: str = "Unknown User"
+    # 2026-08 WS history migration follow-up (see llm-wiki/08-*.md): the REST /api/history view
+    # (now removed) always surfaced these from the DB row; GetFileHistory's original protobuf-era
+    # conversion never carried them, which syncHistoryModal.ts relies on for deletion markers and
+    # rename-chain display.
+    deleted: bool = False
+    related_path: Optional[str] = None
 
 
 @dataclass

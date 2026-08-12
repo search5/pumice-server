@@ -64,6 +64,28 @@ def test_get_file_history_returns_wire_types_history_response(tmp_path, repo):
     assert version.content_hash
 
 
+def test_get_file_history_surfaces_deleted_and_related_path(tmp_path, repo):
+    """Regression test: the REST /api/history view (now removed in favor of WS -- see
+    llm-wiki/08-*.md) always surfaced deleted/related_path from the DB row, but GetFileHistory's
+    wire_types conversion silently dropped them -- syncHistoryModal.ts relies on both for
+    deletion markers and rename-chain display, so this would have been a real feature
+    regression once the client moved off REST onto GetFileHistory/history_req."""
+    servicer, vault_path = make_servicer_with_one_history_entry(tmp_path, repo)
+    repo.add_history(
+        owner_username="alice", vault_id="vault1", path="note.md", modified_at_ms=2000,
+        size_bytes=0, content_hash="", backup_file_path=str(vault_path / "note.md"),
+        device_name="dev", user_name="user", deleted=True, related_path="old-note.md",
+    )
+
+    request = wire_types.HistoryRequest(vault_id="vault1", path="note.md")
+    response = asyncio.run(servicer.GetFileHistory(request, FakeContext()))
+
+    deleted_version = next(v for v in response.versions if v.deleted)
+    assert deleted_version.related_path == "old-note.md"
+    not_deleted_version = next(v for v in response.versions if not v.deleted)
+    assert not_deleted_version.related_path is None
+
+
 def test_get_file_history_for_unknown_path_returns_empty_versions(tmp_path, repo):
     servicer, _ = make_servicer_with_one_history_entry(tmp_path, repo)
 

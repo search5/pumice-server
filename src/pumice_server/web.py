@@ -3,7 +3,6 @@ import json
 import logging
 import re
 import os
-import shutil
 import uuid
 from babel.messages.pofile import read_po
 from babel.support import Translations
@@ -673,133 +672,6 @@ def oauth_token_view(request):
         "access_token": access_token,
         "token_type": "bearer",
     }
-
-# 1. API for looking up a file's backup version history
-@view_config(route_name='get_history', renderer='json', permission='vault-access')
-def get_history_view(request):
-    vault_id = request.context.vault_id
-    path = request.params.get("path")
-    if not path:
-        return Response(body=json.dumps({"error": "Missing vault_id or path"}).encode("utf-8"), status=400, content_type="application/json")
-
-    try:
-        history_rows = request.repository.get_history(request.context.owner, vault_id, path)
-        versions = []
-        for row in history_rows:
-            versions.append({
-                "history_id": row["history_id"],
-                "modified_at_ms": row["modified_at_ms"],
-                "size_bytes": row["size_bytes"],
-                "content_hash": row["content_hash"],
-                "device_name": row.get("device_name", "Unknown Device"),
-                "user_name": row.get("user_name", "Unknown User"),
-                "deleted": bool(row.get("deleted", False)),
-                "related_path": row.get("related_path"),
-            })
-        return {"versions": versions}
-    except Exception as e:
-        logger.error(f"HTTP get_history failed for {path}: {e}")
-        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
-
-# 2. API for downloading a specific version's file (binary response)
-@view_config(route_name='download_history', permission='vault-access')
-def download_history_view(request):
-    history_id_str = request.params.get("history_id")
-    if not history_id_str:
-        return Response("Missing vault_id or history_id", status=400)
-
-    try:
-        history_id = int(history_id_str)
-        row = request.repository.get_history_by_id(request.context.owner, history_id)
-        if not row:
-            return Response("History version not found", status=404)
-            
-        backup_file_path = row["backup_file_path"]
-        if not os.path.exists(backup_file_path):
-            return Response("Backup file not found on disk", status=404)
-            
-        with open(backup_file_path, 'rb') as f:
-            file_data = f.read()
-            
-        response = Response(body=file_data, content_type="application/octet-stream")
-        response.headers["X-File-Path"] = quote(row["path"])
-        response.headers["X-File-Size"] = str(row["size_bytes"])
-        response.headers["X-File-Mtime"] = str(row["modified_at_ms"])
-        return response
-    except Exception as e:
-        logger.error(f"HTTP download_history failed: {e}")
-        return Response(str(e), status=500)
-
-# 3. API for restoring a server-side file to a specific version (POST)
-@view_config(route_name='restore_history', renderer='json', permission='vault-access')
-def restore_history_view(request):
-    try:
-        vault_id = request.context.vault_id
-        body = request.json_body
-        history_id = body.get("history_id")
-        req_path = body.get("path", "")
-
-        if history_id is None:
-            return Response(body=json.dumps({"error": "Missing vault_id or history_id"}).encode("utf-8"), status=400, content_type="application/json")
-
-        row = request.repository.get_history_by_id(request.context.owner, history_id)
-        if not row:
-            return {"ok": False, "error": "History version not found"}
-
-        backup_file_path = row["backup_file_path"]
-        if not os.path.exists(backup_file_path):
-            return {"ok": False, "error": "Backup file not found on disk"}
-
-        target_path = req_path if req_path else row["path"]
-
-        data_dir = request.registry.settings.get("data_dir")
-        vault_path = get_vault_path(data_dir, request.context.owner, vault_id)
-        dest_file_path = os.path.join(vault_path, target_path)
-        
-        if not dest_file_path.startswith(os.path.abspath(vault_path)):
-            return {"ok": False, "error": "Invalid target path (escape attempt)"}
-            
-        os.makedirs(os.path.dirname(dest_file_path), exist_ok=True)
-        if os.path.exists(dest_file_path):
-            os.remove(dest_file_path)
-        shutil.copy2(backup_file_path, dest_file_path)
-        
-        current_mtime_ms = int(time.time() * 1000)
-        mtime_sec = current_mtime_ms / 1000.0
-        os.utime(dest_file_path, (mtime_sec, mtime_sec))
-        
-        meta = {
-            "path": target_path,
-            "modified_at_ms": current_mtime_ms,
-            "size_bytes": row["size_bytes"],
-            "content_hash": row["content_hash"],
-            "is_deleted": False
-        }
-        request.repository.save_one(request.context.owner, vault_id, target_path, meta)
-
-        try:
-            device_name = unquote(request.headers.get("X-Device-Name", "Unknown Device"))
-            user_name = unquote(request.headers.get("X-User-Name", "Unknown User"))
-
-            request.repository.add_history(
-                owner_username=request.context.owner,
-                vault_id=vault_id,
-                path=target_path,
-                modified_at_ms=current_mtime_ms,
-                size_bytes=row["size_bytes"],
-                content_hash=row["content_hash"],
-                backup_file_path=backup_file_path,
-                device_name=device_name,
-                user_name=user_name
-            )
-            logger.info(f"Restore version history added for {target_path} referencing {backup_file_path}")
-        except Exception as backup_err:
-            logger.error(f"Failed to record restore version history for {target_path}: {backup_err}")
-            
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"HTTP restore_history failed: {e}")
-        return {"ok": False, "error": str(e)}
 
 FRONTMATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
 
@@ -1813,9 +1685,6 @@ def create_pyramid_app(repository, data_dir):
     config.add_route('oauth_register', '/oauth/register')
     config.add_route('oauth_authorize', '/oauth/authorize')
     config.add_route('oauth_token', '/oauth/token')
-    config.add_route('get_history', '/api/history', factory=VaultContext)
-    config.add_route('download_history', '/api/history/download', factory=VaultContext)
-    config.add_route('restore_history', '/api/history/restore', factory=VaultContext)
     config.add_route('publish_list', '/api/list', factory=VaultContext)
     config.add_route('publish_upload', '/api/upload', factory=VaultContext)
     config.add_route('publish_remove', '/api/remove', factory=VaultContext)
