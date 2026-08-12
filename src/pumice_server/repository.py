@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Index, inspect,
     BigInteger, Integer, String, Boolean, Text,
-    select, insert, update, delete,
+    select, insert, update, delete, func,
 )
 from sqlalchemy.pool import StaticPool
 
@@ -148,6 +148,18 @@ class MetadataRepository(ABC):
 
     @abstractmethod
     def get_vaults_by_owner(self, owner_username: str) -> list:
+        pass
+
+    @abstractmethod
+    def get_vault_size_bytes(self, owner_username: str, vault_id: str) -> int:
+        pass
+
+    @abstractmethod
+    def get_total_size_bytes(self, owner_username: str) -> int:
+        pass
+
+    @abstractmethod
+    def purge_vault(self, owner_username: str, vault_id: str) -> list:
         pass
 
     @abstractmethod
@@ -730,6 +742,52 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 )
             ).fetchall()}
             return sorted(meta_ids | pub_ids)
+
+    def get_vault_size_bytes(self, owner_username: str, vault_id: str) -> int:
+        with self.engine.connect() as conn:
+            total = conn.execute(
+                select(func.sum(self._file_metadata.c.size_bytes)).where(
+                    self._file_metadata.c.owner_username == owner_username,
+                    self._file_metadata.c.vault_id == vault_id,
+                    self._file_metadata.c.is_deleted.is_(False),
+                )
+            ).scalar()
+            return int(total) if total is not None else 0
+
+    def get_total_size_bytes(self, owner_username: str) -> int:
+        with self.engine.connect() as conn:
+            total = conn.execute(
+                select(func.sum(self._file_metadata.c.size_bytes)).where(
+                    self._file_metadata.c.owner_username == owner_username,
+                    self._file_metadata.c.is_deleted.is_(False),
+                )
+            ).scalar()
+            return int(total) if total is not None else 0
+
+    def purge_vault(self, owner_username: str, vault_id: str) -> list:
+        """Deletes every file_metadata/file_history row for (owner, vault) and returns the
+        removed history rows' backup_file_path list -- this class never touches the filesystem
+        itself (see the rest of this file), so the caller (service.py, which already owns
+        _backup_file/_finalize_uploaded_file's disk I/O) is responsible for actually deleting
+        those backup files and the vault's own directory."""
+        with self.engine.begin() as conn:
+            backup_paths = [
+                r.backup_file_path for r in conn.execute(
+                    select(self._file_history.c.backup_file_path).where(
+                        self._file_history.c.owner_username == owner_username,
+                        self._file_history.c.vault_id == vault_id,
+                    )
+                ).fetchall()
+            ]
+            conn.execute(delete(self._file_history).where(
+                self._file_history.c.owner_username == owner_username,
+                self._file_history.c.vault_id == vault_id,
+            ))
+            conn.execute(delete(self._file_metadata).where(
+                self._file_metadata.c.owner_username == owner_username,
+                self._file_metadata.c.vault_id == vault_id,
+            ))
+            return backup_paths
 
     def get_all_users(self) -> list:
         with self.engine.connect() as conn:

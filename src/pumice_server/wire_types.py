@@ -146,3 +146,45 @@ class RestoreHistoryRequest:
 class RestoreHistoryResponse:
     ok: bool
     error: str = ""
+
+
+# ─── size / purge / usernames (2026-08 Obsidian core Sync WS fidelity follow-up -- see
+# #11_websocket_동기화_프로토콜_설계.md's re-analysis) ───────────────────────────────────────
+
+
+@dataclass
+class SizeRequest:
+    vault_id: str
+
+
+@dataclass
+class SizeResponse:
+    # -1 means "no limit configured" -- this project has no quota system (see service.py's
+    # GetSize docstring), matching the real client's own -1 sentinel when it can't reach a
+    # server at all.
+    vault_size_bytes: int
+    total_size_bytes: int
+    limit_bytes: int = -1
+
+
+@dataclass
+class PurgeRequest:
+    vault_id: str
+
+
+@dataclass
+class PurgeResponse:
+    ok: bool
+    error: str = ""
+
+
+@dataclass
+class UsernamesRequest:
+    vault_id: str
+
+
+@dataclass
+class UsernamesResponse:
+    # Placeholder: always exactly [the authenticated caller's own username] until pumice has an
+    # actual multi-user vault-sharing/ACL system -- see service.py's GetUsernames docstring.
+    usernames: List[str] = field(default_factory=list)

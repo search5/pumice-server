@@ -151,12 +151,37 @@ async def _handle_restore(session: "SyncWsSession", payload: dict):
     return "restore_res", {"ok": response.ok, "error": response.error}
 
 
+async def _handle_size(session: "SyncWsSession", payload: dict):
+    request = wire_types.SizeRequest(vault_id=payload.get("vaultId", ""))
+    response = await session.servicer.GetSize(request, WsServicerContext(session))
+    return "size_res", {
+        "vaultSizeBytes": response.vault_size_bytes,
+        "totalSizeBytes": response.total_size_bytes,
+        "limitBytes": response.limit_bytes,
+    }
+
+
+async def _handle_purge(session: "SyncWsSession", payload: dict):
+    request = wire_types.PurgeRequest(vault_id=payload.get("vaultId", ""))
+    response = await session.servicer.PurgeVault(request, WsServicerContext(session))
+    return "purge_res", {"ok": response.ok, "error": response.error}
+
+
+async def _handle_usernames(session: "SyncWsSession", payload: dict):
+    request = wire_types.UsernamesRequest(vault_id=payload.get("vaultId", ""))
+    response = await session.servicer.GetUsernames(request, WsServicerContext(session))
+    return "usernames_res", {"usernames": response.usernames}
+
+
 # Ops that need an async servicer call, dispatched after authentication. init/ping are handled
 # synchronously by SyncWsSession itself -- see handle_text_message.
 _REQUEST_HANDLERS: Dict[str, Callable] = {
     "delta_req": _handle_delta,
     "history_req": _handle_history,
     "restore_req": _handle_restore,
+    "size_req": _handle_size,
+    "purge_req": _handle_purge,
+    "usernames_req": _handle_usernames,
 }
 
 

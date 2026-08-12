@@ -176,6 +176,48 @@ def test_history_req_for_unknown_path_returns_empty_versions(tmp_path, repo):
     assert sender.last["payload"]["versions"] == []
 
 
+# ─── size_req / purge_req / usernames_req (2026-08 Obsidian core fidelity follow-up) ───────
+
+
+def test_size_req_returns_vault_and_total_size(tmp_path, repo):
+    vault_path = tmp_path / "vaults" / "alice" / "vault1"
+    vault_path.mkdir(parents=True)
+    (vault_path / "note.md").write_text("hello")
+    session, sender, servicer = make_authenticated_session(tmp_path, repo)
+    servicer._scan_and_merge(str(vault_path), "alice", "vault1")
+
+    run(session.handle_text_message('{"requestId":7,"op":"size_req","payload":{"vaultId":"vault1"}}'))
+
+    assert sender.last["op"] == "size_res"
+    assert sender.last["payload"] == {"vaultSizeBytes": 5, "totalSizeBytes": 5, "limitBytes": -1}
+
+
+def test_purge_req_removes_the_vault_and_a_later_delta_sees_nothing_left(tmp_path, repo):
+    vault_path = tmp_path / "vaults" / "alice" / "vault1"
+    vault_path.mkdir(parents=True)
+    (vault_path / "note.md").write_text("hello")
+    session, sender, servicer = make_authenticated_session(tmp_path, repo)
+    servicer._scan_and_merge(str(vault_path), "alice", "vault1")
+
+    run(session.handle_text_message('{"requestId":8,"op":"purge_req","payload":{"vaultId":"vault1"}}'))
+
+    assert sender.last["op"] == "purge_res"
+    assert sender.last["payload"] == {"ok": True, "error": ""}
+    assert not vault_path.exists()
+
+    run(session.handle_text_message('{"requestId":9,"op":"delta_req","payload":{"vaultId":"vault1","localFiles":[]}}'))
+    assert sender.last["payload"]["needDownload"] == []
+
+
+def test_usernames_req_returns_only_the_caller(tmp_path, repo):
+    session, sender, _ = make_authenticated_session(tmp_path, repo)
+
+    run(session.handle_text_message('{"requestId":10,"op":"usernames_req","payload":{"vaultId":"vault1"}}'))
+
+    assert sender.last["op"] == "usernames_res"
+    assert sender.last["payload"] == {"usernames": ["alice"]}
+
+
 # ─── push (ChangeNotifier wiring via on_authenticated) ─────────────────────────────────────
 
 

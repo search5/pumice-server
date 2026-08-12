@@ -928,3 +928,50 @@ class SyncServiceServicer:
         except Exception as e:
             logger.error(f"RestoreHistoryVersion failed: {e}")
             return wire_types.RestoreHistoryResponse(ok=False, error=str(e))
+
+    async def GetSize(self, request, context):
+        """Mirrors Obsidian core's own Sync client's size() -- see
+        #11_websocket_동기화_프로토콜_설계.md's re-analysis. limit_bytes is always -1 (no
+        limit): this project has no per-account storage quota system, unlike the hosted service
+        core's own client talks to."""
+        owner_username = self._verify_vault_access(request.vault_id, context)
+        vault_size = await asyncio.to_thread(self.repository.get_vault_size_bytes, owner_username, request.vault_id)
+        total_size = await asyncio.to_thread(self.repository.get_total_size_bytes, owner_username)
+        return wire_types.SizeResponse(vault_size_bytes=vault_size, total_size_bytes=total_size, limit_bytes=-1)
+
+    async def PurgeVault(self, request, context):
+        """Mirrors Obsidian core's own Sync client's purge() (the settings screen's destructive
+        "purge remote data" button) -- see #11_websocket_동기화_프로토콜_설계.md's re-analysis.
+        Irreversible: deletes every metadata row, history row, and history backup file for this
+        (owner, vault), then the vault's own file directory. Deliberately does not touch the
+        client's local files or trigger a fresh Delta for other connected sessions of this vault
+        -- that's for a caller to handle (see ws_sync_resource.py's wiring)."""
+        try:
+            owner_username = self._verify_vault_access(request.vault_id, context)
+            backup_paths = await asyncio.to_thread(self.repository.purge_vault, owner_username, request.vault_id)
+            for backup_path in backup_paths:
+                try:
+                    if os.path.exists(backup_path):
+                        await asyncio.to_thread(os.remove, backup_path)
+                except Exception as backup_err:
+                    logger.error(f"Failed to remove history backup {backup_path} during purge: {backup_err}")
+
+            vault_path = self._get_vault_path(owner_username, request.vault_id)
+            if os.path.exists(vault_path):
+                await asyncio.to_thread(shutil.rmtree, vault_path)
+
+            logger.info(f"Vault purged: owner={owner_username}, vault={request.vault_id}")
+            return wire_types.PurgeResponse(ok=True)
+        except Exception as e:
+            logger.error(f"PurgeVault failed: {e}")
+            return wire_types.PurgeResponse(ok=False, error=str(e))
+
+    async def GetUsernames(self, request, context):
+        """Placeholder pending a real multi-user vault-sharing/ACL system -- pumice's current
+        authorization model is strictly one vault per one owning account
+        (_verify_vault_access above), so there is nothing else to list yet. Mirrors Obsidian
+        core's own Sync client's getUsernames() (used there to attribute history entries to
+        collaborators on a shared vault) -- see #11_websocket_동기화_프로토콜_설계.md's
+        re-analysis and wire_types.UsernamesResponse's docstring."""
+        owner_username = self._verify_vault_access(request.vault_id, context)
+        return wire_types.UsernamesResponse(usernames=[owner_username])

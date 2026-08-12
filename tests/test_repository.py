@@ -250,3 +250,69 @@ def test_delete_plugin_config_entry_only_affects_the_matching_entry(repo):
 
     result = repo.get_plugin_config_entries("alice", "vault-1", "pumice-plugin-immich")
     assert result == {"profile-def": {"config_blob_b64": "blob-def", "updated_at_ms": 1000}}
+
+
+# ─── vault size / purge (2026-08 Obsidian Sync WS fidelity follow-up) ─────────────────────────
+# size()/purge() in the real Sync client -- see #11_websocket_동기화_프로토콜_설계.md's
+# re-analysis. save_one() is used to seed file rows the same way service.py's real callers do.
+
+
+def test_get_vault_size_bytes_sums_non_deleted_files_only(repo):
+    repo.save_one("alice", "vault-1", "a.md", {"modified_at_ms": 1, "size_bytes": 100, "content_hash": "h1", "is_deleted": False})
+    repo.save_one("alice", "vault-1", "b.md", {"modified_at_ms": 1, "size_bytes": 50, "content_hash": "h2", "is_deleted": False})
+    repo.save_one("alice", "vault-1", "c.md", {"modified_at_ms": 1, "size_bytes": 9999, "content_hash": "h3", "is_deleted": True})
+
+    assert repo.get_vault_size_bytes("alice", "vault-1") == 150
+
+
+def test_get_vault_size_bytes_is_zero_for_an_empty_vault(repo):
+    assert repo.get_vault_size_bytes("alice", "vault-1") == 0
+
+
+def test_get_vault_size_bytes_scopes_by_owner_and_vault(repo):
+    repo.save_one("alice", "vault-1", "a.md", {"modified_at_ms": 1, "size_bytes": 100, "content_hash": "h1", "is_deleted": False})
+    repo.save_one("alice", "vault-2", "b.md", {"modified_at_ms": 1, "size_bytes": 200, "content_hash": "h2", "is_deleted": False})
+    repo.save_one("bob", "vault-1", "c.md", {"modified_at_ms": 1, "size_bytes": 300, "content_hash": "h3", "is_deleted": False})
+
+    assert repo.get_vault_size_bytes("alice", "vault-1") == 100
+
+
+def test_get_total_size_bytes_sums_every_vault_the_owner_has(repo):
+    repo.save_one("alice", "vault-1", "a.md", {"modified_at_ms": 1, "size_bytes": 100, "content_hash": "h1", "is_deleted": False})
+    repo.save_one("alice", "vault-2", "b.md", {"modified_at_ms": 1, "size_bytes": 200, "content_hash": "h2", "is_deleted": False})
+    repo.save_one("bob", "vault-1", "c.md", {"modified_at_ms": 1, "size_bytes": 300, "content_hash": "h3", "is_deleted": False})
+
+    assert repo.get_total_size_bytes("alice") == 300
+
+
+def test_purge_vault_removes_metadata_and_history_and_returns_backup_paths(repo):
+    repo.save_one("alice", "vault-1", "a.md", {"modified_at_ms": 1, "size_bytes": 100, "content_hash": "h1", "is_deleted": False})
+    repo.add_history(
+        owner_username="alice", vault_id="vault-1", path="a.md", modified_at_ms=1,
+        size_bytes=100, content_hash="h1", backup_file_path="/data/history/alice/vault-1/x.bak",
+        device_name="dev", user_name="user",
+    )
+
+    removed_backup_paths = repo.purge_vault("alice", "vault-1")
+
+    assert removed_backup_paths == ["/data/history/alice/vault-1/x.bak"]
+    assert repo.load_all("alice", "vault-1") == {}
+    assert repo.get_history("alice", "vault-1", "a.md") == []
+
+
+def test_purge_vault_only_affects_the_matching_owner_and_vault(repo):
+    repo.save_one("alice", "vault-1", "a.md", {"modified_at_ms": 1, "size_bytes": 100, "content_hash": "h1", "is_deleted": False})
+    repo.save_one("alice", "vault-2", "b.md", {"modified_at_ms": 1, "size_bytes": 200, "content_hash": "h2", "is_deleted": False})
+    repo.save_one("bob", "vault-1", "c.md", {"modified_at_ms": 1, "size_bytes": 300, "content_hash": "h3", "is_deleted": False})
+
+    repo.purge_vault("alice", "vault-1")
+
+    assert repo.load_all("alice", "vault-1") == {}
+    assert list(repo.load_all("alice", "vault-2").keys()) == ["b.md"]
+    assert list(repo.load_all("bob", "vault-1").keys()) == ["c.md"]
+
+
+def test_purge_vault_is_a_no_op_for_an_already_empty_vault(repo):
+    removed_backup_paths = repo.purge_vault("alice", "vault-1")
+
+    assert removed_backup_paths == []
