@@ -143,6 +143,12 @@ def test_single_file_upload_round_trip_writes_the_file_and_acks(tmp_path, repo):
     written = tmp_path / "vaults" / "alice" / "vault1" / "note.md"
     assert written.read_bytes() == content
 
+    # Explicit terminal signal -- the client has no other reliable way to know a streaming op's
+    # requestId is fully done (counting acks/eofs against what it sent isn't enough for
+    # downloads, since the server can silently skip a requested path -- see the module note).
+    [end] = sender.json_messages("stream_end")
+    assert end["requestId"] == 10
+
 
 def test_two_file_batch_upload_sends_two_acks_and_only_finalizes_after_both(tmp_path, repo):
     session, sender, servicer = make_authenticated_session(tmp_path, repo)
@@ -191,13 +197,28 @@ def test_download_req_streams_header_binary_eof_in_order(tmp_path, repo):
     coro = send_text(session, 40, "download_req", {"vaultId": "vault1", "paths": ["note.md"]})
     run(coro)
 
-    kinds = [kind for kind, _ in sender.sent if kind != "json" or _["op"] != "init_ok"]
     header = sender.json_messages("file_chunk_header")[-1]
     eof = sender.json_messages("file_chunk_eof")[-1]
     assert header["requestId"] == 40 and header["payload"]["path"] == "note.md"
     assert eof["requestId"] == 40 and eof["payload"]["contentHash"] == hashlib.sha256(content).hexdigest()
     assert b"".join(sender.binary_frames()) == content
     assert session._active_stream_request_id is None
+    [end] = sender.json_messages("stream_end")
+    assert end["requestId"] == 40
+
+
+def test_download_req_sends_stream_end_even_when_a_requested_path_is_silently_skipped(tmp_path, repo):
+    # DownloadFiles just returns early for a path that doesn't exist server-side -- no header,
+    # no eof, no ack. stream_end is the only signal the client has that this requestId is done.
+    vault_path = tmp_path / "vaults" / "alice" / "vault1"
+    vault_path.mkdir(parents=True)
+    session, sender, servicer = make_authenticated_session(tmp_path, repo)
+
+    run(send_text(session, 45, "download_req", {"vaultId": "vault1", "paths": ["does-not-exist.md"]}))
+
+    assert sender.json_messages("file_chunk_header") == []
+    [end] = sender.json_messages("stream_end")
+    assert end["requestId"] == 45
 
 
 def test_history_dl_req_streams_a_backed_up_version(tmp_path, repo):

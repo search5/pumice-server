@@ -364,6 +364,13 @@ class SyncWsSession:
         except Exception as e:
             logger.error(f"WS stream op '{op}' failed: {e}")
             self._send_error(request_id, "INTERNAL", str(e))
+        else:
+            # Explicit terminal signal -- a download_req/history_dl_req batch can silently skip
+            # paths that don't exist server-side (DownloadFiles just returns early for those,
+            # no ack), so the client can't reliably infer "done" just by counting per-file
+            # header/eof pairs against what it asked for. Only sent on success: an error frame
+            # above already tells the client the requestId is finished.
+            self._send({"requestId": request_id, "op": "stream_end", "payload": {}})
         finally:
             self._active_stream_request_id = None
 
@@ -421,6 +428,12 @@ class SyncWsSession:
         except Exception as e:
             logger.error(f"WS upload (request {request_id}) failed: {e}")
             self._send_error(request_id, "INTERNAL", str(e))
+        else:
+            # Same terminal signal as the download/history-download streams (see
+            # _run_stream_request) -- keeps the client's "how do I know this requestId is done"
+            # logic uniform across every streaming op instead of needing upload-specific
+            # ack-counting against fileCount.
+            self._send({"requestId": request_id, "op": "stream_end", "payload": {}})
         finally:
             self._active_stream_request_id = None
 
