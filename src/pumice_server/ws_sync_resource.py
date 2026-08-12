@@ -19,14 +19,19 @@ SyncWebSocketProtocol is the thin autobahn glue on top: it owns the actual socke
 init-timeout timer, and wires onMessage/onClose to a SyncWsSession instance.
 """
 
+import asyncio
 import json
 import logging
 import time
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import quote
 
+import grpc
 from autobahn.twisted.websocket import WebSocketServerProtocol, WebSocketServerFactory
 from autobahn.twisted.resource import WebSocketResource
 from twisted.internet import reactor as _default_reactor
+
+from . import sync_pb2
 
 logger = logging.getLogger(__name__)
 
@@ -40,22 +45,140 @@ MAX_IN_FLIGHT = 8
 SendFn = Callable[[Dict[str, Any]], None]
 
 
+class WsAborted(Exception):
+    """Raised by WsServicerContext.abort(), mirroring grpc_web_resource.py's Aborted -- kept as
+    a separate class (not imported from there) so this module has no dependency on
+    grpc_web_resource.py, which is slated for removal once the gRPC-Web transport is retired."""
+
+    def __init__(self, code: grpc.StatusCode, details: str):
+        super().__init__(details)
+        self.code = code
+        self.details = details
+
+
+class WsServicerContext:
+    """grpc.ServicerContext-shaped adapter that lets SyncServiceServicer's existing async
+    methods run completely unmodified over a WS connection. Auth already happened once, in the
+    init handshake (SyncWsSession) -- invocation_metadata() re-synthesizes the equivalent of the
+    old Authorization/x-device-name/x-user-name headers from the session's already-verified
+    identity so _verify_vault_access's per-call token lookup (unchanged) still works exactly as
+    it does for gRPC-Web."""
+
+    def __init__(self, session: "SyncWsSession"):
+        self._session = session
+        self.code = grpc.StatusCode.OK
+        self.details: Optional[str] = None
+
+    def invocation_metadata(self):
+        return [
+            ("authorization", f"Bearer {self._session.token}"),
+            ("x-device-name", quote(self._session.device_name)),
+            ("x-user-name", quote(self._session.user_name)),
+        ]
+
+    def abort(self, code: grpc.StatusCode, details: str):
+        self.code = code
+        self.details = details
+        raise WsAborted(code, details)
+
+
+# ─── payload <-> protobuf conversion (temporary boundary layer -- see PR2 note in
+# #11_websocket_동기화_프로토콜_설계.md: SyncServiceServicer keeps speaking protobuf internally
+# until sync.proto itself is removed in the final PR; only the WS edge translates JSON <-> pb) ──
+
+
+def _file_meta_from_dict(d: dict) -> "sync_pb2.FileMeta":
+    return sync_pb2.FileMeta(
+        path=d.get("path", ""),
+        modified_at_ms=d.get("modifiedAtMs", 0),
+        size_bytes=d.get("sizeBytes", 0),
+        content_hash=d.get("contentHash", ""),
+        is_deleted=d.get("isDeleted", False),
+    )
+
+
+def _file_meta_to_dict(m: "sync_pb2.FileMeta") -> dict:
+    return {
+        "path": m.path,
+        "modifiedAtMs": m.modified_at_ms,
+        "sizeBytes": m.size_bytes,
+        "contentHash": m.content_hash,
+        "isDeleted": m.is_deleted,
+    }
+
+
+async def _handle_delta(session: "SyncWsSession", payload: dict):
+    request = sync_pb2.DeltaRequest(
+        vault_id=payload.get("vaultId", ""),
+        local_files=[_file_meta_from_dict(f) for f in payload.get("localFiles", [])],
+    )
+    response = await session.servicer.Delta(request, WsServicerContext(session))
+    return "delta_res", {
+        "needUpload": list(response.need_upload),
+        "needDownload": [_file_meta_to_dict(m) for m in response.need_download],
+    }
+
+
+async def _handle_history(session: "SyncWsSession", payload: dict):
+    request = sync_pb2.HistoryRequest(vault_id=payload.get("vaultId", ""), path=payload.get("path", ""))
+    response = await session.servicer.GetFileHistory(request, WsServicerContext(session))
+    return "history_res", {
+        "versions": [
+            {
+                "historyId": v.history_id,
+                "modifiedAtMs": v.modified_at_ms,
+                "sizeBytes": v.size_bytes,
+                "contentHash": v.content_hash,
+                "deviceName": v.device_name,
+                "userName": v.user_name,
+            }
+            for v in response.versions
+        ],
+    }
+
+
+async def _handle_restore(session: "SyncWsSession", payload: dict):
+    request = sync_pb2.RestoreHistoryRequest(
+        vault_id=payload.get("vaultId", ""),
+        path=payload.get("path", ""),
+        history_id=payload.get("historyId", 0),
+    )
+    response = await session.servicer.RestoreHistoryVersion(request, WsServicerContext(session))
+    return "restore_res", {"ok": response.ok, "error": response.error}
+
+
+# Ops that need an async servicer call, dispatched after authentication. init/ping are handled
+# synchronously by SyncWsSession itself -- see handle_text_message.
+_REQUEST_HANDLERS: Dict[str, Callable] = {
+    "delta_req": _handle_delta,
+    "history_req": _handle_history,
+    "restore_req": _handle_restore,
+}
+
+
 class SyncWsSession:
-    def __init__(self, repository, send: SendFn):
+    def __init__(self, repository, servicer, send: SendFn, on_authenticated: Optional[Callable[[str, str], None]] = None):
         self.repository = repository
+        self.servicer = servicer
         self._send = send
+        self._on_authenticated = on_authenticated
         self.authenticated = False
         self.owner_username: Optional[str] = None
         self.vault_id: Optional[str] = None
         self.device_name: str = ""
         self.user_name: str = ""
+        self.token: str = ""
 
-    def handle_text_message(self, raw: str) -> None:
+    def handle_text_message(self, raw: str) -> Optional["asyncio.Future"]:
+        """Handles one text frame. init/ping/parse-errors are resolved synchronously (return
+        None). An RPC op (once authenticated) returns a coroutine the caller must schedule
+        (e.g. asyncio.ensure_future) -- kept as a plain coroutine rather than being scheduled
+        in here so this stays synchronously testable without a running event loop."""
         try:
             envelope = json.loads(raw)
         except (ValueError, TypeError):
             self._send_error(0, "INVALID_JSON", "Malformed JSON message")
-            return
+            return None
 
         request_id = envelope.get("requestId", 0)
         op = envelope.get("op")
@@ -64,14 +187,31 @@ class SyncWsSession:
         if not self.authenticated:
             if op != "init":
                 self._send_error(request_id, "UNAUTHENTICATED", "Must send init first")
-                return
+                return None
             self._handle_init(request_id, payload)
-            return
+            return None
 
         if op == "ping":
             self._send_pong(request_id)
-        else:
+            return None
+
+        handler = _REQUEST_HANDLERS.get(op)
+        if handler is None:
             self._send_error(request_id, "UNKNOWN_OP", f"Unknown op: {op}")
+            return None
+
+        return self._run_request(request_id, op, handler, payload)
+
+    async def _run_request(self, request_id: int, op: str, handler: Callable, payload: dict) -> None:
+        try:
+            response_op, response_payload = await handler(self, payload)
+        except WsAborted as e:
+            self._send_error(request_id, e.code.name, e.details or "")
+        except Exception as e:
+            logger.error(f"WS op '{op}' failed: {e}")
+            self._send_error(request_id, "INTERNAL", str(e))
+        else:
+            self._send({"requestId": request_id, "op": response_op, "payload": response_payload})
 
     def _handle_init(self, request_id: int, payload: dict) -> None:
         token = payload.get("token", "")
@@ -90,6 +230,7 @@ class SyncWsSession:
         self.vault_id = vault_id
         self.device_name = payload.get("deviceName", "")
         self.user_name = payload.get("userName", "")
+        self.token = token
 
         self._send({
             "requestId": request_id,
@@ -100,6 +241,9 @@ class SyncWsSession:
                 "maxInFlight": MAX_IN_FLIGHT,
             },
         })
+
+        if self._on_authenticated:
+            self._on_authenticated(self.owner_username, self.vault_id)
 
     def _send_pong(self, request_id: int) -> None:
         self._send({
@@ -117,24 +261,30 @@ class SyncWsSession:
 
 
 class SyncWebSocketProtocol(WebSocketServerProtocol):
-    def __init__(self, repository, reactor=None):
+    def __init__(self, repository, servicer, change_notifier=None, reactor=None):
         super().__init__()
         self._repository = repository
+        self._servicer = servicer
+        self._change_notifier = change_notifier
         self._reactor = reactor if reactor is not None else _default_reactor
         self._session: Optional[SyncWsSession] = None
         self._init_timeout_call = None
+        self._unsubscribe: Optional[Callable[[], None]] = None
 
     def onOpen(self):
-        self._session = SyncWsSession(self._repository, send=self._send_json)
+        self._session = SyncWsSession(self._repository, self._servicer, send=self._send_json,
+                                       on_authenticated=self._on_authenticated)
         self._init_timeout_call = self._reactor.callLater(INIT_TIMEOUT_SECONDS, self._on_init_timeout)
 
     def onMessage(self, payload, isBinary):
         if isBinary:
-            # File-chunk binary frames are handled once upload/download ops land (PR2).
+            # File-chunk binary frames are handled once upload/download ops land (a later PR).
             return
 
         assert self._session is not None
-        self._session.handle_text_message(payload.decode("utf-8"))
+        coro = self._session.handle_text_message(payload.decode("utf-8"))
+        if coro is not None:
+            asyncio.ensure_future(coro)
 
         if self._session.authenticated and self._init_timeout_call and self._init_timeout_call.active():
             self._init_timeout_call.cancel()
@@ -142,6 +292,16 @@ class SyncWebSocketProtocol(WebSocketServerProtocol):
     def onClose(self, wasClean, code, reason):
         if self._init_timeout_call and self._init_timeout_call.active():
             self._init_timeout_call.cancel()
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+
+    def _on_authenticated(self, owner_username: str, vault_id: str) -> None:
+        if self._change_notifier is not None:
+            self._unsubscribe = self._change_notifier.subscribe(owner_username, vault_id, self._on_change)
+
+    def _on_change(self) -> None:
+        assert self._session is not None
+        self._send_json({"requestId": 0, "op": "push", "payload": {"vaultId": self._session.vault_id}})
 
     def _on_init_timeout(self):
         if not self._session or not self._session.authenticated:
@@ -152,7 +312,7 @@ class SyncWebSocketProtocol(WebSocketServerProtocol):
         self.sendMessage(json.dumps(message).encode("utf-8"), isBinary=False)
 
 
-def make_ws_sync_resource(repository) -> WebSocketResource:
+def make_ws_sync_resource(repository, servicer, change_notifier=None) -> WebSocketResource:
     factory = WebSocketServerFactory()
-    factory.protocol = lambda: SyncWebSocketProtocol(repository)
+    factory.protocol = lambda: SyncWebSocketProtocol(repository, servicer, change_notifier)
     return WebSocketResource(factory)

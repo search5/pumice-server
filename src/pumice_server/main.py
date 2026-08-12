@@ -192,7 +192,7 @@ def main():
         streaming_resource = StreamingUploadResource(servicer, streaming_upload_metrics)
         watch_resource = WatchResource(repository, change_notifier)
         mcp_resource = McpResource(repository, args.data_dir)
-        ws_resource = make_ws_sync_resource(repository)
+        ws_resource = make_ws_sync_resource(repository, servicer, change_notifier)
 
         root_resource = RootResource(sync_resource, pyramid_resource, streaming_resource, watch_resource,
                                       mcp_resource, ws_resource)

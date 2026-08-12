@@ -39,9 +39,11 @@ class RecordingSender:
 
 
 def make_session(repository=None):
+    # servicer=None is fine here -- none of these tests exercise an RPC op (that needs a real
+    # servicer, see test_ws_sync_rpc_ops.py), only init/ping which never touch self.servicer.
     repository = repository or FakeRepository()
     sender = RecordingSender()
-    session = SyncWsSession(repository, sender)
+    session = SyncWsSession(repository, None, sender)
     return session, sender
 
 
