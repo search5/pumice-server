@@ -228,9 +228,10 @@ class _UploadAccumulator:
         self.chunks: list = []
         self.files_completed = 0
 
-    def add_header(self, path: str, total_bytes: int, modified_at_ms: int) -> None:
+    def add_header(self, path: str, total_bytes: int, modified_at_ms: int, content_hash: str = "") -> None:
         self.chunks.append(wire_types.FileChunk(header=wire_types.ChunkHeader(
             vault_id=self.vault_id, path=path, total_bytes=total_bytes, modified_at_ms=modified_at_ms,
+            content_hash=content_hash,
         )))
 
     def add_data(self, path: str, sequence: int, data: bytes) -> None:
@@ -385,7 +386,9 @@ class SyncWsSession:
             self._send_error(request_id, "INVALID_STATE", "file_chunk_header without an active upload_begin")
             return
         path = payload.get("path", "")
-        self._upload_accumulator.add_header(path, payload.get("totalBytes", 0), payload.get("modifiedAtMs", 0))
+        self._upload_accumulator.add_header(
+            path, payload.get("totalBytes", 0), payload.get("modifiedAtMs", 0), payload.get("contentHash", "")
+        )
         self._upload_current_path = path
         self._upload_current_sequence = 0
 
@@ -460,6 +463,7 @@ class SyncWsSession:
                 "serverVersion": "0.1.0",
                 "timestampMs": int(time.time() * 1000),
                 "maxInFlight": MAX_IN_FLIGHT,
+                "maxFileSizeBytes": self.servicer.max_file_size_bytes,
             },
         })
 

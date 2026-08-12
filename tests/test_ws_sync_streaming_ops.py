@@ -108,6 +108,22 @@ def test_upload_accumulator_builds_file_chunk_protos_in_order():
     assert all(isinstance(c, wire_types.FileChunk) for c in acc.chunks)
 
 
+def test_upload_accumulator_add_header_passes_through_the_declared_content_hash():
+    """Item 6 (2026-08 re-analysis follow-up): the header may now declare contentHash up front,
+    not just at eof -- see wire_types.ChunkHeader's docstring."""
+    acc = _UploadAccumulator(vault_id="v1", file_count=1)
+    acc.add_header("a.md", 3, 1000, content_hash="hash-a")
+
+    assert acc.chunks[0].header.content_hash == "hash-a"
+
+
+def test_upload_accumulator_add_header_defaults_content_hash_to_empty_string():
+    acc = _UploadAccumulator(vault_id="v1", file_count=1)
+    acc.add_header("a.md", 3, 1000)
+
+    assert acc.chunks[0].header.content_hash == ""
+
+
 # ─── _file_chunk_to_frame (pure) ────────────────────────────────────────────────────────────
 
 
@@ -184,6 +200,28 @@ def test_upload_hash_mismatch_is_acked_as_a_failure_not_a_crash(tmp_path, repo):
 
     [ack] = sender.json_messages("upload_ack")
     assert ack["payload"]["ok"] is False
+
+
+def test_upload_end_to_end_carries_the_header_content_hash_through_to_a_mismatch_rejection(tmp_path, repo):
+    """Item 6 (2026-08 re-analysis follow-up): a contentHash declared in file_chunk_header that
+    disagrees with the one declared at file_chunk_eof is rejected -- full WS round trip, not
+    just the pure _UploadAccumulator/service.py unit tests."""
+    session, sender, servicer = make_authenticated_session(tmp_path, repo)
+    content = b"hello from ws upload"
+    real_hash = hashlib.sha256(content).hexdigest()
+
+    send_text(session, 31, "upload_begin", {"vaultId": "vault1", "fileCount": 1})
+    send_text(session, 31, "file_chunk_header", {
+        "vaultId": "vault1", "path": "note.md", "totalBytes": len(content), "modifiedAtMs": 1000,
+        "contentHash": "declared-in-header-and-wrong",
+    })
+    session.handle_binary_frame(content)
+    coro = send_text(session, 31, "file_chunk_eof", {"path": "note.md", "contentHash": real_hash})
+    run(coro)
+
+    [ack] = sender.json_messages("upload_ack")
+    assert ack["payload"]["ok"] is False
+    assert "header" in ack["payload"]["error"].lower()
 
 
 # ─── download end-to-end ─────────────────────────────────────────────────────────────────────

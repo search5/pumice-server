@@ -44,6 +44,13 @@ class ChunkHeader:
     path: str
     total_bytes: int
     modified_at_ms: int
+    # Declared up front (not just at ChunkEOF), mirroring Obsidian core's own Sync client, whose
+    # single push op carries the hash before any bytes transfer -- see
+    # #11_websocket_동기화_프로토콜_설계.md's re-analysis. "" (the default) means the sender
+    # didn't declare one; service.py's UploadFiles only checks it against the eof hash when
+    # non-empty. Not used for dedup yet -- see that design doc note for the follow-up this sets
+    # up.
+    content_hash: str = ""
 
 
 @dataclass

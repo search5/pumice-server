@@ -82,3 +82,110 @@ def test_upload_files_hash_mismatch_is_acked_as_a_failure(tmp_path, repo):
     assert isinstance(acks[0], wire_types.UploadAck)
     assert acks[0].ok is False
     assert "Hash verification failed" in acks[0].error
+
+
+def test_upload_files_rejects_a_file_over_the_configured_max_size(tmp_path, repo):
+    """PR5 follow-up (item 5, 2026-08): mirrors Obsidian core's own Sync client, which has the
+    server advertise a perFileMax the client can check up front. Here the enforcement itself is
+    server-side -- see test_ws_sync_session.py for the init_ok advertisement half."""
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo, max_file_size_bytes=10)
+
+    request = wire_types.UploadBatch(chunks=[
+        wire_types.FileChunk(header=wire_types.ChunkHeader(
+            vault_id="vault1", path="big.md", total_bytes=11, modified_at_ms=1000)),
+    ])
+
+    acks = asyncio.run(_collect(servicer.UploadFiles(request, FakeContext())))
+
+    assert len(acks) == 1
+    assert acks[0].ok is False
+    assert "too large" in acks[0].error.lower()
+    # Rejected before any temp file was ever created for it.
+    assert not (tmp_path / "tmp").exists()
+
+
+def test_upload_files_accepts_a_file_exactly_at_the_configured_max_size(tmp_path, repo):
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo, max_file_size_bytes=5)
+    content = b"hello"
+    content_hash = hashlib.sha256(content).hexdigest()
+
+    request = wire_types.UploadBatch(chunks=[
+        wire_types.FileChunk(header=wire_types.ChunkHeader(
+            vault_id="vault1", path="note.md", total_bytes=len(content), modified_at_ms=1000)),
+        wire_types.FileChunk(data=wire_types.ChunkData(path="note.md", sequence=0, data=content)),
+        wire_types.FileChunk(eof=wire_types.ChunkEOF(path="note.md", content_hash=content_hash)),
+    ])
+
+    acks = asyncio.run(_collect(servicer.UploadFiles(request, FakeContext())))
+
+    assert len(acks) == 1
+    assert acks[0].ok is True
+
+
+def test_upload_files_accepts_a_header_content_hash_matching_the_eof_hash(tmp_path, repo):
+    """PR5 follow-up (item 6, 2026-08): the client now declares contentHash up front in the
+    header too (not just at eof) -- laying groundwork for a future dedup-skip optimization
+    (see #11_websocket_동기화_프로토콜_설계.md's re-analysis of Obsidian core's own push op,
+    which sends the hash before any bytes transfer). No dedup logic yet -- this just accepts
+    the extra field and expects it to agree with the eof hash."""
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo)
+    content = b"hello"
+    content_hash = hashlib.sha256(content).hexdigest()
+
+    request = wire_types.UploadBatch(chunks=[
+        wire_types.FileChunk(header=wire_types.ChunkHeader(
+            vault_id="vault1", path="note.md", total_bytes=len(content), modified_at_ms=1000,
+            content_hash=content_hash)),
+        wire_types.FileChunk(data=wire_types.ChunkData(path="note.md", sequence=0, data=content)),
+        wire_types.FileChunk(eof=wire_types.ChunkEOF(path="note.md", content_hash=content_hash)),
+    ])
+
+    acks = asyncio.run(_collect(servicer.UploadFiles(request, FakeContext())))
+
+    assert len(acks) == 1
+    assert acks[0].ok is True
+
+
+def test_upload_files_rejects_when_header_hash_disagrees_with_eof_hash(tmp_path, repo):
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo)
+    content = b"hello"
+    real_hash = hashlib.sha256(content).hexdigest()
+
+    request = wire_types.UploadBatch(chunks=[
+        wire_types.FileChunk(header=wire_types.ChunkHeader(
+            vault_id="vault1", path="note.md", total_bytes=len(content), modified_at_ms=1000,
+            content_hash="a-different-hash-than-eof-declares")),
+        wire_types.FileChunk(data=wire_types.ChunkData(path="note.md", sequence=0, data=content)),
+        wire_types.FileChunk(eof=wire_types.ChunkEOF(path="note.md", content_hash=real_hash)),
+    ])
+
+    acks = asyncio.run(_collect(servicer.UploadFiles(request, FakeContext())))
+
+    assert len(acks) == 1
+    assert acks[0].ok is False
+    assert "header" in acks[0].error.lower()
+
+
+def test_upload_files_treats_an_absent_header_hash_as_no_constraint(tmp_path, repo):
+    """Backward-compatible default: a header with no contentHash at all (content_hash="") skips
+    the consistency check entirely -- matches wire_types.ChunkHeader's default."""
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo)
+    content = b"hello"
+    real_hash = hashlib.sha256(content).hexdigest()
+
+    request = wire_types.UploadBatch(chunks=[
+        wire_types.FileChunk(header=wire_types.ChunkHeader(
+            vault_id="vault1", path="note.md", total_bytes=len(content), modified_at_ms=1000)),
+        wire_types.FileChunk(data=wire_types.ChunkData(path="note.md", sequence=0, data=content)),
+        wire_types.FileChunk(eof=wire_types.ChunkEOF(path="note.md", content_hash=real_hash)),
+    ])
+
+    acks = asyncio.run(_collect(servicer.UploadFiles(request, FakeContext())))
+
+    assert len(acks) == 1
+    assert acks[0].ok is True

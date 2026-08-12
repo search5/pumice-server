@@ -34,9 +34,12 @@ def _backup_file(src_path: str, dst_path: str) -> None:
     except OSError:
         shutil.copy2(src_path, dst_path)
 
+DEFAULT_MAX_FILE_SIZE_BYTES = 2 * 1024 ** 3  # 2 GiB -- see max_file_size_bytes below
+
+
 class SyncServiceServicer:
     def __init__(self, data_dir: str, repository: MetadataRepository, change_notifier=None,
-                 download_concurrency: int = 8):
+                 download_concurrency: int = 8, max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES):
         self.data_dir = data_dir
         self.vaults_dir = os.path.join(data_dir, "vaults")
         self.repository = repository
@@ -48,6 +51,12 @@ class SyncServiceServicer:
         # fresh vault's first sync that can be thousands of files -- and this used to spawn one
         # unbounded asyncio task per path (see DownloadFiles below).
         self._download_semaphore = asyncio.Semaphore(download_concurrency)
+        # Per-file upload cap, enforced in UploadFiles and advertised to the client as
+        # maxFileSizeBytes in init_ok (ws_sync_resource.py's _handle_init reads this attribute
+        # directly). No cap existed at all before this -- 2 GiB is a deliberately generous
+        # default chosen not to break any existing self-hosted deployment's real usage, matching
+        # this project's small/personal-scale design (see #11_websocket_동기화_프로토콜_설계.md).
+        self.max_file_size_bytes = max_file_size_bytes
         os.makedirs(self.vaults_dir, exist_ok=True)
 
     def _verify_vault_access(self, vault_id: str, context) -> str:
@@ -505,6 +514,7 @@ class SyncServiceServicer:
         total_bytes = 0
         received_bytes = 0
         modified_at_ms = 0
+        declared_header_hash = ""
         sha256_hash = None
         vault_id = None
 
@@ -549,6 +559,13 @@ class SyncServiceServicer:
                         yield wire_types.UploadAck(path=header.path, ok=False, error="Invalid file path")
                         continue
 
+                    # Reject before doing any temp-file/disk work -- advertised to the client as
+                    # maxFileSizeBytes in init_ok (see ws_sync_resource.py's _handle_init),
+                    # mirroring Obsidian core's own Sync client (perFileMax).
+                    if header.total_bytes > self.max_file_size_bytes:
+                        yield wire_types.UploadAck(path=header.path, ok=False, error="File too large")
+                        continue
+
                     vault_path = self._get_vault_path(owner_username, vault_id)
                     current_file_path = os.path.join(vault_path, current_rel_path)
 
@@ -575,6 +592,7 @@ class SyncServiceServicer:
 
                     total_bytes = header.total_bytes
                     modified_at_ms = header.modified_at_ms
+                    declared_header_hash = header.content_hash
                     received_bytes = 0
                     sha256_hash = hashlib.sha256()
 
@@ -611,6 +629,18 @@ class SyncServiceServicer:
                         if os.path.exists(current_temp_path):
                             os.remove(current_temp_path)
                         yield wire_types.UploadAck(path=chunk_path, ok=False, error="Path mismatch in eof chunk")
+                        continue
+
+                    # declared_header_hash is "" (not declared) for any sender that doesn't send
+                    # contentHash in the header yet -- see wire_types.ChunkHeader's docstring.
+                    # Only a genuine disagreement between the two declarations is rejected here;
+                    # this isn't a substitute for the calculated-vs-eof check right below.
+                    if declared_header_hash and declared_header_hash != eof_payload.content_hash:
+                        file_handle.close()
+                        file_handle = None
+                        if os.path.exists(current_temp_path):
+                            os.remove(current_temp_path)
+                        yield wire_types.UploadAck(path=chunk_path, ok=False, error="Header/eof content hash mismatch")
                         continue
 
                     file_handle.close()

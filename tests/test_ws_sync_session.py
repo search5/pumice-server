@@ -38,12 +38,21 @@ class RecordingSender:
         return self.sent[-1]
 
 
-def make_session(repository=None):
-    # servicer=None is fine here -- none of these tests exercise an RPC op (that needs a real
-    # servicer, see test_ws_sync_rpc_ops.py), only init/ping which never touch self.servicer.
+class FakeServicer:
+    """Stands in for the real SyncServiceServicer -- none of these tests exercise an actual RPC
+    op (that needs the real thing, see test_ws_sync_rpc_ops.py), only init/ping, but init_ok now
+    reads max_file_size_bytes off the servicer to advertise as maxFileSizeBytes (see
+    #11_websocket_동기화_프로토콜_설계.md's perFileMax re-analysis)."""
+
+    def __init__(self, max_file_size_bytes=2 * 1024 ** 3):
+        self.max_file_size_bytes = max_file_size_bytes
+
+
+def make_session(repository=None, servicer=None):
     repository = repository or FakeRepository()
+    servicer = servicer if servicer is not None else FakeServicer()
     sender = RecordingSender()
-    session = SyncWsSession(repository, None, sender)
+    session = SyncWsSession(repository, servicer, sender)
     return session, sender
 
 
@@ -66,6 +75,14 @@ def test_init_with_valid_token_authenticates_and_sends_init_ok():
     assert sender.last["requestId"] == 1
     assert sender.last["op"] == "init_ok"
     assert "maxInFlight" in sender.last["payload"]
+
+
+def test_init_ok_advertises_the_servicer_s_configured_max_file_size():
+    session, sender = make_session(servicer=FakeServicer(max_file_size_bytes=12345))
+
+    send_envelope(session, 1, "init", {"token": "tok", "vaultId": "vault1"})
+
+    assert sender.last["payload"]["maxFileSizeBytes"] == 12345
 
 
 def test_init_with_invalid_token_sends_unauthenticated_error():
