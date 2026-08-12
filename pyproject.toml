@@ -24,6 +24,7 @@ dependencies = [
     "pyramid-jinja2>=2.10.1",
     "babel>=2.18.0",
     "pumice-plugin-immich>=0.1.0",
+    "autobahn[twisted]>=26.7.1",
 ]
 
 [project.urls]

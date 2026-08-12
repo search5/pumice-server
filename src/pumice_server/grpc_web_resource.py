@@ -266,13 +266,15 @@ class RootResource(Resource):
 
     isLeaf = True
 
-    def __init__(self, sync_resource, fallback_resource, streaming_resource=None, watch_resource=None, mcp_resource=None):
+    def __init__(self, sync_resource, fallback_resource, streaming_resource=None, watch_resource=None,
+                 mcp_resource=None, ws_resource=None):
         super().__init__()
         self._sync_resource = sync_resource
         self._fallback_resource = fallback_resource
         self._streaming_resource = streaming_resource
         self._watch_resource = watch_resource
         self._mcp_resource = mcp_resource
+        self._ws_resource = ws_resource
 
     def render(self, request):
         # Checked before the generic SyncService prefix below -- the streaming upload path
@@ -286,6 +288,11 @@ class RootResource(Resource):
         # docstring for why it's deliberately outside sync.proto entirely.
         if self._watch_resource is not None and request.path == b"/watch":
             return self._watch_resource.render(request)
+        # /ws is the WebSocket sync endpoint that's replacing gRPC-Web + /watch (see
+        # ws_sync_resource.py's module docstring and #11_websocket_동기화_프로토콜_설계.md) --
+        # both old paths stay routable alongside it until the migration's later PRs remove them.
+        if self._ws_resource is not None and request.path == b"/ws":
+            return self._ws_resource.render(request)
         # /mcp is the MCP Streamable HTTP endpoint -- also plain JSON-RPC-over-HTTP, not
         # gRPC-Web, see mcp_resource.py's module docstring.
         if self._mcp_resource is not None and request.path == b"/mcp":
