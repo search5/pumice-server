@@ -8,13 +8,20 @@ asyncio.gather() and killed the *entire* RPC. The client's retry loop only shrin
 retry list on a per-file ack -- a whole-stream failure leaves it unchanged -- so every
 retry re-requested the identical full list and failed identically, forever.
 
-Two properties are tested against the real DownloadFiles/stream_file code path (no mocking
+Three properties are tested against the real DownloadFiles/stream_file code path (no mocking
 of the method under test itself):
 
 1. One file's write failure must not prevent the other files in the same batch from being
    delivered, and must not raise out of DownloadFiles at all.
-2. Concurrent in-flight files (header sent, eof not yet sent) must never exceed the
-   servicer's configured download_concurrency.
+2. A file's wire emission (header through eof) is fully serialized against every other file
+   in the same batch, regardless of download_concurrency -- concurrent tasks may still read
+   files off disk in parallel, but only one may be writing to the wire at a time. This was
+   added after the WS transport (#11_websocket_동기화_프로토콜_설계.md) exposed a real bug:
+   its raw binary data frames carry no per-chunk path tag (unlike gRPC-Web's ChunkData.path),
+   so a client receiving interleaved chunks from two concurrently-streamed files in one batch
+   couldn't tell them apart. download_concurrency still bounds how many files are concurrently
+   being *read*, but no longer changes how many can be *emitting* at once -- that's always 1.
+3. No two files' frames ever actually interleave in the emitted order (not just a count check).
 """
 
 import asyncio
@@ -107,7 +114,7 @@ def test_one_failing_file_does_not_abort_the_whole_batch(tmp_path):
     assert "b.md" not in paths_with_eof(context)
 
 
-def test_concurrency_is_fully_serialized_when_limit_is_one(tmp_path):
+def test_wire_emission_is_serialized_when_concurrency_limit_is_one(tmp_path):
     files = {f"n{i}.md": f"content-{i}".encode() for i in range(12)}
     make_vault(tmp_path, files=files)
     servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=FakeRepository(), download_concurrency=1)
@@ -120,7 +127,10 @@ def test_concurrency_is_fully_serialized_when_limit_is_one(tmp_path):
     assert paths_with_eof(context) == set(files.keys())
 
 
-def test_concurrency_never_exceeds_the_configured_limit(tmp_path):
+def test_wire_emission_is_serialized_even_with_a_higher_read_concurrency_limit(tmp_path):
+    # download_concurrency=4 lets up to 4 files be read off disk at once, but that must never
+    # translate into more than one file's frames being emitted (header..eof) at a time -- see
+    # the module docstring for why (raw binary data frames have no per-chunk path tag).
     files = {f"n{i}.md": f"content-{i}".encode() for i in range(20)}
     make_vault(tmp_path, files=files)
     servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=FakeRepository(), download_concurrency=4)
@@ -129,5 +139,37 @@ def test_concurrency_never_exceeds_the_configured_limit(tmp_path):
 
     asyncio.run(servicer.DownloadFiles(request, context))
 
-    assert context.max_concurrent <= 4
+    assert context.max_concurrent == 1
     assert paths_with_eof(context) == set(files.keys())
+
+
+def test_no_two_files_frames_ever_actually_interleave_in_the_emitted_order(tmp_path):
+    # A count-based max_concurrent check alone wouldn't catch a bug where, say, two files each
+    # got a brief non-overlapping "gap" that still happened to not overlap in count terms but
+    # did interleave in sequence -- this walks the actual emitted message order instead.
+    files = {f"n{i}.md": f"content-{i}".encode() * 5000 for i in range(6)}  # forces multiple data chunks each
+    make_vault(tmp_path, files=files)
+    servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=FakeRepository(), download_concurrency=4)
+    context = FakeContext()
+    request = sync_pb2.DownloadBatchRequest(vault_id="vault1", paths=list(files.keys()))
+
+    asyncio.run(servicer.DownloadFiles(request, context))
+
+    def path_of(message):
+        if message.HasField("header"):
+            return message.header.path
+        if message.HasField("data"):
+            return message.data.path
+        return message.eof.path
+
+    open_path = None
+    for message in context.written:
+        path = path_of(message)
+        if message.HasField("header"):
+            assert open_path is None, f"{path}'s header arrived while {open_path} was still open"
+            open_path = path
+        else:
+            assert path == open_path, f"frame for {path} arrived while {open_path} was open"
+            if message.HasField("eof"):
+                open_path = None
+    assert open_path is None

@@ -717,6 +717,14 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             # files, so keep it off the event loop.
             content_hash = await asyncio.to_thread(calculate_sha256, file_path)
 
+        # Held for this file's *entire* header-through-eof emission, not re-acquired per chunk --
+        # concurrent tasks for other paths in the same DownloadFiles batch (see below) would
+        # otherwise interleave their own header/data/eof writes with this file's on the wire.
+        # gRPC-Web's FileChunk.ChunkData carried a path field that let the client demultiplex
+        # interleaved chunks; the WS transport's raw binary data frames deliberately don't (see
+        # #11_websocket_동기화_프로토콜_설계.md's "왜 JSON인가"), so the server has to guarantee
+        # non-interleaving instead. Concurrent disk reads across files are unaffected -- only the
+        # wire emission is serialized per file.
         async with write_lock:
             await context.write(sync_pb2.FileChunk(header=sync_pb2.ChunkHeader(
                 vault_id=vault_id,
@@ -725,26 +733,24 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                 modified_at_ms=mtime_ms,
             )))
 
-        sequence = 0
-        # Blocking file I/O is offloaded to a worker thread so reading one file doesn't
-        # stall the event loop (and therefore every other concurrent download/RPC).
-        f = await asyncio.to_thread(open, file_path, 'rb')
-        try:
-            while True:
-                data = await asyncio.to_thread(f.read, chunk_size)
-                if not data:
-                    break
-                async with write_lock:
+            sequence = 0
+            # Blocking file I/O is offloaded to a worker thread so reading one file doesn't
+            # stall the event loop (and therefore every other concurrent download/RPC).
+            f = await asyncio.to_thread(open, file_path, 'rb')
+            try:
+                while True:
+                    data = await asyncio.to_thread(f.read, chunk_size)
+                    if not data:
+                        break
                     await context.write(sync_pb2.FileChunk(data=sync_pb2.ChunkData(
                         path=rel_path,
                         sequence=sequence,
                         data=data,
                     )))
-                sequence += 1
-        finally:
-            f.close()
+                    sequence += 1
+            finally:
+                f.close()
 
-        async with write_lock:
             await context.write(sync_pb2.FileChunk(eof=sync_pb2.ChunkEOF(
                 path=rel_path,
                 content_hash=content_hash,
