@@ -765,7 +765,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             logger.info(f"Found {len(history_rows)} history rows for {request.path}")
             versions = []
             for row in history_rows:
-                versions.append(sync_pb2.HistoryVersion(
+                versions.append(wire_types.HistoryVersion(
                     history_id=row["history_id"],
                     modified_at_ms=row["modified_at_ms"],
                     size_bytes=row["size_bytes"],
@@ -773,7 +773,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                     device_name=row.get("device_name", "Unknown Device"),
                     user_name=row.get("user_name", "Unknown User")
                 ))
-            return sync_pb2.HistoryResponse(versions=versions)
+            return wire_types.HistoryResponse(versions=versions)
         except Exception as e:
             logger.error(f"GetFileHistory failed for {request.path}: {e}")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
@@ -835,11 +835,11 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             # 1. Look up the history entry in the DB
             row = self.repository.get_history_by_id(owner_username, request.history_id)
             if not row:
-                return sync_pb2.RestoreHistoryResponse(ok=False, error="History version not found")
+                return wire_types.RestoreHistoryResponse(ok=False, error="History version not found")
 
             backup_file_path = row["backup_file_path"]
             if not os.path.exists(backup_file_path):
-                return sync_pb2.RestoreHistoryResponse(ok=False, error="Backup file not found on disk")
+                return wire_types.RestoreHistoryResponse(ok=False, error="Backup file not found on disk")
 
             # 2. Set the restore target path
             target_path = request.path if request.path else row["path"]
@@ -850,7 +850,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
 
             # Security check: prevent escaping into a parent directory
             if not dest_file_path.startswith(os.path.abspath(vault_path)):
-                return sync_pb2.RestoreHistoryResponse(ok=False, error="Invalid target path (escape attempt)")
+                return wire_types.RestoreHistoryResponse(ok=False, error="Invalid target path (escape attempt)")
 
             # 4. Create the directory and restore by overwriting
             os.makedirs(os.path.dirname(dest_file_path), exist_ok=True)
@@ -902,7 +902,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                 logger.error(f"Failed to record restore version history for {target_path}: {backup_err}")
 
             logger.info(f"Server-side restore completed: vault={request.vault_id}, path={target_path}, history_id={request.history_id}")
-            return sync_pb2.RestoreHistoryResponse(ok=True)
+            return wire_types.RestoreHistoryResponse(ok=True)
         except Exception as e:
             logger.error(f"RestoreHistoryVersion failed: {e}")
-            return sync_pb2.RestoreHistoryResponse(ok=False, error=str(e))
+            return wire_types.RestoreHistoryResponse(ok=False, error=str(e))

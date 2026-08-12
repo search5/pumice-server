@@ -105,3 +105,37 @@ class HistoryVersionDownloadRequest:
     vault_id: str
     path: str
     history_id: int
+
+
+@dataclass
+class HistoryRequest:
+    vault_id: str
+    path: str
+
+
+@dataclass
+class HistoryVersion:
+    history_id: int
+    modified_at_ms: int
+    size_bytes: int
+    content_hash: str
+    device_name: str = "Unknown Device"
+    user_name: str = "Unknown User"
+
+
+@dataclass
+class HistoryResponse:
+    versions: List[HistoryVersion] = field(default_factory=list)
+
+
+@dataclass
+class RestoreHistoryRequest:
+    vault_id: str
+    path: str
+    history_id: int
+
+
+@dataclass
+class RestoreHistoryResponse:
+    ok: bool
+    error: str = ""

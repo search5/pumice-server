@@ -31,7 +31,6 @@ from autobahn.twisted.websocket import WebSocketServerProtocol, WebSocketServerF
 from autobahn.twisted.resource import WebSocketResource
 from twisted.internet import reactor as _default_reactor
 
-from . import sync_pb2
 from . import wire_types
 
 logger = logging.getLogger(__name__)
@@ -91,10 +90,11 @@ class WsServicerContext:
 
 
 # ─── payload <-> wire_types conversion ──────────────────────────────────────────────────────
-# PR5 (pumice's 13_PR5_계획.md) is converting SyncServiceServicer's methods off protobuf one at
-# a time -- Delta/UploadFiles/DownloadFiles/DownloadHistoryVersion already speak wire_types
-# dataclasses; GetFileHistory/RestoreHistoryVersion below still construct sync_pb2 messages
-# until their own conversion lands. See llm-wiki/ in this repo for the per-method log.
+# PR5 (pumice's 13_PR5_계획.md): every SyncServiceServicer method this module calls now speaks
+# wire_types dataclasses, not sync_pb2 -- this file has no protobuf dependency left at all.
+# service.py itself still imports sync_pb2/sync_pb2_grpc (Ping/Pong, the servicer base class),
+# left in place until the dead gRPC-Web path that's their only remaining caller is removed.
+# See llm-wiki/ in this repo for the per-method conversion log.
 
 
 def _file_meta_from_dict(d: dict) -> "wire_types.FileMeta":
@@ -130,7 +130,7 @@ async def _handle_delta(session: "SyncWsSession", payload: dict):
 
 
 async def _handle_history(session: "SyncWsSession", payload: dict):
-    request = sync_pb2.HistoryRequest(vault_id=payload.get("vaultId", ""), path=payload.get("path", ""))
+    request = wire_types.HistoryRequest(vault_id=payload.get("vaultId", ""), path=payload.get("path", ""))
     response = await session.servicer.GetFileHistory(request, WsServicerContext(session))
     return "history_res", {
         "versions": [
@@ -148,7 +148,7 @@ async def _handle_history(session: "SyncWsSession", payload: dict):
 
 
 async def _handle_restore(session: "SyncWsSession", payload: dict):
-    request = sync_pb2.RestoreHistoryRequest(
+    request = wire_types.RestoreHistoryRequest(
         vault_id=payload.get("vaultId", ""),
         path=payload.get("path", ""),
         history_id=payload.get("historyId", 0),
