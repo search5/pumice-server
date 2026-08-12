@@ -40,9 +40,21 @@ sqlalchemy-cubrid = { git = "https://github.com/search5/sqlalchemy_cubrid" }
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
     "pytest-twisted>=1.14.3",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["src/pumice_server"]
+
+[tool.coverage.report]
+# Abstract-method stub bodies (MetadataRepository's @abstractmethod defs) are never executed --
+# the concrete SqlAlchemyMetadataRepository always overrides them -- so chasing "coverage" on a
+# bare `pass` there is meaningless busywork, not a real test gap.
+exclude_also = [
+    "^\\s*pass$",
+]

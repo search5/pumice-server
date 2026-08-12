@@ -16,3 +16,7 @@ wheels/
 # Runtime data (tokens/DB/synced vault originals) -- secrets and generated-at-runtime content
 data/
 logs/
+
+# pytest-cov's data file / html report
+.coverage
+htmlcov/

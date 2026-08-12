@@ -874,10 +874,22 @@ class SyncServiceServicer:
 
             # 3. Locate the file on the server's physical storage
             vault_path = self._get_vault_path(owner_username, request.vault_id)
-            dest_file_path = os.path.join(vault_path, target_path)
+            # Resolved (os.path.abspath, not just joined) before the prefix check below -- a
+            # relative ".." segment in target_path (e.g. "../escaped.md") otherwise still passes
+            # a plain startswith(vault_path) check on the *unresolved* joined string (it's a
+            # textual prefix match, so ".../vault1/../escaped.md" "starts with" ".../vault1"),
+            # only to have os.makedirs/shutil.copy2 below resolve the ".." for real and write
+            # outside the vault -- this was a live path-traversal bug, found via a coverage-drive
+            # test (llm-wiki/10-*.md), fixed here.
+            dest_file_path = os.path.abspath(os.path.join(vault_path, target_path))
+            vault_path_abs = os.path.abspath(vault_path)
 
-            # Security check: prevent escaping into a parent directory
-            if not dest_file_path.startswith(os.path.abspath(vault_path)):
+            # Security check: prevent escaping into a parent directory. The os.sep suffix on
+            # vault_path_abs (rather than a bare startswith) also closes a narrower sibling-path
+            # false positive -- without it, a vault_path_abs of ".../alice" would incorrectly
+            # accept an escape into ".../alice2" too, since that string also "starts with"
+            # ".../alice".
+            if dest_file_path != vault_path_abs and not dest_file_path.startswith(vault_path_abs + os.sep):
                 return wire_types.RestoreHistoryResponse(ok=False, error="Invalid target path (escape attempt)")
 
             # 4. Create the directory and restore by overwriting
