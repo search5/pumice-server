@@ -3,10 +3,15 @@
 [🇺🇸 English](README.md) | 🇰🇷 한국어
 
 [Pumice](https://github.com/search5/pumice) 옵시디언 플러그인을 위한 자체 호스팅 동기화/버전 히스토리/퍼블리시 백엔드입니다.
-Python 3.13+와 Twisted(`asyncioreactor`)로 만들어졌습니다: 동기화 RPC(`Delta`, `UploadFiles`,
-`DownloadFiles` 등)는 리액터의 이벤트 루프에서 직접 구동되는 네이티브 gRPC-Web `Resource`
-(`src/pumice_server/grpc_web_resource.py`)가 처리하고, Pyramid 앱이 퍼블리시 사이트·REST 엔드포인트·웹
-로그인/관리자 대시보드를 담당합니다 -- 둘 다 같은 HTTP 포트를 공유합니다.
+Python 3.13+와 Twisted(`asyncioreactor`)로 만들어졌습니다: 파일 동기화(델타 비교, 파일 업/다운로드,
+버전 히스토리)는 vault마다 하나씩 유지되는 단일 상시 연결 WebSocket(`/ws`,
+`src/pumice_server/ws_sync_resource.py`)으로 처리되며, 옵시디언 자체 내장 Sync 플러그인의 프로토콜을
+참고해 설계되어 있어서 어디서 변경하든 폴링 주기를 기다리지 않고 실시간으로 반영됩니다. Pyramid
+앱이 퍼블리시 사이트·REST 엔드포인트·웹 로그인/관리자 대시보드를 담당합니다 -- 둘 다 같은 HTTP
+포트를 공유합니다.
+
+이전 버전은 gRPC-Web 방식(RPC 하나당 요청 하나, 실시간 push 없음)이었는데, 이번 버전에서는 이를
+완전히 걷어내고 위의 상시 연결 WebSocket 방식으로 전면 교체했습니다.
 
 ## 설치
 
@@ -93,8 +98,8 @@ CUBRID 서비스는 비어있는 상태로 시작합니다 -- 기존에 이미 �
 - **옵시디언 플러그인**: "로그인" 버튼이 시스템 브라우저에서
   `/login?redirect=obsidian://pumice-auth&device_name=...`을 엽니다; 성공하면 사용자가 토큰을 직접
   복사/붙여넣기 하는 대신 `obsidian://` 콜백으로 페이지가 토큰을 건네줍니다. 이후 플러그인은 이
-  동일한 토큰을 *모든 곳에* 사용합니다 — gRPC 동기화 메타데이터는 물론, 모든 HTTP 호출(퍼블리시,
-  버전 히스토리)에도 엔드포인트에 따라 `Authorization: Bearer`, `obs-token`, 또는 JSON 본문의
+  동일한 토큰을 *모든 곳에* 사용합니다 — `/ws` 연결의 `init` 메시지는 물론, 모든 HTTP
+  호출(퍼블리시 등)에도 엔드포인트에 따라 `Authorization: Bearer`, `obs-token`, 또는 JSON 본문의
   `token` 필드로 실어 보냅니다. 서버는 이 중 무엇이든, 그리고 쿠키까지도 동일하게 인식합니다
   (`web.py`의 `extract_token()`이 `get_device_token()`으로 검증).
 - **디바이스 관리**: 모든 계정은 `/api/user/devices`에서 자신의 세션을 조회/폐기할 수 있고
@@ -162,18 +167,39 @@ uv run python scripts/compile_locale.py
 ## 하는 일
 
 - `/` — 세션 쿠키가 있는지 여부에 따라 `/dashboard` 또는 `/login`으로 리다이렉트.
-- `Delta` / `UploadFiles` / `DownloadFiles` (gRPC-Web) — 핵심 파일 동기화 프로토콜.
-- `GetFileHistory` / `DownloadHistoryVersion` / `RestoreHistoryVersion` (gRPC-Web) — 파일별 버전
-  히스토리, 변경이 있을 때마다 물리적 백업(가능하면 하드링크)으로 뒷받침됩니다.
-- `UploadFilesStream` (`/obsidian.sync.v1.SyncService/UploadFilesStream`, 옵트인) — `fetch()`
-  요청 바디 스트리밍을 지원하는 브라우저용 진짜 client-streaming 업로드. 위 gRPC-Web 디스패치와는
-  완전히 별개로 처리됩니다(아래 "스트리밍 업로드" 참고).
+- `/ws` — 동기화 프로토콜: vault마다 유지되는 하나의 상시 연결 WebSocket이 파일 델타·업/다운로드·
+  버전 히스토리(목록/다운로드/복구)를 모두 처리하고, 다른 기기가 vault를 바꾸면 즉시 push도
+  보냅니다. 아래 "동기화 프로토콜" 참고.
 - `/api/*` (HTTP, Pyramid) — 퍼블리시(업로드/목록/삭제/다운로드), 퍼블리시 공유(이메일로 초대, 초대
   코드로 수락), 버전 히스토리 REST 미러, 사용자 계정, 디바이스 관리, 관리자 대시보드.
 - `/publish/{username}/{vault}/...` — 실제로 퍼블리시된 사이트, 마크다운을 즉석에서 렌더링
   (위키링크 해석, YAML 프런트매터 제거).
 - `/mcp` — Streamable HTTP 기반 MCP(Model Context Protocol) 서버로, AI 클라이언트에게 동기화된
   vault에 대한 읽기/쓰기 접근을 제공합니다 (아래 "MCP" 참고).
+
+## 동기화 프로토콜
+
+플러그인이 설정되어 있는 동안, 연결된 모든 기기는 동기화 동작을 할 때마다 새 연결을 여는 대신
+`/ws`로 하나의 WebSocket을 계속 열어둡니다. 그래서 정해진 동기화 주기를 기다리지 않고도 다른
+기기의 변경 사항이 바로 반영됩니다:
+
+- **인증은 연결 자체를 통해 이뤄집니다** — 클라이언트가 가장 먼저 보내는 메시지는 `init`(디바이스
+  이름, vault id, 선택적인 `lastKnownChangeId`)입니다. WS 핸드셰이크 헤더로 인증하지 않는 이유는
+  브라우저 WebSocket API가 커스텀 헤더를 지원하지 않기 때문이고, 옵시디언 자체 클라이언트도 같은
+  제약을 안고 있습니다.
+- **한 연결당 한 번에 요청 하나만 진행** — 옵시디언 코어 Sync의 실제 클라이언트 동작과 정확히
+  일치합니다. 양쪽 다 requestId 다중화를 신경 쓸 필요가 없습니다.
+- **재연결 시 재스캔 대신 캐치업** — 이미 마지막 변경 ID를 알고 있는 클라이언트는 연결이 끊겼다
+  다시 붙을 때마다(모바일 백그라운드 전환, 불안정한 wifi 등) vault 전체를 다시 스캔하는 대신,
+  놓친 변경분만 일반 push 프레임으로 재생받습니다.
+- **파일 업로드는 콘텐츠 해시로 중복 제거됩니다** — 같은 내용의 파일이 vault 어딘가에 이미 있으면
+  (복사본, 이름 변경 등) 서버가 바이트를 다시 요청하지 않고 바로 그 자리에 링크를 겁니다.
+- **같은 vault를 보고 있는 다른 모든 연결에 변경 사항이 즉시 push됩니다** — 그래서 두 번째
+  기기(혹은 두 번째 옵시디언 창)는 다음 폴링을 기다리지 않고 대략 왕복 시간 정도 안에 변경을
+  반영합니다.
+
+이 설계(그리고 그 법적 근거 — 코드 복제가 아니라 설계/동작 방식만 참고)는 `pumice` 클라이언트
+저장소의 `11_websocket_동기화_프로토콜_설계.md`에 문서화되어 있습니다.
 
 ## MCP (Model Context Protocol)
 
@@ -271,46 +297,6 @@ authorization_code 교환, refresh token은 없음 — 디바이스 토큰 자�
 
 서버발 알림(Streamable HTTP의 GET/SSE 절반)은 아직 구현되어 있지 않습니다 — `GET /mcp`는 `501`을
 반환합니다. 현재로선 서버가 연결된 MCP 클라이언트에게 능동적으로 보내야 할 게 없습니다.
-
-## 스트리밍 업로드 (`UploadFilesStream`)
-
-`UploadFiles`(위)는 바디 바이트를 단 하나도 처리하기 전에 요청 바디 전체를 메모리에 버퍼링합니다
-(`grpc_web_resource.py`의 `request.content.read()`) — 원래 의도한 배치 크기에서는 문제없지만,
-훨씬 큰 단일 요청이 이 방식에 의존할 이유는 없습니다. `UploadFilesStream`은 바디 바이트가 도착하는
-대로 점진적으로 파싱하는 옵트인 대안으로(`src/pumice_server/streaming.py`의
-`EnvelopeStreamParser`, `src/pumice_server/streaming_upload_resource.py`의
-`StreamingUploadRequest`/`StreamingUploadResource`), 파일이 디스크에 기록되고 `UploadFiles`와
-완전히 동일하게 해시 검증·백업·기록되며, 바디 전체를 메모리에 버퍼링하지 않습니다. 생성된 gRPC-Web
-스텁이 아니라 클라이언트가 직접 짠 `fetch()` + envelope 프레이밍으로 호출됩니다 — 브라우저의
-grpc-web/connect-es 라이브러리는 애초에 client-streaming을 지원하지 않기 때문입니다.
-
-보장하는 것들:
-
-- **스트리밍 시작 전 인증** — `Authorization` 헤더를 바디 바이트가 파서에 단 1바이트도 전달되기
-  전에 디바이스/소유자 신원으로 해석합니다. 토큰이 없거나 잘못됐으면 맨 `401`만 응답하고 (공격자가
-  조작했을 수도 있는) 바디를 처리하기 전에 커넥션을 끊습니다.
-- **백프레셔** — 블로킹 작업(토큰 조회, 각 프레임의 디스크 I/O)이 진행되는 동안은 트랜스포트를
-  일시정지시켜, 빠르거나 악의적인 송신자가 실제로 디스크에 기록된 양보다 한없이 앞서서 큐를 쌓을 수
-  없습니다.
-- **블로킹 I/O 회피** — 토큰 조회와 모든 파일 I/O는 `twisted.internet.threads.deferToThread`를
-  거칩니다 — `service.py`가 `UploadFiles`의 동일한 작업에 이미 쓰고 있는 `asyncio.to_thread`
-  관례와 맞춘 것으로, 업로드 I/O 때문에 리액터가 멈추는 일이 없습니다.
-
-### 타임아웃 & 관측성
-
-- **인증 조회 타임아웃**(`AUTH_TIMEOUT_SECONDS = 10`) — DB 스레드 조회가 멈추면(풀 고갈, 데드락)
-  요청과 그 일시정지된 트랜스포트가 무한정 대기하지 않고 `503`으로 응답합니다. `401`("자격증명이
-  틀림")과는 구분됩니다("서버가 너무 느렸음").
-- **최대 업로드 시간 상한**(`MAX_UPLOAD_SECONDS = 600`) — 아래 idle 타임아웃과 별개로, 활동 여부와
-  무관한 상한입니다 — 바이트를 완전히 멈추지는 않을 만큼만 드문드문 보내는 slow-loris류 전송도
-  커넥션을 무한정 붙잡을 수 없습니다.
-- **전역 idle 타임아웃**(60초) — `main.py`에서 `Site(root_resource, timeout=60)`으로 명시적으로
-  설정되며, Twisted의 `HTTPFactory`/`HTTPChannel`을 통해 모든 커넥션에 적용됩니다.
-- **메트릭**(`StreamingUploadMetrics`) — 활성/누적 업로드 수, 수신 바이트 수, 파일 성공/실패
-  카운트(실패는 사유별로: 잘못된 vault/경로, 임시파일 오류, 경로 불일치, 해시 불일치), 거부
-  카운트(인증 실패/타임아웃, 프레임 초과, 프레임 손상, 최대 시간 초과), 백프레셔 일시정지 빈도/누적
-  시간. `GET /api/admin/streaming-stats`(`permission='admin'`)와 주기적 로그 요약(`main.py`의
-  `log_streaming_upload_stats`)으로 노출됩니다.
 
 ## 서버 플러그인
 
