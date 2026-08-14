@@ -160,6 +160,30 @@ def test_push_req_hash_mismatch_is_acked_as_a_failure_not_a_crash(tmp_path, repo
     assert session._stream_active is False
 
 
+def test_push_req_over_the_configured_max_file_size_is_rejected_before_requesting_data(tmp_path, repo):
+    # perFileMax enforcement (see #11_websocket_동기화_프로토콜_설계.md's re-analysis) --
+    # regression guard: PR6's push_req rewrite initially dropped this check entirely (it used
+    # to live in the now-deleted UploadFiles), which would have silently accepted arbitrarily
+    # large files despite advertising maxFileSizeBytes in init_ok.
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo, max_file_size_bytes=5)
+    sender = RecordingSender()
+    session = SyncWsSession(repo, servicer, sender.send_json, send_binary=sender.send_binary)
+    session.handle_text_message('{"op":"init","payload":{"token":"tok","vaultId":"vault1"}}')
+
+    coro = send_text(session, "push_req", {
+        "vaultId": "vault1", "path": "big.md", "contentHash": "h", "sizeBytes": 6, "modifiedAtMs": 1,
+    })
+    run(coro)
+
+    assert sender.json_messages("push_res") == []  # never asked for data
+    [ack] = sender.json_messages("push_ack")
+    assert ack["payload"]["ok"] is False
+    assert "too large" in ack["payload"]["error"].lower()
+    assert sender.json_messages("stream_end")
+    assert session._stream_active is False
+
+
 def test_two_sequential_pushes_both_succeed_since_the_connection_serializes_them(tmp_path, repo):
     session, sender, servicer = make_authenticated_session(tmp_path, repo)
 

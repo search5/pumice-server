@@ -1,7 +1,7 @@
 """TDD for SyncServiceServicer.GetFileHistory/RestoreHistoryVersion speaking wire_types
 instead of sync_pb2 -- part of PR5 (see pumice's 13_PR5_계획.md, option A). The last two of
-the six RPC methods to convert (Delta: see test_service_delta.py; UploadFiles/DownloadFiles/
-DownloadHistoryVersion: see test_service_upload_files.py etc.).
+the six RPC methods to convert (Delta: see test_service_delta.py; UploadFiles (later removed
+in PR6b)/DownloadFiles/DownloadHistoryVersion: see test_service_download_files.py etc.).
 
 End-to-end coverage of the WS history_req/restore_req round trip already lives in
 test_ws_sync_rpc_ops.py::test_history_then_restore_round_trip and is unaffected (JSON only,

@@ -51,9 +51,10 @@ class SyncServiceServicer:
         # fresh vault's first sync that can be thousands of files -- and this used to spawn one
         # unbounded asyncio task per path (see DownloadFiles below).
         self._download_semaphore = asyncio.Semaphore(download_concurrency)
-        # Per-file upload cap, enforced in UploadFiles and advertised to the client as
-        # maxFileSizeBytes in init_ok (ws_sync_resource.py's _handle_init reads this attribute
-        # directly). No cap existed at all before this -- 2 GiB is a deliberately generous
+        # Per-file upload cap, enforced in ws_sync_resource.py's _run_push (PR6 of
+        # #14_옵시디언싱크_정렬_구현계획.md) and advertised to the client as maxFileSizeBytes in
+        # init_ok (_handle_init reads this attribute directly). No cap existed at all before
+        # this -- 2 GiB is a deliberately generous
         # default chosen not to break any existing self-hosted deployment's real usage, matching
         # this project's small/personal-scale design (see #11_websocket_동기화_프로토콜_설계.md).
         self.max_file_size_bytes = max_file_size_bytes
@@ -396,135 +397,15 @@ class SyncServiceServicer:
             conflicts=[]
         )
 
-    def _finalize_uploaded_file(self, owner_username: str, vault_id: str, current_rel_path: str,
-                                 current_temp_path: str, current_file_path: str,
-                                 total_bytes: int, modified_at_ms: int, calculated_hash: str,
-                                 device_name: str, user_name: str,
-                                 metadata_cache: Dict[str, dict], tombstones_by_hash: Dict[str, str]):
-        # metadata_cache/tombstones_by_hash are loaded once per vault per UploadFiles batch
-        # (see UploadFiles) and kept up to date here, instead of re-reading the whole vault's
-        # metadata from the DB for every single file — that turned an N-file batch into an
-        # O(N * vault size) scan.
-        dest_dir = os.path.dirname(current_file_path)
-        os.makedirs(dest_dir, exist_ok=True)
-
-        try:
-            is_new_file = not os.path.exists(current_file_path)
-            should_backup = True
-            rename_related_path = None
-
-            if is_history_excluded_path(current_rel_path):
-                should_backup = False
-            elif is_new_file:
-                # Check whether some previous path (old_path) exists as a deletion tombstone
-                # with the same hash (an O(1) lookup instead of scanning every file)
-                old_path = tombstones_by_hash.get(calculated_hash)
-                if old_path:
-                    try:
-                        logger.info(f"Rename detected: migrating history from {old_path} to {current_rel_path}")
-                        self.repository.migrate_history_on_rename(owner_username, vault_id, old_path, current_rel_path)
-                        # Carry over the previous history, but also record the rename
-                        # event itself as its own history entry (related_path)
-                        rename_related_path = old_path
-                        tombstones_by_hash.pop(calculated_hash, None)
-                        metadata_cache.pop(old_path, None)
-                    except Exception as migrate_err:
-                        logger.error(f"Failed to migrate history on rename: {migrate_err}")
-            else:
-                try:
-                    old_meta = metadata_cache.get(current_rel_path)
-                    old_hash = old_meta.get("content_hash") if old_meta else calculate_sha256(current_file_path)
-                    if old_hash == calculated_hash:
-                        history_rows = self.repository.get_history(owner_username, vault_id, current_rel_path)
-                        if not history_rows:
-                            should_backup = True
-                            logger.info(f"First history for {current_rel_path} - force backup despite same hash.")
-                        else:
-                            should_backup = False
-                            logger.info(f"Skip duplicate backup for {current_rel_path} (same hash: {calculated_hash})")
-                except Exception as hash_err:
-                    logger.error(f"Failed to check duplicate hash: {hash_err}")
-
-            if os.path.exists(current_file_path):
-                os.remove(current_file_path)
-            os.rename(current_temp_path, current_file_path)
-
-            # Set the modification time
-            mtime_sec = modified_at_ms / 1000.0
-            os.utime(current_file_path, (mtime_sec, mtime_sec))
-
-            meta = {
-                "path": current_rel_path,
-                "modified_at_ms": modified_at_ms,
-                "size_bytes": total_bytes,
-                "content_hash": calculated_hash,
-                "is_deleted": False
-            }
-
-            # Copy the new version into the backup directory first. Kept as its own try/except
-            # (separate from the DB write below) so a filesystem backup failure never blocks the
-            # metadata update that makes the upload count as successful.
-            backup_file_path = None
-            if should_backup:
-                try:
-                    timestamp = int(time.time() * 1000)
-                    backup_dir = os.path.join(self.data_dir, "history", owner_username, vault_id)
-                    os.makedirs(backup_dir, exist_ok=True)
-                    backup_file_path = os.path.join(backup_dir, f"{timestamp}_{secrets.token_hex(4)}.bak")
-                    _backup_file(current_file_path, backup_file_path)
-                except Exception as backup_err:
-                    logger.error(f"Failed to create backup version for {current_rel_path}: {backup_err}")
-                    backup_file_path = None
-
-            # The metadata update, journal entry, and history entry (if any) share a single commit.
-            with self.repository.batch() as batch:
-                batch.save_one(owner_username, vault_id, current_rel_path, meta)
-                batch.record_change(owner_username, vault_id, current_rel_path, meta)
-                if backup_file_path:
-                    batch.add_history(
-                        owner_username=owner_username,
-                        vault_id=vault_id,
-                        path=current_rel_path,
-                        modified_at_ms=modified_at_ms,
-                        size_bytes=total_bytes,
-                        content_hash=calculated_hash,
-                        backup_file_path=backup_file_path,
-                        device_name=device_name,
-                        user_name=user_name,
-                        related_path=rename_related_path,
-                    )
-
-            if backup_file_path:
-                logger.info(f"Backup version created for {current_rel_path} -> {backup_file_path}")
-
-            # A successful upload is an unconditional change -- no need for diff_changed_files()
-            # here the way _scan_and_merge() needs it (this path only runs when a file's content
-            # actually differs, never as a no-op poll). Fires once per file in a batch upload,
-            # carrying that file's own metadata; harmless -- syncNow() on the receiving end
-            # already coalesces concurrent/rapid calls (main.ts's isSyncing/syncQueuedWhileRunning
-            # guard).
-            if self.change_notifier is not None:
-                self.change_notifier.notify_change(owner_username, vault_id, meta)
-
-            # Keep the in-memory cache in sync so later files in this same batch see this
-            # file's new state without a DB round trip.
-            metadata_cache[current_rel_path] = meta
-
-            return True, ""
-        except Exception as e:
-            logger.error(f"UploadFiles EOF processing failed for {current_rel_path}: {e}", exc_info=True)
-            if os.path.exists(current_temp_path):
-                os.remove(current_temp_path)
-            return False, f"File move failed: {e}"
-
     def finalize_pushed_file(self, owner_username: str, vault_id: str, rel_path: str, data: bytes,
                               declared_size: int, modified_at_ms: int, declared_hash: str,
                               device_name: str, user_name: str):
         """PR6 of #14_옵시디언싱크_정렬_구현계획.md: finalizes one push_req's binary frame (the
         dedup-miss case -- see finalize_deduped_file for the hit case). Per-file, not batched --
-        see the module docstring for why this looks up just this one path via
-        repository.load_one() instead of a pre-loaded whole-vault cache the way
-        _finalize_uploaded_file does."""
+        looks up just this one path via repository.load_one() rather than a pre-loaded
+        whole-vault cache, since there's no longer a batch boundary to amortize that load
+        against (the old UploadFiles/_finalize_uploaded_file batch flow this replaced is gone --
+        see llm-wiki/'s PR6 writeup)."""
         calculated_hash = hashlib.sha256(data).hexdigest()
         if declared_hash and calculated_hash != declared_hash:
             return False, "Header/eof content hash mismatch"
@@ -648,183 +529,6 @@ class SyncServiceServicer:
 
         if self.change_notifier is not None:
             self.change_notifier.notify_change(owner_username, vault_id, meta)
-
-    async def UploadFiles(self, request, context):
-        logger.info("gRPC UploadFiles batch started.")
-        current_file_path = None
-        current_rel_path = None
-        current_temp_path = None
-        file_handle = None
-        total_bytes = 0
-        received_bytes = 0
-        modified_at_ms = 0
-        declared_header_hash = ""
-        sha256_hash = None
-        vault_id = None
-
-        # Loading a vault's metadata is O(vault size); load it once per vault seen in this
-        # batch (lazily, on that vault's first file) and reuse it for every file instead of
-        # reloading the whole vault from the DB per file.
-        metadata_caches: Dict[str, Dict[str, dict]] = {}
-        tombstone_indexes: Dict[str, Dict[str, str]] = {}
-        # Every file in a batch shares one authenticated caller, so the owner_username resolved
-        # on the first header applies to the whole batch (vault_id can vary chunk to chunk, but
-        # the caller's own identity can't).
-        owner_username = None
-
-        try:
-            for chunk in request.chunks:
-                payload_type = chunk.WhichOneof("payload")
-                logger.info(f"UploadFiles received chunk: payload_type={payload_type}")
-
-                if payload_type == "header":
-                    # Clean up if a previous file was left unfinished (e.g. an abnormal termination)
-                    if file_handle:
-                        file_handle.close()
-                        file_handle = None
-                        if current_temp_path and os.path.exists(current_temp_path):
-                            os.remove(current_temp_path)
-
-                    header = chunk.header
-                    vault_id = header.vault_id
-
-                    # Check ownership
-                    try:
-                        owner_username = self._verify_vault_access(vault_id, context)
-                    except Exception as auth_err:
-                        logger.error(f"UploadFiles authorization failed: {auth_err}")
-                        yield wire_types.UploadAck(path=header.path, ok=False, error="Authorization failed")
-                        continue
-
-                    current_rel_path = os.path.normpath(header.path).replace("\\", "/")
-
-                    # Security check: prevent escaping into a parent directory
-                    if current_rel_path.startswith("..") or os.path.isabs(current_rel_path):
-                        yield wire_types.UploadAck(path=header.path, ok=False, error="Invalid file path")
-                        continue
-
-                    # Reject before doing any temp-file/disk work -- advertised to the client as
-                    # maxFileSizeBytes in init_ok (see ws_sync_resource.py's _handle_init),
-                    # mirroring Obsidian core's own Sync client (perFileMax).
-                    if header.total_bytes > self.max_file_size_bytes:
-                        yield wire_types.UploadAck(path=header.path, ok=False, error="File too large")
-                        continue
-
-                    vault_path = self._get_vault_path(owner_username, vault_id)
-                    current_file_path = os.path.join(vault_path, current_rel_path)
-
-                    if vault_id not in metadata_caches:
-                        files = await asyncio.to_thread(self.repository.load_all, owner_username, vault_id)
-                        metadata_caches[vault_id] = files
-                        tombstone_indexes[vault_id] = {
-                            meta["content_hash"]: path
-                            for path, meta in files.items()
-                            if meta.get("is_deleted") and meta.get("content_hash")
-                        }
-
-                    # Set up the temp file path
-                    temp_dir = os.path.join(self.data_dir, "tmp", owner_username, vault_id)
-                    os.makedirs(temp_dir, exist_ok=True)
-                    current_temp_path = os.path.join(temp_dir, f"{secrets.token_hex(8)}.tmp")
-
-                    try:
-                        file_handle = open(current_temp_path, 'wb')
-                    except Exception as e:
-                        yield wire_types.UploadAck(path=header.path, ok=False, error=f"Failed to create temp file: {e}")
-                        current_file_path = None
-                        continue
-
-                    total_bytes = header.total_bytes
-                    modified_at_ms = header.modified_at_ms
-                    declared_header_hash = header.content_hash
-                    received_bytes = 0
-                    sha256_hash = hashlib.sha256()
-
-                elif payload_type == "data":
-                    data_payload = chunk.data
-                    if not file_handle:
-                        logger.warning("UploadFiles received data chunk but file_handle is null!")
-                        continue
-
-                    # Security check: make sure the chunk's path matches the header's
-                    chunk_path = os.path.normpath(data_payload.path).replace("\\", "/")
-                    if chunk_path != current_rel_path:
-                        file_handle.close()
-                        file_handle = None
-                        if os.path.exists(current_temp_path):
-                            os.remove(current_temp_path)
-                        yield wire_types.UploadAck(path=chunk_path, ok=False, error="Path mismatch in data chunk")
-                        continue
-
-                    file_handle.write(data_payload.data)
-                    sha256_hash.update(data_payload.data)
-                    received_bytes += len(data_payload.data)
-
-                elif payload_type == "eof":
-                    eof_payload = chunk.eof
-                    if not file_handle:
-                        logger.warning("UploadFiles received eof chunk but file_handle is null!")
-                        continue
-
-                    chunk_path = os.path.normpath(eof_payload.path).replace("\\", "/")
-                    if chunk_path != current_rel_path:
-                        file_handle.close()
-                        file_handle = None
-                        if os.path.exists(current_temp_path):
-                            os.remove(current_temp_path)
-                        yield wire_types.UploadAck(path=chunk_path, ok=False, error="Path mismatch in eof chunk")
-                        continue
-
-                    # declared_header_hash is "" (not declared) for any sender that doesn't send
-                    # contentHash in the header yet -- see wire_types.ChunkHeader's docstring.
-                    # Only a genuine disagreement between the two declarations is rejected here;
-                    # this isn't a substitute for the calculated-vs-eof check right below.
-                    if declared_header_hash and declared_header_hash != eof_payload.content_hash:
-                        file_handle.close()
-                        file_handle = None
-                        if os.path.exists(current_temp_path):
-                            os.remove(current_temp_path)
-                        yield wire_types.UploadAck(path=chunk_path, ok=False, error="Header/eof content hash mismatch")
-                        continue
-
-                    file_handle.close()
-                    file_handle = None
-
-                    calculated_hash = sha256_hash.hexdigest()
-                    logger.info(f"UploadFiles verifying hash for {eof_payload.path}: calculated={calculated_hash}, expected={eof_payload.content_hash}")
-
-                    # Verify the hash
-                    if calculated_hash != eof_payload.content_hash:
-                        logger.error(f"Hash mismatch for {eof_payload.path}: calculated={calculated_hash}, expected={eof_payload.content_hash}")
-                        if os.path.exists(current_temp_path):
-                            os.remove(current_temp_path)
-                        yield wire_types.UploadAck(path=eof_payload.path, ok=False, error="Hash verification failed")
-                        continue
-
-                    logger.info(f"Hash verified successfully for {eof_payload.path}. Proceeding with file rename and metadata update.")
-
-                    client_metadata = dict(context.invocation_metadata())
-                    device_name = unquote(client_metadata.get("x-device-name", "Unknown Device"))
-                    user_name = unquote(client_metadata.get("x-user-name", "Unknown User"))
-
-                    # Rename + backup + DB writes are all blocking; offload to a worker thread so
-                    # one large batch upload doesn't freeze every other concurrent RPC.
-                    ok, error = await asyncio.to_thread(
-                        self._finalize_uploaded_file, owner_username, vault_id, current_rel_path,
-                        current_temp_path, current_file_path, total_bytes, modified_at_ms,
-                        calculated_hash, device_name, user_name,
-                        metadata_caches[vault_id], tombstone_indexes[vault_id]
-                    )
-                    yield wire_types.UploadAck(path=eof_payload.path, ok=ok, error=error)
-
-                    current_file_path = None
-                    current_rel_path = None
-                    current_temp_path = None
-        finally:
-            if file_handle:
-                file_handle.close()
-                if current_temp_path and os.path.exists(current_temp_path):
-                    os.remove(current_temp_path)
 
     async def DownloadFiles(self, request, context):
         CHUNK_SIZE = 256 * 1024

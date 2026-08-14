@@ -461,7 +461,7 @@ def rename_note(
     content_hash/size/modified_at_ms are preserved exactly -- nothing about the note's content
     changed, only its path. A fresh history entry is still recorded at new_path (related_path=
     old_path), matching how a real client-driven rename gets one too (service.py's
-    _finalize_uploaded_file always backs up the just-placed file, even when content is unchanged --
+    finalize_pushed_file always backs up the just-placed file, even when content is unchanged --
     cheap since _backup_file hard-links rather than copies). No E2EE handling needed -- moving a
     file doesn't touch its bytes."""
     old_meta = repository.load_one(owner_username, vault_id, old_path)

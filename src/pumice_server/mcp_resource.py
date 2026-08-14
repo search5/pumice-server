@@ -280,7 +280,7 @@ class McpResource(Resource):
 
     def _move_vault_file(self, owner_username: str, vault_id: str, old_path: str, new_path: str) -> dict:
         """Moves a note's live file to a new path, then backs up the result -- mirrors
-        service.py's own rename-detected write path (_finalize_uploaded_file always backs up the
+        service.py's own rename-detected write path (finalize_pushed_file always backs up the
         file at its new location, even though content is unchanged)."""
         old_full_path = resolve_vault_file_path(self._data_dir, owner_username, vault_id, old_path)
         new_full_path = resolve_vault_file_path(self._data_dir, owner_username, vault_id, new_path)

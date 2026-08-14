@@ -388,6 +388,13 @@ class SyncWsSession:
         size_bytes = payload.get("sizeBytes", 0)
         modified_at_ms = payload.get("modifiedAtMs", 0)
         try:
+            # perFileMax (see #11_websocket_동기화_프로토콜_설계.md's re-analysis), advertised in
+            # init_ok -- rejected before any dedup lookup or disk work, same as the now-removed
+            # UploadFiles did, so a client never wastes a round trip sending bytes the server was
+            # always going to refuse.
+            if size_bytes > self.servicer.max_file_size_bytes:
+                self._send({"op": "push_ack", "payload": {"ok": False, "needData": False, "error": "File too large"}})
+                return
             dedup_source = await asyncio.to_thread(
                 self.repository.find_live_file_by_content_hash, self.owner_username, vault_id, content_hash
             )

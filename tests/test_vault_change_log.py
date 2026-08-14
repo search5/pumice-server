@@ -204,7 +204,10 @@ def test_delete_on_server_records_a_tombstone_change(tmp_path):
     assert rows[-1]["is_deleted"] is True
 
 
-def test_finalize_uploaded_file_records_a_change(tmp_path):
+def test_finalize_pushed_file_records_a_change(tmp_path):
+    # PR6 of #14_옵시디언싱크_정렬_구현계획.md replaced the batch-oriented
+    # UploadFiles/_finalize_uploaded_file (gone -- see llm-wiki) with this per-file push_req
+    # finalize path; same mutation-site-journals-a-change coverage, updated call site.
     import hashlib
     from pumice_server.service import SyncServiceServicer
 
@@ -214,15 +217,11 @@ def test_finalize_uploaded_file_records_a_change(tmp_path):
     vault_path.mkdir(parents=True)
     servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo)
 
-    content = b"hello upload"
-    temp_path = vault_path / "a.md.tmp"
-    temp_path.write_bytes(content)
-    final_path = vault_path / "a.md"
+    content = b"hello push"
 
-    ok, err = servicer._finalize_uploaded_file(
-        "alice", "vault-1", "a.md", str(temp_path), str(final_path),
-        len(content), 1000, hashlib.sha256(content).hexdigest(), "dev", "user",
-        metadata_cache={}, tombstones_by_hash={},
+    ok, err = servicer.finalize_pushed_file(
+        "alice", "vault-1", "a.md", content, len(content), 1000,
+        hashlib.sha256(content).hexdigest(), "dev", "user",
     )
 
     assert ok is True, err

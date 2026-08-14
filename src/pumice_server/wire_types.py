@@ -40,16 +40,16 @@ class DeltaResponse:
 
 @dataclass
 class ChunkHeader:
+    """Still used for DownloadFiles/DownloadHistoryVersion's outgoing FileChunk stream (see
+    _file_chunk_to_frame in ws_sync_resource.py) -- the old upload side that used to construct
+    these directly was removed in PR6 of #14_옵시디언싱크_정렬_구현계획.md (pumice repo), which
+    replaced it with a per-file push_req/push_ack exchange that carries this same
+    path/size/mtime/hash shape as plain JSON instead."""
+
     vault_id: str
     path: str
     total_bytes: int
     modified_at_ms: int
-    # Declared up front (not just at ChunkEOF), mirroring Obsidian core's own Sync client, whose
-    # single push op carries the hash before any bytes transfer -- see
-    # #11_websocket_동기화_프로토콜_설계.md's re-analysis. "" (the default) means the sender
-    # didn't declare one; service.py's UploadFiles only checks it against the eof hash when
-    # non-empty. Not used for dedup yet -- see that design doc note for the follow-up this sets
-    # up.
     content_hash: str = ""
 
 
@@ -87,18 +87,6 @@ class FileChunk:
         if self.eof is not None:
             return "eof"
         return None
-
-
-@dataclass
-class UploadAck:
-    path: str
-    ok: bool
-    error: str = ""
-
-
-@dataclass
-class UploadBatch:
-    chunks: List[FileChunk] = field(default_factory=list)
 
 
 @dataclass

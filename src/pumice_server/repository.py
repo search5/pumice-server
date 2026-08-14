@@ -934,7 +934,7 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         """Deletes every file_metadata/file_history row for (owner, vault) and returns the
         removed history rows' backup_file_path list -- this class never touches the filesystem
         itself (see the rest of this file), so the caller (service.py, which already owns
-        _backup_file/_finalize_uploaded_file's disk I/O) is responsible for actually deleting
+        _backup_file/finalize_pushed_file's disk I/O) is responsible for actually deleting
         those backup files and the vault's own directory.
 
         Also records a tombstone in vault_change_log for every currently-live path before

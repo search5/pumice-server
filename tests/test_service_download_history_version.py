@@ -1,6 +1,7 @@
 """TDD for SyncServiceServicer.DownloadHistoryVersion speaking wire_types instead of sync_pb2
 -- part of PR5 (see pumice's 13_PR5_계획.md). Shares FileChunk/ChunkHeader/ChunkData/ChunkEOF
-with UploadFiles/DownloadFiles (see test_service_upload_files.py, test_service_download_files.py).
+with DownloadFiles (see test_service_download_files.py) -- UploadFiles, which used to share
+this too, was removed in PR6b of #14_옵시디언싱크_정렬_구현계획.md once push_req replaced it.
 
 End-to-end coverage of the WS history_dl_req path already lives in
 test_ws_sync_streaming_ops.py's test_history_dl_req_streams_a_backed_up_version and is
