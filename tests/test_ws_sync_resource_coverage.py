@@ -47,6 +47,12 @@ class FakeRepository:
             return {"username": "alice"}
         return None
 
+    def get_changes_since(self, owner_username, vault_id, since_change_id):
+        return []
+
+    def get_latest_change_id(self, owner_username, vault_id):
+        return 0
+
 
 class RecordingSender:
     def __init__(self):
@@ -74,14 +80,14 @@ def make_authenticated_session(servicer):
     sender = RecordingSender()
     session = SyncWsSession(FakeRepository(), servicer, sender)
     session.handle_text_message(json.dumps(
-        {"requestId": 1, "op": "init", "payload": {"token": "tok", "vaultId": "vault1"}}
+        {"op": "init", "payload": {"token": "tok", "vaultId": "vault1"}}
     ))
     assert session.authenticated
     return session, sender
 
 
-def send_text(session, request_id, op, payload):
-    return session.handle_text_message(json.dumps({"requestId": request_id, "op": op, "payload": payload}))
+def send_text(session, op, payload):
+    return session.handle_text_message(json.dumps({"op": op, "payload": payload}))
 
 
 def run(coro):
@@ -116,10 +122,10 @@ class CrashingDeltaServicer(PlainServicer):
 def test_run_request_turns_a_ws_aborted_servicer_call_into_an_error_op():
     session, sender = make_authenticated_session(AbortingDeltaServicer())
 
-    run(send_text(session, 2, "delta_req", {"vaultId": "vault1", "localFiles": []}))
+    run(send_text(session, "delta_req", {"vaultId": "vault1", "localFiles": []}))
 
     assert sender.last == {
-        "requestId": 2, "op": "error",
+        "op": "error",
         "payload": {"code": "INVALID_ARGUMENT", "message": "bad delta"},
     }
 
@@ -127,7 +133,7 @@ def test_run_request_turns_a_ws_aborted_servicer_call_into_an_error_op():
 def test_run_request_turns_an_unexpected_servicer_exception_into_an_internal_error_op():
     session, sender = make_authenticated_session(CrashingDeltaServicer())
 
-    run(send_text(session, 2, "delta_req", {"vaultId": "vault1", "localFiles": []}))
+    run(send_text(session, "delta_req", {"vaultId": "vault1", "localFiles": []}))
 
     assert sender.last["op"] == "error"
     assert sender.last["payload"]["code"] == "INTERNAL"
@@ -150,27 +156,27 @@ class CrashingDownloadServicer(PlainServicer):
 def test_run_stream_request_turns_a_ws_aborted_servicer_call_into_an_error_op_and_frees_the_lock():
     session, sender = make_authenticated_session(AbortingDownloadServicer())
 
-    run(send_text(session, 5, "download_req", {"vaultId": "vault1", "paths": ["a.md"]}))
+    run(send_text(session, "download_req", {"vaultId": "vault1", "paths": ["a.md"]}))
 
     assert sender.last == {
-        "requestId": 5, "op": "error",
+        "op": "error",
         "payload": {"code": "NOT_FOUND", "message": "vault gone"},
     }
     # the `finally:` in _run_stream_request must release the slot even on failure, or every
     # later streaming op on this connection would be wrongly rejected as STREAM_IN_PROGRESS.
-    assert session._active_stream_request_id is None
+    assert session._stream_active is False
     assert sender.find("stream_end") == []
 
 
 def test_run_stream_request_turns_an_unexpected_servicer_exception_into_an_internal_error_op():
     session, sender = make_authenticated_session(CrashingDownloadServicer())
 
-    run(send_text(session, 5, "download_req", {"vaultId": "vault1", "paths": ["a.md"]}))
+    run(send_text(session, "download_req", {"vaultId": "vault1", "paths": ["a.md"]}))
 
     assert sender.last["op"] == "error"
     assert sender.last["payload"]["code"] == "INTERNAL"
     assert "download boom" in sender.last["payload"]["message"]
-    assert session._active_stream_request_id is None
+    assert session._stream_active is False
 
 
 # ─── _finish_upload: same, for the buffered upload batch call ──────────────────────────────
@@ -189,10 +195,10 @@ class CrashingUploadServicer(PlainServicer):
 
 
 def _run_single_file_upload(session):
-    send_text(session, 7, "upload_begin", {"vaultId": "vault1", "fileCount": 1})
-    send_text(session, 7, "file_chunk_header", {"vaultId": "vault1", "path": "a.md", "totalBytes": 3, "modifiedAtMs": 1})
+    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 1})
+    send_text(session, "file_chunk_header", {"vaultId": "vault1", "path": "a.md", "totalBytes": 3, "modifiedAtMs": 1})
     session.handle_binary_frame(b"abc")
-    run(send_text(session, 7, "file_chunk_eof", {"path": "a.md", "contentHash": "deadbeef"}))
+    run(send_text(session, "file_chunk_eof", {"path": "a.md", "contentHash": "deadbeef"}))
 
 
 def test_finish_upload_turns_a_ws_aborted_servicer_call_into_an_error_op_and_frees_the_lock():
@@ -201,10 +207,10 @@ def test_finish_upload_turns_a_ws_aborted_servicer_call_into_an_error_op_and_fre
     _run_single_file_upload(session)
 
     assert sender.last == {
-        "requestId": 7, "op": "error",
+        "op": "error",
         "payload": {"code": "INVALID_ARGUMENT", "message": "batch rejected"},
     }
-    assert session._active_stream_request_id is None
+    assert session._stream_active is False
 
 
 def test_finish_upload_turns_an_unexpected_servicer_exception_into_an_internal_error_op():
@@ -215,7 +221,7 @@ def test_finish_upload_turns_an_unexpected_servicer_exception_into_an_internal_e
     assert sender.last["op"] == "error"
     assert sender.last["payload"]["code"] == "INTERNAL"
     assert "upload boom" in sender.last["payload"]["message"]
-    assert session._active_stream_request_id is None
+    assert session._stream_active is False
 
 
 # ─── upload accumulator: STREAM_IN_PROGRESS / INVALID_STATE rejections ─────────────────────
@@ -229,24 +235,23 @@ def test_upload_begin_while_a_stream_is_already_active_is_rejected_via_its_own_c
     # _handle_upload_begin's own _try_claim_stream() call.
     session, sender = make_authenticated_session(PlainServicer())
 
-    send_text(session, 10, "upload_begin", {"vaultId": "vault1", "fileCount": 2})
-    send_text(session, 11, "upload_begin", {"vaultId": "vault1", "fileCount": 1})
+    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 2})
+    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 1})
 
     err = sender.find("error")[-1]
-    assert err["requestId"] == 11
     assert err["payload"]["code"] == "STREAM_IN_PROGRESS"
     # The first claim/accumulator must be left completely untouched by the rejected second call.
-    assert session._active_stream_request_id == 10
+    assert session._stream_active is True
     assert session._upload_accumulator.file_count == 2
 
 
 def test_file_chunk_header_without_a_prior_upload_begin_is_rejected():
     session, sender = make_authenticated_session(PlainServicer())
 
-    send_text(session, 12, "file_chunk_header", {"vaultId": "vault1", "path": "a.md", "totalBytes": 3, "modifiedAtMs": 1})
+    send_text(session, "file_chunk_header", {"vaultId": "vault1", "path": "a.md", "totalBytes": 3, "modifiedAtMs": 1})
 
     assert sender.last == {
-        "requestId": 12, "op": "error",
+        "op": "error",
         "payload": {"code": "INVALID_STATE", "message": "file_chunk_header without an active upload_begin"},
     }
     assert session._upload_accumulator is None
@@ -255,11 +260,11 @@ def test_file_chunk_header_without_a_prior_upload_begin_is_rejected():
 def test_file_chunk_eof_without_a_prior_upload_begin_is_rejected():
     session, sender = make_authenticated_session(PlainServicer())
 
-    result = send_text(session, 13, "file_chunk_eof", {"path": "a.md", "contentHash": "deadbeef"})
+    result = send_text(session, "file_chunk_eof", {"path": "a.md", "contentHash": "deadbeef"})
 
     assert result is None  # no batch was ever started, so there's nothing to finalize
     assert sender.last == {
-        "requestId": 13, "op": "error",
+        "op": "error",
         "payload": {"code": "INVALID_STATE", "message": "file_chunk_eof without an active upload_begin"},
     }
 
@@ -332,21 +337,21 @@ def test_on_message_dispatches_binary_and_text_frames_and_cancels_init_timeout_a
     init_timeout_call = reactor.calls[0]
 
     # Before auth, a message must NOT cancel the init timeout.
-    protocol.onMessage(b'{"requestId":1,"op":"ping","payload":{}}', False)
+    protocol.onMessage(b'{"op":"ping","payload":{}}', False)
     assert init_timeout_call.active() is True
 
     # init authenticates synchronously (returns no coroutine) and disarms the init timeout.
     protocol.onMessage(json.dumps(
-        {"requestId": 2, "op": "init", "payload": {"token": "tok", "vaultId": "vault1"}}
+        {"op": "init", "payload": {"token": "tok", "vaultId": "vault1"}}
     ).encode("utf-8"), False)
     assert protocol._session.authenticated is True
     assert init_timeout_call.active() is False
 
     protocol.onMessage(json.dumps(
-        {"requestId": 3, "op": "upload_begin", "payload": {"vaultId": "vault1", "fileCount": 1}}
+        {"op": "upload_begin", "payload": {"vaultId": "vault1", "fileCount": 1}}
     ).encode("utf-8"), False)
     protocol.onMessage(json.dumps(
-        {"requestId": 3, "op": "file_chunk_header", "payload": {"vaultId": "vault1", "path": "a.md", "totalBytes": 3, "modifiedAtMs": 1}}
+        {"op": "file_chunk_header", "payload": {"vaultId": "vault1", "path": "a.md", "totalBytes": 3, "modifiedAtMs": 1}}
     ).encode("utf-8"), False)
 
     # The isBinary branch: dispatched straight to handle_binary_frame, not JSON-decoded.
@@ -357,7 +362,7 @@ def test_on_message_dispatches_binary_and_text_frames_and_cancels_init_timeout_a
         # file_chunk_eof completes the batch and returns a coroutine that onMessage must
         # schedule via asyncio.ensure_future rather than run synchronously.
         protocol.onMessage(json.dumps(
-            {"requestId": 3, "op": "file_chunk_eof", "payload": {"path": "a.md", "contentHash": hashlib.sha256(b"abc").hexdigest()}}
+            {"op": "file_chunk_eof", "payload": {"path": "a.md", "contentHash": hashlib.sha256(b"abc").hexdigest()}}
         ).encode("utf-8"), False)
         pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         if pending:

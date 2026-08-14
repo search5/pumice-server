@@ -39,6 +39,7 @@ class FakeRepository:
         self._history_by_id = {}  # history_id -> entry
         self._published = {}  # (owner, vault_id) -> [{"path", "hash"}]
         self.add_history_calls = []
+        self.record_change_calls = []
         self._next_history_id = 1000
 
     def get_vaults_by_owner(self, owner_username):
@@ -53,6 +54,9 @@ class FakeRepository:
     def save_one(self, owner_username, vault_id, path, meta):
         self._vaults_by_owner.setdefault(owner_username, set()).add(vault_id)
         self._files.setdefault((owner_username, vault_id), {})[path] = dict(meta)
+
+    def record_change(self, owner_username, vault_id, path, meta):
+        self.record_change_calls.append((owner_username, vault_id, path, dict(meta)))
 
     def add_history(self, **kwargs):
         self.add_history_calls.append(kwargs)
@@ -855,6 +859,23 @@ def test_write_note_records_a_history_entry():
     assert entry["backup_file_path"] == "/fake/new.bak"
 
 
+def test_write_note_records_a_change_log_entry():
+    # #14_옵시디언싱크_정렬_구현계획.md's vault_change_log journal: write_note bypasses
+    # service.py entirely (an MCP-driven write), so this call site needs its own explicit
+    # record_change() -- discovered while wiring PR1, not part of the original 4-call-site scope.
+    repo = FakeRepository()
+    writer = FakeWriter(modified_at_ms=999)
+
+    write_note(repo, "alice", "vault1", "new.md", "hello world", read_file=lambda *_: b"", write_file=writer)
+
+    assert len(repo.record_change_calls) == 1
+    owner, vault_id, path, meta = repo.record_change_calls[0]
+    assert (owner, vault_id, path) == ("alice", "vault1", "new.md")
+    assert meta["is_deleted"] is False
+    assert meta["modified_at_ms"] == 999
+    assert meta["content_hash"] == repo.load_one("alice", "vault1", "new.md")["content_hash"]
+
+
 def test_write_note_only_samples_first_few_existing_files():
     repo = FakeRepository()
     # 5 plaintext files, then one that looks encrypted -- default sample_size is small enough
@@ -932,6 +953,20 @@ def test_delete_note_records_last_version_backup_and_tombstone_history_entries()
     assert tombstone_entry["content_hash"] == ""
     assert tombstone_entry["size_bytes"] == 0
     assert tombstone_entry["backup_file_path"] == ""
+
+
+def test_delete_note_records_a_change_log_tombstone():
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md", modified_at_ms=1, size_bytes=10, content_hash="h1")
+
+    delete_note(repo, "alice", "vault1", "a.md", delete_file=FakeDeleter(deleted_at_ms=999))
+
+    assert len(repo.record_change_calls) == 1
+    owner, vault_id, path, meta = repo.record_change_calls[0]
+    assert (owner, vault_id, path) == ("alice", "vault1", "a.md")
+    assert meta["is_deleted"] is True
+    assert meta["content_hash"] == ""
+    assert meta["modified_at_ms"] == 999
 
 
 def test_delete_note_skips_last_version_backup_when_file_already_absent_on_disk():
@@ -1028,6 +1063,28 @@ def test_rename_note_records_a_history_entry_with_related_path():
     assert entry["related_path"] == "a.md"
     assert entry["content_hash"] == "h1"
     assert entry["backup_file_path"] == "/fake/moved.bak"
+
+
+def test_rename_note_records_a_change_log_tombstone_and_creation_pair():
+    # migrate_history_on_rename() relabels file_metadata's path column in place -- no save_one
+    # call at all -- so without an explicit fix here, a rename via the MCP tool would be
+    # completely invisible to a client catching up from vault_change_log (neither old_path's
+    # disappearance nor new_path's appearance would ever get journaled). Found while wiring PR1
+    # of #14_옵시디언싱크_정렬_구현계획.md; represented as delete(old_path) + create(new_path),
+    # matching how the design doc says a rename should read in the journal.
+    repo = FakeRepository()
+    repo.seed_file("alice", "vault1", "a.md", content_hash="h1", size_bytes=10, modified_at_ms=5)
+
+    rename_note(repo, "alice", "vault1", "a.md", "b.md", move_file=FakeMover())
+
+    assert len(repo.record_change_calls) == 2
+    old_call, new_call = repo.record_change_calls
+    assert old_call[:3] == ("alice", "vault1", "a.md")
+    assert old_call[3]["is_deleted"] is True
+    assert new_call[:3] == ("alice", "vault1", "b.md")
+    assert new_call[3]["is_deleted"] is False
+    assert new_call[3]["content_hash"] == "h1"
+    assert new_call[3]["size_bytes"] == 10
 
 
 def test_rename_note_moves_existing_history_entries():

@@ -3,11 +3,18 @@ gRPC-Web's per-RPC HTTP requests and SSE's /watch with one op-based protocol, mo
 Obsidian core's own built-in Sync plugin (analyzed from the shipped app, not copied -- see
 #11_websocket_동기화_프로토콜_설계.md for the design and the legal review behind it).
 
-Wire format: JSON text frames for control messages ({"requestId", "op", "payload"}), raw
-binary frames for file content (added in a later PR alongside upload/download op handling).
-Auth happens via the first application-level message (op="init") rather than a WS handshake
-header, for the same reason Obsidian core does it that way -- the browser WebSocket API
-doesn't support custom headers.
+Wire format: JSON text frames for control messages ({"op", "payload"}), raw binary frames for
+file content. Auth happens via the first application-level message (op="init") rather than a WS
+handshake header, for the same reason Obsidian core does it that way -- the browser WebSocket
+API doesn't support custom headers.
+
+Exactly one request may be outstanding on a connection at a time (matches Obsidian core's own
+Sync client exactly -- see #14_옵시디언싱크_정렬_구현계획.md in the `pumice` repo): there is no
+requestId in the envelope, and the server never needs to correlate a response to a request
+beyond "reply to whatever's currently pending on this connection." An earlier version of this
+protocol multiplexed requests via a requestId field; removed as dead complexity once analysis
+showed Obsidian core doesn't do this either, and pumice's own client no longer sends more than
+one request at a time.
 
 SyncWsSession holds all the per-connection protocol logic and is deliberately independent of
 autobahn/Twisted -- `send` is an injected callable rather than a call to a transport method,
@@ -35,10 +42,6 @@ logger = logging.getLogger(__name__)
 
 # How long a connection is given to send its init message before being dropped.
 INIT_TIMEOUT_SECONDS = 5.0
-
-# Advertised to the client in init_ok -- bounds how many requestIds it may keep in flight at
-# once on this connection (see #11 설계 문서, "요청 동시성" 절).
-MAX_IN_FLIGHT = 8
 
 SendFn = Callable[[Dict[str, Any]], None]
 
@@ -80,9 +83,8 @@ class WsServicerContext:
     async def write(self, message) -> None:
         # Only DownloadFiles uses this (it calls context.write(...) internally rather than
         # yielding, unlike DownloadHistoryVersion -- see the two _STREAM_HANDLERS entries
-        # below). self._session._active_stream_request_id is set for the whole duration of the
-        # call that owns this context, so it's always the right requestId to tag frames with.
-        self._session._emit_stream_frame(self._session._active_stream_request_id, _file_chunk_to_frame(message))
+        # below).
+        self._session._emit_stream_frame(_file_chunk_to_frame(message))
 
 
 # ─── payload <-> wire_types conversion ──────────────────────────────────────────────────────
@@ -189,9 +191,10 @@ _REQUEST_HANDLERS: Dict[str, Callable] = {
 
 # ─── binary file-chunk streaming (upload/download/history-download) ────────────────────────
 #
-# Raw binary WS frames carry no requestId envelope (matching Obsidian core's framing), so only
-# one streaming op may be active on a connection at a time -- see SyncWsSession's
-# _active_stream_request_id. Non-streaming ops above are unaffected and stay fully multiplexed.
+# Raw binary WS frames carry no envelope at all (matching Obsidian core's framing), so only one
+# streaming op may be active on a connection at a time -- see SyncWsSession._stream_active. In
+# practice a well-behaved client never attempts a second one anyway (see the module docstring),
+# but the server still rejects an overlapping attempt defensively.
 
 
 def _file_chunk_to_frame(chunk: "wire_types.FileChunk"):
@@ -290,7 +293,7 @@ class SyncWsSession:
 
         # Streaming (binary file-chunk) op state -- see the module-level note above
         # _UploadAccumulator for why only one of these can be active at a time.
-        self._active_stream_request_id: Optional[int] = None
+        self._stream_active: bool = False
         self._upload_accumulator: Optional[_UploadAccumulator] = None
         self._upload_current_path: Optional[str] = None
         self._upload_current_sequence: int = 0
@@ -305,77 +308,76 @@ class SyncWsSession:
         try:
             envelope = json.loads(raw)
         except (ValueError, TypeError):
-            self._send_error(0, "INVALID_JSON", "Malformed JSON message")
+            self._send_error("INVALID_JSON", "Malformed JSON message")
             return None
 
-        request_id = envelope.get("requestId", 0)
         op = envelope.get("op")
         payload = envelope.get("payload") or {}
 
         if not self.authenticated:
             if op != "init":
-                self._send_error(request_id, "UNAUTHENTICATED", "Must send init first")
+                self._send_error("UNAUTHENTICATED", "Must send init first")
                 return None
-            self._handle_init(request_id, payload)
+            self._handle_init(payload)
             return None
 
         if op == "ping":
-            self._send_pong(request_id)
+            self._send_pong()
             return None
 
         if op == "upload_begin":
-            self._handle_upload_begin(request_id, payload)
+            self._handle_upload_begin(payload)
             return None
         if op == "file_chunk_header":
-            self._handle_file_chunk_header(request_id, payload)
+            self._handle_file_chunk_header(payload)
             return None
         if op == "file_chunk_eof":
-            return self._handle_file_chunk_eof(request_id, payload)
+            return self._handle_file_chunk_eof(payload)
 
         handler = _REQUEST_HANDLERS.get(op)
         if handler is not None:
-            return self._run_request(request_id, op, handler, payload)
+            return self._run_request(op, handler, payload)
 
         stream_handler = _STREAM_HANDLERS.get(op)
         if stream_handler is not None:
             # Claimed synchronously (not inside the coroutine below) so a second streaming op
             # is rejected immediately, before any scheduling -- same as upload_begin's claim.
-            if not self._try_claim_stream(request_id):
+            if not self._try_claim_stream():
                 return None
-            return self._run_stream_request(request_id, op, stream_handler, payload)
+            return self._run_stream_request(op, stream_handler, payload)
 
-        self._send_error(request_id, "UNKNOWN_OP", f"Unknown op: {op}")
+        self._send_error("UNKNOWN_OP", f"Unknown op: {op}")
         return None
 
-    async def _run_request(self, request_id: int, op: str, handler: Callable, payload: dict) -> None:
+    async def _run_request(self, op: str, handler: Callable, payload: dict) -> None:
         try:
             response_op, response_payload = await handler(self, payload)
         except WsAborted as e:
-            self._send_error(request_id, e.code.name, e.details or "")
+            self._send_error(e.code.name, e.details or "")
         except Exception as e:
             logger.error(f"WS op '{op}' failed: {e}")
-            self._send_error(request_id, "INTERNAL", str(e))
+            self._send_error("INTERNAL", str(e))
         else:
-            self._send({"requestId": request_id, "op": response_op, "payload": response_payload})
+            self._send({"op": response_op, "payload": response_payload})
 
     # ─── streaming (binary file-chunk) ops ──────────────────────────────────────────────────
 
-    def _try_claim_stream(self, request_id: int) -> bool:
-        if self._active_stream_request_id is not None:
-            self._send_error(request_id, "STREAM_IN_PROGRESS", "Another file stream is already active on this connection")
+    def _try_claim_stream(self) -> bool:
+        if self._stream_active:
+            self._send_error("STREAM_IN_PROGRESS", "Another file stream is already active on this connection")
             return False
-        self._active_stream_request_id = request_id
+        self._stream_active = True
         return True
 
-    def _emit_stream_frame(self, request_id: int, frame) -> None:
+    def _emit_stream_frame(self, frame) -> None:
         if frame[0] == "json":
             _, frame_op, frame_payload = frame
-            self._send({"requestId": request_id, "op": frame_op, "payload": frame_payload})
+            self._send({"op": frame_op, "payload": frame_payload})
         else:
             assert self._send_binary is not None, "send_binary must be provided for streaming ops"
             self._send_binary(frame[1])
 
-    async def _run_stream_request(self, request_id: int, op: str, handler: Callable, payload: dict) -> None:
+    async def _run_stream_request(self, op: str, handler: Callable, payload: dict) -> None:
         # Claim already happened synchronously in handle_text_message before this coroutine was
         # even created -- see the stream_handler dispatch branch there.
         try:
@@ -383,24 +385,24 @@ class SyncWsSession:
                 await handler(self, payload)
             else:
                 async for frame in handler(self, payload):
-                    self._emit_stream_frame(request_id, frame)
+                    self._emit_stream_frame(frame)
         except WsAborted as e:
-            self._send_error(request_id, e.code.name, e.details or "")
+            self._send_error(e.code.name, e.details or "")
         except Exception as e:
             logger.error(f"WS stream op '{op}' failed: {e}")
-            self._send_error(request_id, "INTERNAL", str(e))
+            self._send_error("INTERNAL", str(e))
         else:
             # Explicit terminal signal -- a download_req/history_dl_req batch can silently skip
             # paths that don't exist server-side (DownloadFiles just returns early for those,
             # no ack), so the client can't reliably infer "done" just by counting per-file
             # header/eof pairs against what it asked for. Only sent on success: an error frame
-            # above already tells the client the requestId is finished.
-            self._send({"requestId": request_id, "op": "stream_end", "payload": {}})
+            # above already tells the client the stream is finished.
+            self._send({"op": "stream_end", "payload": {}})
         finally:
-            self._active_stream_request_id = None
+            self._stream_active = False
 
-    def _handle_upload_begin(self, request_id: int, payload: dict) -> None:
-        if not self._try_claim_stream(request_id):
+    def _handle_upload_begin(self, payload: dict) -> None:
+        if not self._try_claim_stream():
             return
         vault_id = payload.get("vaultId", self.vault_id or "")
         file_count = payload.get("fileCount", 0)
@@ -408,9 +410,9 @@ class SyncWsSession:
         self._upload_current_path = None
         self._upload_current_sequence = 0
 
-    def _handle_file_chunk_header(self, request_id: int, payload: dict) -> None:
-        if self._active_stream_request_id != request_id or self._upload_accumulator is None:
-            self._send_error(request_id, "INVALID_STATE", "file_chunk_header without an active upload_begin")
+    def _handle_file_chunk_header(self, payload: dict) -> None:
+        if not self._stream_active or self._upload_accumulator is None:
+            self._send_error("INVALID_STATE", "file_chunk_header without an active upload_begin")
             return
         path = payload.get("path", "")
         self._upload_accumulator.add_header(
@@ -420,15 +422,15 @@ class SyncWsSession:
         self._upload_current_sequence = 0
 
     def handle_binary_frame(self, data: bytes) -> None:
-        if self._active_stream_request_id is None or self._upload_accumulator is None or self._upload_current_path is None:
+        if not self._stream_active or self._upload_accumulator is None or self._upload_current_path is None:
             logger.warning("WS: received a binary frame with no active upload in progress")
             return
         self._upload_accumulator.add_data(self._upload_current_path, self._upload_current_sequence, data)
         self._upload_current_sequence += 1
 
-    def _handle_file_chunk_eof(self, request_id: int, payload: dict) -> Optional["asyncio.Future"]:
-        if self._active_stream_request_id != request_id or self._upload_accumulator is None:
-            self._send_error(request_id, "INVALID_STATE", "file_chunk_eof without an active upload_begin")
+    def _handle_file_chunk_eof(self, payload: dict) -> Optional["asyncio.Future"]:
+        if not self._stream_active or self._upload_accumulator is None:
+            self._send_error("INVALID_STATE", "file_chunk_eof without an active upload_begin")
             return None
         path = payload.get("path", "")
         self._upload_accumulator.add_eof(path, payload.get("contentHash", ""))
@@ -439,41 +441,40 @@ class SyncWsSession:
 
         accumulator = self._upload_accumulator
         self._upload_accumulator = None
-        return self._finish_upload(request_id, accumulator)
+        return self._finish_upload(accumulator)
 
-    async def _finish_upload(self, request_id: int, accumulator: _UploadAccumulator) -> None:
+    async def _finish_upload(self, accumulator: _UploadAccumulator) -> None:
         try:
             batch = wire_types.UploadBatch(chunks=accumulator.chunks)
             async for ack in self.servicer.UploadFiles(batch, WsServicerContext(self)):
                 self._send({
-                    "requestId": request_id,
                     "op": "upload_ack",
                     "payload": {"path": ack.path, "ok": ack.ok, "error": ack.error},
                 })
         except WsAborted as e:
-            self._send_error(request_id, e.code.name, e.details or "")
+            self._send_error(e.code.name, e.details or "")
         except Exception as e:
-            logger.error(f"WS upload (request {request_id}) failed: {e}")
-            self._send_error(request_id, "INTERNAL", str(e))
+            logger.error(f"WS upload failed: {e}")
+            self._send_error("INTERNAL", str(e))
         else:
             # Same terminal signal as the download/history-download streams (see
-            # _run_stream_request) -- keeps the client's "how do I know this requestId is done"
+            # _run_stream_request) -- keeps the client's "how do I know this stream is done"
             # logic uniform across every streaming op instead of needing upload-specific
             # ack-counting against fileCount.
-            self._send({"requestId": request_id, "op": "stream_end", "payload": {}})
+            self._send({"op": "stream_end", "payload": {}})
         finally:
-            self._active_stream_request_id = None
+            self._stream_active = False
 
-    def _handle_init(self, request_id: int, payload: dict) -> None:
+    def _handle_init(self, payload: dict) -> None:
         token = payload.get("token", "")
         vault_id = payload.get("vaultId", "")
         if not token or not vault_id:
-            self._send_error(request_id, "INVALID_ARGUMENT", "token and vaultId are required")
+            self._send_error("INVALID_ARGUMENT", "token and vaultId are required")
             return
 
         device = self.repository.get_device_token(token)
         if not device:
-            self._send_error(request_id, "UNAUTHENTICATED", "Invalid or missing auth token")
+            self._send_error("UNAUTHENTICATED", "Invalid or missing auth token")
             return
 
         self.authenticated = True
@@ -484,29 +485,53 @@ class SyncWsSession:
         self.token = token
 
         self._send({
-            "requestId": request_id,
             "op": "init_ok",
             "payload": {
                 "serverVersion": "0.1.0",
                 "timestampMs": int(time.time() * 1000),
-                "maxInFlight": MAX_IN_FLIGHT,
                 "maxFileSizeBytes": self.servicer.max_file_size_bytes,
             },
         })
 
+        # Version-catch-up (PR2 of #14_옵시디언싱크_정렬_구현계획.md, pumice repo) -- matches
+        # Obsidian core's own Sync client exactly (confirmed via obsidian.asar analysis): there
+        # is no separate "give me changes since X" RPC. The client reports its last known
+        # version in `init`, and the server just streams the intervening changes as ordinary
+        # `push` frames (the exact same op/shape the client already handles for live updates),
+        # then signals `ready`. last_known_change_id=0 (a brand-new device with no baseline)
+        # deliberately skips the catch-up burst -- see the design doc for why: it'd mean
+        # replaying potentially thousands of files as individual push frames instead of letting
+        # the client's existing delta_req full-scan bootstrap handle it in one round trip.
+        last_known_change_id = payload.get("lastKnownChangeId", 0)
+        if last_known_change_id > 0:
+            changes = self.repository.get_changes_since(self.owner_username, vault_id, last_known_change_id)
+            for file_meta in changes:
+                self._send({
+                    "op": "push",
+                    "payload": {
+                        "vaultId": vault_id,
+                        "path": file_meta["path"],
+                        "modifiedAtMs": file_meta["modified_at_ms"],
+                        "sizeBytes": file_meta["size_bytes"],
+                        "contentHash": file_meta["content_hash"],
+                        "isDeleted": file_meta["is_deleted"],
+                    },
+                })
+
+        latest_change_id = self.repository.get_latest_change_id(self.owner_username, vault_id)
+        self._send({"op": "ready", "payload": {"latestChangeId": latest_change_id}})
+
         if self._on_authenticated:
             self._on_authenticated(self.owner_username, self.vault_id)
 
-    def _send_pong(self, request_id: int) -> None:
+    def _send_pong(self) -> None:
         self._send({
-            "requestId": request_id,
             "op": "pong",
             "payload": {"timestampMs": int(time.time() * 1000)},
         })
 
-    def _send_error(self, request_id: int, code: str, message: str) -> None:
+    def _send_error(self, code: str, message: str) -> None:
         self._send({
-            "requestId": request_id,
             "op": "error",
             "payload": {"code": code, "message": message},
         })
@@ -554,7 +579,6 @@ class SyncWebSocketProtocol(WebSocketServerProtocol):
     def _on_change(self, file_meta: dict) -> None:
         assert self._session is not None
         self._send_json({
-            "requestId": 0,
             "op": "push",
             "payload": {
                 "vaultId": self._session.vault_id,

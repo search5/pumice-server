@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import os
 import json
 import logging
+import time
 from typing import Callable, Dict, Any, Optional
 
 from sqlalchemy import (
@@ -57,9 +58,34 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
+    def record_change(self, owner_username: str, vault_id: str, path: str, meta: Dict[str, Any]) -> None:
+        """Appends one row to the vault-wide change journal (`vault_change_log`) -- every call
+        site that mutates file_metadata must also call this with the same 5-key meta dict
+        (path/modified_at_ms/size_bytes/content_hash/is_deleted) passed to save_one/save_all, so
+        a client with a lastKnownChangeId baseline can later ask "what changed since then"
+        without a full-vault Delta scan. See #14_옵시디언싱크_정렬_구현계획.md (pumice repo)."""
+        pass
+
+    @abstractmethod
     def batch(self):
         """Context manager yielding an object with save_one/add_history that share a
         single commit, instead of each call committing (and fsyncing) on its own."""
+        pass
+
+    @abstractmethod
+    def get_changes_since(self, owner_username: str, vault_id: str, since_change_id: int) -> list:
+        """Returns one FileMeta-shaped dict (path/modified_at_ms/size_bytes/content_hash/
+        is_deleted) per path whose vault_change_log entry has change_id > since_change_id,
+        folded to each path's latest recorded state -- PR2's `init` handshake catch-up burst
+        (see #14_옵시디언싱크_정렬_구현계획.md, pumice repo). Nothing calls this with
+        since_change_id=0 in practice (that case skips catch-up entirely client-side), but it's
+        valid and just returns every recorded change for the vault."""
+        pass
+
+    @abstractmethod
+    def get_latest_change_id(self, owner_username: str, vault_id: str) -> int:
+        """The highest change_id recorded for (owner, vault), or 0 if none yet -- sent back in
+        the `ready` op's payload so the client can set its new lastKnownChangeId baseline."""
         pass
 
     @abstractmethod
@@ -228,6 +254,28 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         )
         Index("idx_history_owner_vault_path", self._file_history.c.owner_username,
               self._file_history.c.vault_id, self._file_history.c.path)
+
+        # Append-only vault-wide change journal (PR1 of #14_옵시디언싱크_정렬_구현계획.md, pumice
+        # repo) -- unlike file_history above, this is never rewritten (no rename path-mutation)
+        # and never carries a physical backup, purely a metadata event log. change_id is a
+        # global (cross-vault) autoincrement, same pattern as file_history.history_id -- queries
+        # always filter by (owner_username, vault_id) so this is fine, and it's already proven
+        # safe across all 4 supported dialects (see idx_history_owner_vault_path above). Nothing
+        # reads this table yet (that's PR2, the `init` handshake catch-up) -- this PR only wires
+        # up writing to it.
+        self._vault_change_log = Table("vault_change_log", self._meta,
+            Column("change_id", Integer, primary_key=True, autoincrement=True),
+            Column("owner_username", String(100), nullable=False),
+            Column("vault_id", String(255), nullable=False),
+            Column("path", String(500), nullable=False),
+            Column("content_hash", String(64), nullable=False),
+            Column("size_bytes", BigInteger, nullable=False),
+            Column("modified_at_ms", BigInteger, nullable=False),
+            Column("is_deleted", Boolean, nullable=False, default=False),
+            Column("recorded_at_ms", BigInteger, nullable=False),
+        )
+        Index("idx_change_log_owner_vault_change_id", self._vault_change_log.c.owner_username,
+              self._vault_change_log.c.vault_id, self._vault_change_log.c.change_id)
 
         self._published_files = Table("published_files", self._meta,
             Column("owner_username", String(100), primary_key=True),
@@ -553,6 +601,51 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 related_path=related_path,
             ))
 
+    def record_change(self, owner_username: str, vault_id: str, path: str, meta: Dict[str, Any]) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(insert(self._vault_change_log).values(
+                owner_username=owner_username,
+                vault_id=vault_id,
+                path=path,
+                content_hash=meta["content_hash"],
+                size_bytes=meta["size_bytes"],
+                modified_at_ms=meta["modified_at_ms"],
+                is_deleted=bool(meta["is_deleted"]),
+                recorded_at_ms=int(time.time() * 1000),
+            ))
+
+    def get_changes_since(self, owner_username: str, vault_id: str, since_change_id: int) -> list:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(self._vault_change_log).where(
+                    self._vault_change_log.c.owner_username == owner_username,
+                    self._vault_change_log.c.vault_id == vault_id,
+                    self._vault_change_log.c.change_id > since_change_id,
+                ).order_by(self._vault_change_log.c.change_id)
+            ).fetchall()
+            # Folds to each path's LATEST row -- rows are read in ascending change_id order, so
+            # a later dict assignment for the same path naturally clobbers an earlier one.
+            folded: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                folded[r.path] = {
+                    "path": r.path,
+                    "modified_at_ms": r.modified_at_ms,
+                    "size_bytes": r.size_bytes,
+                    "content_hash": r.content_hash,
+                    "is_deleted": bool(r.is_deleted),
+                }
+            return list(folded.values())
+
+    def get_latest_change_id(self, owner_username: str, vault_id: str) -> int:
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                select(func.max(self._vault_change_log.c.change_id)).where(
+                    self._vault_change_log.c.owner_username == owner_username,
+                    self._vault_change_log.c.vault_id == vault_id,
+                )
+            ).scalar()
+            return int(result) if result is not None else 0
+
     @contextmanager
     def batch(self):
         with self.engine.begin() as conn:
@@ -819,7 +912,13 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         removed history rows' backup_file_path list -- this class never touches the filesystem
         itself (see the rest of this file), so the caller (service.py, which already owns
         _backup_file/_finalize_uploaded_file's disk I/O) is responsible for actually deleting
-        those backup files and the vault's own directory."""
+        those backup files and the vault's own directory.
+
+        Also records a tombstone in vault_change_log for every currently-live path before
+        wiping file_metadata (#14_옵시디언싱크_정렬_구현계획.md's "PurgeVault와의 상호작용"): a
+        client resuming from an old lastKnownChangeId must still learn every one of its known
+        files is gone, not just find "nothing changed since then" because the rows it would have
+        compared against no longer exist at all."""
         with self.engine.begin() as conn:
             backup_paths = [
                 r.backup_file_path for r in conn.execute(
@@ -829,6 +928,27 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                     )
                 ).fetchall()
             ]
+
+            live_paths = conn.execute(
+                select(self._file_metadata.c.path).where(
+                    self._file_metadata.c.owner_username == owner_username,
+                    self._file_metadata.c.vault_id == vault_id,
+                    self._file_metadata.c.is_deleted.is_(False),
+                )
+            ).fetchall()
+            now_ms = int(time.time() * 1000)
+            for row in live_paths:
+                conn.execute(insert(self._vault_change_log).values(
+                    owner_username=owner_username,
+                    vault_id=vault_id,
+                    path=row.path,
+                    content_hash="",
+                    size_bytes=0,
+                    modified_at_ms=now_ms,
+                    is_deleted=True,
+                    recorded_at_ms=now_ms,
+                ))
+
             conn.execute(delete(self._file_history).where(
                 self._file_history.c.owner_username == owner_username,
                 self._file_history.c.vault_id == vault_id,
@@ -904,5 +1024,17 @@ class _SqlAlchemyBatch:
             user_name=user_name,
             deleted=deleted,
             related_path=related_path,
+        ))
+
+    def record_change(self, owner_username: str, vault_id: str, path: str, meta: Dict[str, Any]) -> None:
+        self._conn.execute(insert(self._repo._vault_change_log).values(
+            owner_username=owner_username,
+            vault_id=vault_id,
+            path=path,
+            content_hash=meta["content_hash"],
+            size_bytes=meta["size_bytes"],
+            modified_at_ms=meta["modified_at_ms"],
+            is_deleted=bool(meta["is_deleted"]),
+            recorded_at_ms=int(time.time() * 1000),
         ))
 

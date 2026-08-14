@@ -211,12 +211,18 @@ class SyncServiceServicer:
         # Persist the metadata updates
         self.repository.save_all(owner_username, vault_id, merged_files)
         # Delta calls this on every sync/poll cycle regardless of whether anything actually
-        # changed, so this must be gated -- an unconditional notify would make a client's own
-        # no-op poll re-notify itself (and every other watcher) every single cycle. One
-        # notify_change() per actually-changed file (not one per whole scan) so a push carries
-        # that file's own metadata, matching real Obsidian Sync -- see diff_changed_files.
-        if self.change_notifier is not None:
-            for changed_path, changed_meta in diff_changed_files(metadata_files, merged_files).items():
+        # changed, so both the journal write and the live notify below must be gated on an
+        # actual diff -- an unconditional notify would make a client's own no-op poll
+        # re-notify itself (and every other watcher) every single cycle, and an unconditional
+        # journal write would make every no-op poll bump every file's change_id forever. One
+        # record_change()/notify_change() per actually-changed file (not one per whole scan) so
+        # a push carries that file's own metadata, matching real Obsidian Sync -- see
+        # diff_changed_files. record_change() always runs (even with no change_notifier
+        # configured) since the journal is read by init's catch-up regardless of live-push
+        # wiring; notify_change() stays conditional.
+        for changed_path, changed_meta in diff_changed_files(metadata_files, merged_files).items():
+            self.repository.record_change(owner_username, vault_id, changed_path, changed_meta)
+            if self.change_notifier is not None:
                 self.change_notifier.notify_change(owner_username, vault_id, changed_meta)
         return merged_files
 
@@ -287,6 +293,7 @@ class SyncServiceServicer:
             "is_deleted": True
         }
         self.repository.save_one(owner_username, vault_id, path, meta)
+        self.repository.record_change(owner_username, vault_id, path, meta)
         return meta
 
     async def Delta(self, request, context):
@@ -469,9 +476,10 @@ class SyncServiceServicer:
                     logger.error(f"Failed to create backup version for {current_rel_path}: {backup_err}")
                     backup_file_path = None
 
-            # The metadata update and the history entry (if any) share a single commit.
+            # The metadata update, journal entry, and history entry (if any) share a single commit.
             with self.repository.batch() as batch:
                 batch.save_one(owner_username, vault_id, current_rel_path, meta)
+                batch.record_change(owner_username, vault_id, current_rel_path, meta)
                 if backup_file_path:
                     batch.add_history(
                         owner_username=owner_username,
@@ -915,6 +923,7 @@ class SyncServiceServicer:
                 "is_deleted": False
             }
             self.repository.save_one(owner_username, request.vault_id, target_path, meta)
+            self.repository.record_change(owner_username, request.vault_id, target_path, meta)
 
             if self.change_notifier is not None:
                 self.change_notifier.notify_change(owner_username, request.vault_id, meta)

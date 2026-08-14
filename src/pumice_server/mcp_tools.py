@@ -15,6 +15,7 @@ what repository.py itself already guards.
 import base64
 import hashlib
 import os
+import time
 from typing import Callable, Optional
 
 from .e2ee import DecryptionError, decrypt, derive_key, encrypt
@@ -364,18 +365,15 @@ def write_note(
     write_result = write_file(owner_username, vault_id, path, raw)
     content_hash = hashlib.sha256(raw).hexdigest()
 
-    repository.save_one(
-        owner_username,
-        vault_id,
-        path,
-        {
-            "path": path,
-            "modified_at_ms": write_result["modified_at_ms"],
-            "size_bytes": write_result["size_bytes"],
-            "content_hash": content_hash,
-            "is_deleted": False,
-        },
-    )
+    meta = {
+        "path": path,
+        "modified_at_ms": write_result["modified_at_ms"],
+        "size_bytes": write_result["size_bytes"],
+        "content_hash": content_hash,
+        "is_deleted": False,
+    }
+    repository.save_one(owner_username, vault_id, path, meta)
+    repository.record_change(owner_username, vault_id, path, meta)
     repository.add_history(
         owner_username=owner_username,
         vault_id=vault_id,
@@ -437,18 +435,15 @@ def delete_note(
         deleted=True,
     )
 
-    repository.save_one(
-        owner_username,
-        vault_id,
-        path,
-        {
-            "path": path,
-            "modified_at_ms": deleted_at_ms,
-            "size_bytes": 0,
-            "content_hash": "",
-            "is_deleted": True,
-        },
-    )
+    tombstone_meta = {
+        "path": path,
+        "modified_at_ms": deleted_at_ms,
+        "size_bytes": 0,
+        "content_hash": "",
+        "is_deleted": True,
+    }
+    repository.save_one(owner_username, vault_id, path, tombstone_meta)
+    repository.record_change(owner_username, vault_id, path, tombstone_meta)
 
     return {"path": path, "deleted": True}
 
@@ -480,6 +475,22 @@ def rename_note(
     move_result = move_file(owner_username, vault_id, old_path, new_path)
 
     repository.migrate_history_on_rename(owner_username, vault_id, old_path, new_path)
+
+    # migrate_history_on_rename() relabels file_metadata's path column in place -- no save_one
+    # call happens for either path, so without this the rename would be completely invisible to
+    # a client catching up from vault_change_log. Represented as delete(old_path) +
+    # create(new_path), matching #14_옵시디언싱크_정렬_구현계획.md's journal design for renames.
+    now_ms = int(time.time() * 1000)
+    repository.record_change(owner_username, vault_id, old_path, {
+        "path": old_path, "modified_at_ms": now_ms, "size_bytes": 0, "content_hash": "", "is_deleted": True,
+    })
+    repository.record_change(owner_username, vault_id, new_path, {
+        "path": new_path,
+        "modified_at_ms": old_meta["modified_at_ms"],
+        "size_bytes": old_meta["size_bytes"],
+        "content_hash": old_meta["content_hash"],
+        "is_deleted": False,
+    })
 
     backup_file_path = move_result.get("backup_file_path")
     if backup_file_path:

@@ -3,9 +3,11 @@ independent of autobahn/Twisted transport specifics (mirrors NativeServicerConte
 business logic it wraps in grpc_web_resource.py/service.py) so it's testable without a real
 socket. `send` is an injected callable instead of a transport method call.
 
-See #11_websocket_동기화_프로토콜_설계.md for the wire protocol this implements: JSON text
-frames, {requestId, op, payload} envelope, init-first handshake (no custom headers -- browser
-WebSocket API doesn't support them), ping/pong heartbeat response.
+See #11_websocket_동기화_프로토콜_설계.md / #14_옵시디언싱크_정렬_구현계획.md (pumice repo) for
+the wire protocol this implements: JSON text frames, {op, payload} envelope (no requestId --
+exactly one request may be outstanding at a time, matching Obsidian core's own Sync client),
+init-first handshake (no custom headers -- browser WebSocket API doesn't support them),
+ping/pong heartbeat response.
 """
 
 import json
@@ -25,6 +27,12 @@ class FakeRepository:
             return {"username": self._username}
         return None
 
+    def get_changes_since(self, owner_username, vault_id, since_change_id):
+        return []
+
+    def get_latest_change_id(self, owner_username, vault_id):
+        return 0
+
 
 class RecordingSender:
     def __init__(self):
@@ -36,6 +44,9 @@ class RecordingSender:
     @property
     def last(self):
         return self.sent[-1]
+
+    def find(self, op):
+        return [m for m in self.sent if m["op"] == op]
 
 
 class FakeServicer:
@@ -56,14 +67,14 @@ def make_session(repository=None, servicer=None):
     return session, sender
 
 
-def send_envelope(session, request_id, op, payload=None):
-    session.handle_text_message(json.dumps({"requestId": request_id, "op": op, "payload": payload or {}}))
+def send_envelope(session, op, payload=None):
+    session.handle_text_message(json.dumps({"op": op, "payload": payload or {}}))
 
 
 def test_init_with_valid_token_authenticates_and_sends_init_ok():
     session, sender = make_session()
 
-    send_envelope(session, 1, "init", {
+    send_envelope(session, "init", {
         "token": "tok", "vaultId": "vault1", "deviceName": "MyPC", "userName": "Alice",
     })
 
@@ -72,27 +83,32 @@ def test_init_with_valid_token_authenticates_and_sends_init_ok():
     assert session.vault_id == "vault1"
     assert session.device_name == "MyPC"
     assert session.user_name == "Alice"
-    assert sender.last["requestId"] == 1
-    assert sender.last["op"] == "init_ok"
-    assert "maxInFlight" in sender.last["payload"]
+    init_ok = sender.find("init_ok")[-1]
+    assert "serverVersion" in init_ok["payload"]
+    # A fresh session always gets a `ready` after `init_ok` too (PR2's version catch-up --
+    # see #14_옵시디언싱크_정렬_구현계획.md) -- FakeRepository has no changes, so it just reports
+    # latestChangeId 0, no catch-up push frames.
+    ready = sender.find("ready")[-1]
+    assert ready["payload"]["latestChangeId"] == 0
+    assert sender.find("push") == []
 
 
 def test_init_ok_advertises_the_servicer_s_configured_max_file_size():
     session, sender = make_session(servicer=FakeServicer(max_file_size_bytes=12345))
 
-    send_envelope(session, 1, "init", {"token": "tok", "vaultId": "vault1"})
+    send_envelope(session, "init", {"token": "tok", "vaultId": "vault1"})
 
-    assert sender.last["payload"]["maxFileSizeBytes"] == 12345
+    assert sender.find("init_ok")[-1]["payload"]["maxFileSizeBytes"] == 12345
 
 
 def test_init_with_invalid_token_sends_unauthenticated_error():
     session, sender = make_session()
 
-    send_envelope(session, 1, "init", {"token": "wrong", "vaultId": "vault1"})
+    send_envelope(session, "init", {"token": "wrong", "vaultId": "vault1"})
 
     assert session.authenticated is False
     assert sender.last == {
-        "requestId": 1, "op": "error",
+        "op": "error",
         "payload": {"code": "UNAUTHENTICATED", "message": "Invalid or missing auth token"},
     }
 
@@ -105,7 +121,7 @@ def test_init_with_invalid_token_sends_unauthenticated_error():
 def test_init_missing_required_fields_sends_invalid_argument_error(payload):
     session, sender = make_session()
 
-    send_envelope(session, 1, "init", payload)
+    send_envelope(session, "init", payload)
 
     assert session.authenticated is False
     assert sender.last["op"] == "error"
@@ -115,32 +131,29 @@ def test_init_missing_required_fields_sends_invalid_argument_error(payload):
 def test_any_op_other_than_init_before_authentication_is_rejected():
     session, sender = make_session()
 
-    send_envelope(session, 5, "ping")
+    send_envelope(session, "ping")
 
     assert session.authenticated is False
-    assert sender.last["requestId"] == 5
     assert sender.last["op"] == "error"
     assert sender.last["payload"]["code"] == "UNAUTHENTICATED"
 
 
-def test_ping_after_init_returns_pong_with_same_request_id():
+def test_ping_after_init_returns_pong():
     session, sender = make_session()
-    send_envelope(session, 1, "init", {"token": "tok", "vaultId": "vault1"})
+    send_envelope(session, "init", {"token": "tok", "vaultId": "vault1"})
 
-    send_envelope(session, 42, "ping")
+    send_envelope(session, "ping")
 
-    assert sender.last["requestId"] == 42
     assert sender.last["op"] == "pong"
     assert "timestampMs" in sender.last["payload"]
 
 
 def test_unknown_op_after_init_returns_error_without_raising():
     session, sender = make_session()
-    send_envelope(session, 1, "init", {"token": "tok", "vaultId": "vault1"})
+    send_envelope(session, "init", {"token": "tok", "vaultId": "vault1"})
 
-    send_envelope(session, 2, "not_a_real_op")
+    send_envelope(session, "not_a_real_op")
 
-    assert sender.last["requestId"] == 2
     assert sender.last["op"] == "error"
     assert sender.last["payload"]["code"] == "UNKNOWN_OP"
 

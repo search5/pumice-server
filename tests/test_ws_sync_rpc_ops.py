@@ -5,8 +5,8 @@ SyncServiceServicer's Delta/GetFileHistory/RestoreHistoryVersion are called thro
 normal (wire_types-speaking, see pumice's 13_PR5_계획.md) interface -- these tests exercise
 the WS-specific glue: JSON payload <-> wire_types conversion, WsServicerContext
 (invocation_metadata()/abort() synthesized from the session's already-authenticated identity
-instead of a header), and SyncWsSession's dispatch of requestId-tagged async ops (as opposed
-to the synchronous init/ping path covered by test_ws_sync_session.py).
+instead of a header), and SyncWsSession's dispatch of async ops (as opposed to the synchronous
+init/ping path covered by test_ws_sync_session.py).
 
 Uses the real SqlAlchemyMetadataRepository + SyncServiceServicer (same pattern as
 test_service_delta.py) rather than a fake -- the whole point of this PR is the WS<->servicer
@@ -51,7 +51,7 @@ def make_authenticated_session(tmp_path, repo, servicer=None, on_authenticated=N
     servicer = servicer or SyncServiceServicer(data_dir=str(tmp_path), repository=repo)
     sender = RecordingSender()
     session = SyncWsSession(repo, servicer, sender, on_authenticated=on_authenticated)
-    session.handle_text_message('{"requestId":1,"op":"init","payload":{"token":"tok","vaultId":"vault1","deviceName":"MyPC","userName":"Alice"}}')
+    session.handle_text_message('{"op":"init","payload":{"token":"tok","vaultId":"vault1","deviceName":"MyPC","userName":"Alice"}}')
     assert session.authenticated
     return session, sender, servicer
 
@@ -99,11 +99,10 @@ def test_delta_req_returns_need_download_for_a_server_side_file(tmp_path, repo):
 
     session, sender, _ = make_authenticated_session(tmp_path, repo)
 
-    coro = session.handle_text_message('{"requestId":2,"op":"delta_req","payload":{"vaultId":"vault1","localFiles":[]}}')
+    coro = session.handle_text_message('{"op":"delta_req","payload":{"vaultId":"vault1","localFiles":[]}}')
     run(coro)
 
     res = sender.last
-    assert res["requestId"] == 2
     assert res["op"] == "delta_res"
     assert res["payload"]["needUpload"] == []
     [meta] = res["payload"]["needDownload"]
@@ -122,7 +121,7 @@ def test_delta_req_returns_need_upload_for_a_client_only_file(tmp_path, repo):
         "vaultId": "vault1",
         "localFiles": [{"path": "local.md", "modifiedAtMs": 1000, "sizeBytes": 3, "contentHash": "abc", "isDeleted": False}],
     }
-    run(session.handle_text_message('{"requestId":3,"op":"delta_req","payload":' + __import__("json").dumps(payload) + "}"))
+    run(session.handle_text_message('{"op":"delta_req","payload":' + __import__("json").dumps(payload) + "}"))
 
     res = sender.last
     assert res["payload"]["needUpload"] == ["local.md"]
@@ -142,9 +141,8 @@ def test_history_then_restore_round_trip(tmp_path, repo):
     # First scan creates a history entry for note.md (see _scan_and_merge's backup-on-first-seen).
     servicer._scan_and_merge(str(vault_path), "alice", "vault1")
 
-    run(session.handle_text_message('{"requestId":4,"op":"history_req","payload":{"vaultId":"vault1","path":"note.md"}}'))
+    run(session.handle_text_message('{"op":"history_req","payload":{"vaultId":"vault1","path":"note.md"}}'))
     history_res = sender.find("history_res")[-1]
-    assert history_res["requestId"] == 4
     [version] = history_res["payload"]["versions"]
     assert version["contentHash"]
     assert version["deleted"] is False
@@ -160,10 +158,9 @@ def test_history_then_restore_round_trip(tmp_path, repo):
     tmp_note.write_text("v2 -- overwritten locally")
     tmp_note.replace(note)
     payload = {"vaultId": "vault1", "path": "note.md", "historyId": history_id}
-    run(session.handle_text_message('{"requestId":5,"op":"restore_req","payload":' + __import__("json").dumps(payload) + "}"))
+    run(session.handle_text_message('{"op":"restore_req","payload":' + __import__("json").dumps(payload) + "}"))
 
     restore_res = sender.find("restore_res")[-1]
-    assert restore_res["requestId"] == 5
     assert restore_res["payload"] == {"ok": True, "error": ""}
     assert note.read_text() == "v1"
 
@@ -173,7 +170,7 @@ def test_history_req_for_unknown_path_returns_empty_versions(tmp_path, repo):
     vault_path.mkdir(parents=True)
     session, sender, _ = make_authenticated_session(tmp_path, repo)
 
-    run(session.handle_text_message('{"requestId":6,"op":"history_req","payload":{"vaultId":"vault1","path":"nope.md"}}'))
+    run(session.handle_text_message('{"op":"history_req","payload":{"vaultId":"vault1","path":"nope.md"}}'))
 
     assert sender.last["payload"]["versions"] == []
 
@@ -188,7 +185,7 @@ def test_size_req_returns_vault_and_total_size(tmp_path, repo):
     session, sender, servicer = make_authenticated_session(tmp_path, repo)
     servicer._scan_and_merge(str(vault_path), "alice", "vault1")
 
-    run(session.handle_text_message('{"requestId":7,"op":"size_req","payload":{"vaultId":"vault1"}}'))
+    run(session.handle_text_message('{"op":"size_req","payload":{"vaultId":"vault1"}}'))
 
     assert sender.last["op"] == "size_res"
     assert sender.last["payload"] == {"vaultSizeBytes": 5, "totalSizeBytes": 5, "limitBytes": -1}
@@ -201,20 +198,20 @@ def test_purge_req_removes_the_vault_and_a_later_delta_sees_nothing_left(tmp_pat
     session, sender, servicer = make_authenticated_session(tmp_path, repo)
     servicer._scan_and_merge(str(vault_path), "alice", "vault1")
 
-    run(session.handle_text_message('{"requestId":8,"op":"purge_req","payload":{"vaultId":"vault1"}}'))
+    run(session.handle_text_message('{"op":"purge_req","payload":{"vaultId":"vault1"}}'))
 
     assert sender.last["op"] == "purge_res"
     assert sender.last["payload"] == {"ok": True, "error": ""}
     assert not vault_path.exists()
 
-    run(session.handle_text_message('{"requestId":9,"op":"delta_req","payload":{"vaultId":"vault1","localFiles":[]}}'))
+    run(session.handle_text_message('{"op":"delta_req","payload":{"vaultId":"vault1","localFiles":[]}}'))
     assert sender.last["payload"]["needDownload"] == []
 
 
 def test_usernames_req_returns_only_the_caller(tmp_path, repo):
     session, sender, _ = make_authenticated_session(tmp_path, repo)
 
-    run(session.handle_text_message('{"requestId":10,"op":"usernames_req","payload":{"vaultId":"vault1"}}'))
+    run(session.handle_text_message('{"op":"usernames_req","payload":{"vaultId":"vault1"}}'))
 
     assert sender.last["op"] == "usernames_res"
     assert sender.last["payload"] == {"usernames": ["alice"]}
@@ -230,7 +227,7 @@ def test_session_calls_on_authenticated_after_successful_init(tmp_path, repo):
     sender = RecordingSender()
     session = SyncWsSession(repo, servicer, sender, on_authenticated=lambda owner, vault: calls.append((owner, vault)))
 
-    session.handle_text_message('{"requestId":1,"op":"init","payload":{"token":"tok","vaultId":"vault1"}}')
+    session.handle_text_message('{"op":"init","payload":{"token":"tok","vaultId":"vault1"}}')
 
     assert calls == [("alice", "vault1")]
 
@@ -241,7 +238,7 @@ def test_on_authenticated_is_not_called_when_init_fails(tmp_path, repo):
     sender = RecordingSender()
     session = SyncWsSession(repo, servicer, sender, on_authenticated=lambda owner, vault: calls.append((owner, vault)))
 
-    session.handle_text_message('{"requestId":1,"op":"init","payload":{"token":"wrong","vaultId":"vault1"}}')
+    session.handle_text_message('{"op":"init","payload":{"token":"wrong","vaultId":"vault1"}}')
 
     assert calls == []
 
@@ -259,7 +256,6 @@ def test_change_notifier_push_reaches_a_subscribed_ws_session(tmp_path, repo):
             owner,
             vault_id,
             lambda file_meta: sender({
-                "requestId": 0,
                 "op": "push",
                 "payload": {
                     "vaultId": vault_id,
@@ -273,13 +269,12 @@ def test_change_notifier_push_reaches_a_subscribed_ws_session(tmp_path, repo):
         )
 
     session = SyncWsSession(repo, servicer, sender, on_authenticated=on_authenticated)
-    session.handle_text_message('{"requestId":1,"op":"init","payload":{"token":"tok","vaultId":"vault1"}}')
+    session.handle_text_message('{"op":"init","payload":{"token":"tok","vaultId":"vault1"}}')
 
     notifier.notify_change("alice", "vault1", {"path": "a.md", "modified_at_ms": 1000, "size_bytes": 5, "content_hash": "h1", "is_deleted": False})
 
     push = sender.find("push")[-1]
     assert push == {
-        "requestId": 0,
         "op": "push",
         "payload": {"vaultId": "vault1", "path": "a.md", "modifiedAtMs": 1000, "sizeBytes": 5, "contentHash": "h1", "isDeleted": False},
     }
@@ -305,7 +300,6 @@ def test_ws_protocol_on_change_sends_push_with_real_file_metadata(tmp_path, repo
     notifier.notify_change("alice", "vault1", file_meta)
 
     assert sent == [{
-        "requestId": 0,
         "op": "push",
         "payload": {"vaultId": "vault1", "path": "a.md", "modifiedAtMs": 1000, "sizeBytes": 5, "contentHash": "h1", "isDeleted": False},
     }]
