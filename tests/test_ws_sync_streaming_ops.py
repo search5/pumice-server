@@ -1,26 +1,28 @@
-"""TDD for the binary file-chunk streaming ops (upload/download/history-download) -- the
-remainder of PR2 in #11_websocket_동기화_프로토콜_설계.md.
+"""TDD for the binary file-chunk streaming ops (push/download/history-download).
 
-Design note (not in the original doc, added while implementing): raw binary WS frames carry no
-envelope at all (matching Obsidian core's framing -- see the design doc's "왜 JSON인가"
-section), so the server can only ever have ONE streaming op (upload OR download OR
-history-download) actively producing/consuming binary frames on a connection at a time.
-SyncWsSession enforces this with a single _stream_active flag. There is also no requestId in
-the protocol anywhere anymore (see #14_옵시디언싱크_정렬_구현계획.md in the pumice repo) --
-exactly one request of any kind, streaming or not, may be outstanding on a connection at a time,
-matching Obsidian core's own Sync client.
+Design note: raw binary WS frames carry no envelope at all (matching Obsidian core's framing --
+see #11_websocket_동기화_프로토콜_설계.md's "왜 JSON인가" section), so the server can only ever
+have ONE streaming op (push OR download OR history-download) actively producing/consuming
+binary frames on a connection at a time. SyncWsSession enforces this with a single
+_stream_active flag. There is also no requestId in the protocol anywhere (see
+#14_옵시디언싱크_정렬_구현계획.md in the pumice repo) -- exactly one request of any kind,
+streaming or not, may be outstanding on a connection at a time, matching Obsidian core's own
+Sync client.
 
-Upload is buffered rather than truly incremental: file_chunk_header/binary/file_chunk_eof
-frames accumulate into an UploadBatch-shaped list of FileChunk protos (exactly what the
-existing, unmodified UploadFiles RPC already expects), and the batch is only handed to
-UploadFiles() once every declared file has its EOF. Real constant-memory streaming (mirroring
-streaming_upload_resource.py's per-chunk finalize) is a possible future optimization, out of
-scope here -- UploadFiles's own gRPC-Web path already fully buffers today anyway, so this is
-not a regression.
+push_req (PR6 of #14_옵시디언싱크_정렬_구현계획.md) replaced the old upload_begin/
+file_chunk_header/file_chunk_eof/upload_ack quartet: the client declares one file's
+path/contentHash/sizeBytes/modifiedAtMs up front, and the server either (a) already has that
+exact content live somewhere else in this vault (content-hash dedup, mirroring real Obsidian
+Sync's own `push` op) and hard-links/copies it onto the new path without asking for any bytes,
+or (b) asks for the raw binary frame and finalizes it once received. There is no more
+upload_begin batch wrapper -- one push_req is exactly one file, and the connection's existing
+single-outstanding-request serialization is what used to need a batch wrapper to get multiple
+files processed in order.
 
-Download and history-download need no such buffering: DownloadFiles/DownloadHistoryVersion are
-already async generators, reused completely unmodified -- each yielded FileChunk is translated
-to a JSON control frame (header/eof) or a raw binary frame (data) as it's produced.
+Download and history-download need no such per-file negotiation: DownloadFiles/
+DownloadHistoryVersion are already async generators, reused completely unmodified -- each
+yielded FileChunk is translated to a JSON control frame (header/eof) or a raw binary frame
+(data) as it's produced.
 """
 
 import asyncio
@@ -30,8 +32,8 @@ import pytest
 
 from pumice_server.repository import SqlAlchemyMetadataRepository
 from pumice_server.service import SyncServiceServicer
+from pumice_server.ws_sync_resource import SyncWsSession, _file_chunk_to_frame
 from pumice_server import wire_types
-from pumice_server.ws_sync_resource import SyncWsSession, _UploadAccumulator, _file_chunk_to_frame
 
 
 @pytest.fixture
@@ -78,55 +80,37 @@ def send_text(session, op, payload):
     return session.handle_text_message(json.dumps({"op": op, "payload": payload}))
 
 
-# ─── _UploadAccumulator (pure) ──────────────────────────────────────────────────────────────
+def push(session, sender, path, content, modified_at_ms=1000, declared_hash=None):
+    """Drives one full push_req round trip: sends the request, waits for the server's first
+    response (push_res if it needs data, push_ack directly on a dedup hit), feeds the binary
+    frame only in the push_res case, then waits for completion."""
+    content_hash = declared_hash if declared_hash is not None else hashlib.sha256(content).hexdigest()
+    coro = send_text(session, "push_req", {
+        "vaultId": "vault1", "path": path, "contentHash": content_hash,
+        "sizeBytes": len(content), "modifiedAtMs": modified_at_ms,
+    })
+    assert coro is not None
+    start_index = len(sender.sent)
+
+    async def drive():
+        task = asyncio.ensure_future(coro)
+        # _run_push's dedup lookup goes through asyncio.to_thread, which needs the event loop to
+        # actually notice the executor thread finished -- a single sleep(0) isn't enough to
+        # guarantee that, so poll with real (tiny) sleeps until push_res/push_ack shows up.
+        new_ops = []
+        for _ in range(1000):
+            new_ops = [m["op"] for kind, m in sender.sent[start_index:] if kind == "json"]
+            if "push_res" in new_ops or "push_ack" in new_ops:
+                break
+            await asyncio.sleep(0.001)
+        if "push_res" in new_ops:
+            session.handle_binary_frame(content)
+        await task
+
+    asyncio.run(drive())
 
 
-def test_upload_accumulator_is_not_complete_until_declared_file_count_reached():
-    acc = _UploadAccumulator(vault_id="v1", file_count=2)
-    assert acc.is_complete is False
-
-    acc.add_header("a.md", 3, 1000)
-    acc.add_data("a.md", 0, b"abc")
-    acc.add_eof("a.md", "hash-a")
-    assert acc.is_complete is False
-
-    acc.add_header("b.md", 3, 1000)
-    acc.add_eof("b.md", "hash-b")
-    assert acc.is_complete is True
-
-
-def test_upload_accumulator_builds_file_chunk_protos_in_order():
-    acc = _UploadAccumulator(vault_id="v1", file_count=1)
-    acc.add_header("a.md", 3, 1000)
-    acc.add_data("a.md", 0, b"abc")
-    acc.add_eof("a.md", "hash-a")
-
-    # WhichOneof() is a deliberate compatibility shim on wire_types.FileChunk (see its
-    # docstring) so this line reads identically to when acc.chunks held sync_pb2.FileChunk.
-    kinds = [c.WhichOneof("payload") for c in acc.chunks]
-    assert kinds == ["header", "data", "eof"]
-    assert acc.chunks[1].data.data == b"abc"
-    # PR5 (pumice's 13_PR5_계획.md): must be plain dataclasses now, not protobuf messages.
-    assert all(isinstance(c, wire_types.FileChunk) for c in acc.chunks)
-
-
-def test_upload_accumulator_add_header_passes_through_the_declared_content_hash():
-    """Item 6 (2026-08 re-analysis follow-up): the header may now declare contentHash up front,
-    not just at eof -- see wire_types.ChunkHeader's docstring."""
-    acc = _UploadAccumulator(vault_id="v1", file_count=1)
-    acc.add_header("a.md", 3, 1000, content_hash="hash-a")
-
-    assert acc.chunks[0].header.content_hash == "hash-a"
-
-
-def test_upload_accumulator_add_header_defaults_content_hash_to_empty_string():
-    acc = _UploadAccumulator(vault_id="v1", file_count=1)
-    acc.add_header("a.md", 3, 1000)
-
-    assert acc.chunks[0].header.content_hash == ""
-
-
-# ─── _file_chunk_to_frame (pure) ────────────────────────────────────────────────────────────
+# ─── _file_chunk_to_frame (pure, still used by download/history-download) ──────────────────
 
 
 def test_file_chunk_to_frame_translates_header():
@@ -144,84 +128,92 @@ def test_file_chunk_to_frame_translates_eof():
     assert _file_chunk_to_frame(chunk) == ("json", "file_chunk_eof", {"path": "a.md", "contentHash": "deadbeef"})
 
 
-# ─── upload end-to-end (real servicer + real vault dir) ────────────────────────────────────
+# ─── push_req end-to-end (real servicer + real vault dir) ──────────────────────────────────
 
 
-def test_single_file_upload_round_trip_writes_the_file_and_acks(tmp_path, repo):
+def test_push_req_with_no_existing_match_asks_for_data_then_acks(tmp_path, repo):
     session, sender, servicer = make_authenticated_session(tmp_path, repo)
-    content = b"hello from ws upload"
-    content_hash = hashlib.sha256(content).hexdigest()
+    content = b"hello from ws push"
 
-    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 1})
-    send_text(session, "file_chunk_header", {"vaultId": "vault1", "path": "note.md", "totalBytes": len(content), "modifiedAtMs": 1000})
-    session.handle_binary_frame(content)
-    coro = send_text(session, "file_chunk_eof", {"path": "note.md", "contentHash": content_hash})
-    run(coro)
+    push(session, sender, "note.md", content)
 
-    [ack] = sender.json_messages("upload_ack")
-    assert ack["payload"] == {"path": "note.md", "ok": True, "error": ""}
-
+    [res] = sender.json_messages("push_res")
+    assert res["payload"] == {"needData": True}
+    [ack] = sender.json_messages("push_ack")
+    assert ack["payload"] == {"ok": True, "needData": True, "error": ""}
     written = tmp_path / "vaults" / "alice" / "vault1" / "note.md"
     assert written.read_bytes() == content
-
-    # Explicit terminal signal -- the client has no other reliable way to know a streaming op is
-    # fully done (counting acks/eofs against what it sent isn't enough for downloads, since the
-    # server can silently skip a requested path -- see the module note).
     assert sender.json_messages("stream_end")
+    assert session._stream_active is False
 
 
-def test_two_file_batch_upload_sends_two_acks_and_only_finalizes_after_both(tmp_path, repo):
-    session, sender, servicer = make_authenticated_session(tmp_path, repo)
-
-    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 2})
-    for path, content in [("a.md", b"AAA"), ("b.md", b"BBBB")]:
-        send_text(session, "file_chunk_header", {"vaultId": "vault1", "path": path, "totalBytes": len(content), "modifiedAtMs": 1000})
-        session.handle_binary_frame(content)
-        h = hashlib.sha256(content).hexdigest()
-        coro = send_text(session, "file_chunk_eof", {"path": path, "contentHash": h})
-        if coro is not None:
-            run(coro)
-
-    acks = sender.json_messages("upload_ack")
-    assert {a["payload"]["path"] for a in acks} == {"a.md", "b.md"}
-    assert all(a["payload"]["ok"] for a in acks)
-    assert session._stream_active is False  # released once the batch finished
-
-
-def test_upload_hash_mismatch_is_acked_as_a_failure_not_a_crash(tmp_path, repo):
+def test_push_req_hash_mismatch_is_acked_as_a_failure_not_a_crash(tmp_path, repo):
     session, sender, servicer = make_authenticated_session(tmp_path, repo)
     content = b"tampered content"
 
-    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 1})
-    send_text(session, "file_chunk_header", {"vaultId": "vault1", "path": "note.md", "totalBytes": len(content), "modifiedAtMs": 1000})
-    session.handle_binary_frame(content)
-    coro = send_text(session, "file_chunk_eof", {"path": "note.md", "contentHash": "0" * 64})
-    run(coro)
+    push(session, sender, "note.md", content, declared_hash="0" * 64)
 
-    [ack] = sender.json_messages("upload_ack")
+    [ack] = sender.json_messages("push_ack")
     assert ack["payload"]["ok"] is False
+    assert "hash" in ack["payload"]["error"].lower()
+    assert sender.json_messages("stream_end")
+    assert session._stream_active is False
 
 
-def test_upload_end_to_end_carries_the_header_content_hash_through_to_a_mismatch_rejection(tmp_path, repo):
-    """Item 6 (2026-08 re-analysis follow-up): a contentHash declared in file_chunk_header that
-    disagrees with the one declared at file_chunk_eof is rejected -- full WS round trip, not
-    just the pure _UploadAccumulator/service.py unit tests."""
+def test_two_sequential_pushes_both_succeed_since_the_connection_serializes_them(tmp_path, repo):
     session, sender, servicer = make_authenticated_session(tmp_path, repo)
-    content = b"hello from ws upload"
-    real_hash = hashlib.sha256(content).hexdigest()
 
-    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 1})
-    send_text(session, "file_chunk_header", {
-        "vaultId": "vault1", "path": "note.md", "totalBytes": len(content), "modifiedAtMs": 1000,
-        "contentHash": "declared-in-header-and-wrong",
+    push(session, sender, "a.md", b"AAA")
+    push(session, sender, "b.md", b"BBBB")
+
+    acks = sender.json_messages("push_ack")
+    assert len(acks) == 2
+    assert all(a["payload"]["ok"] for a in acks)
+    assert session._stream_active is False
+
+
+# ─── push_req content-hash dedup (PR6) ───────────────────────────────────────────────────────
+
+
+def test_push_req_skips_data_entirely_when_the_content_already_exists_live_in_this_vault(tmp_path, repo):
+    session, sender, servicer = make_authenticated_session(tmp_path, repo)
+    content = b"shared content"
+    push(session, sender, "original.md", content)
+    sender.sent.clear()
+
+    content_hash = hashlib.sha256(content).hexdigest()
+    coro = send_text(session, "push_req", {
+        "vaultId": "vault1", "path": "copy.md", "contentHash": content_hash,
+        "sizeBytes": len(content), "modifiedAtMs": 2000,
     })
-    session.handle_binary_frame(content)
-    coro = send_text(session, "file_chunk_eof", {"path": "note.md", "contentHash": real_hash})
     run(coro)
 
-    [ack] = sender.json_messages("upload_ack")
-    assert ack["payload"]["ok"] is False
-    assert "header" in ack["payload"]["error"].lower()
+    # No push_res (which would mean "send me the bytes") -- push_ack comes straight back.
+    assert sender.json_messages("push_res") == []
+    [ack] = sender.json_messages("push_ack")
+    assert ack["payload"] == {"ok": True, "needData": False, "error": ""}
+    assert sender.binary_frames() == []
+    copied = tmp_path / "vaults" / "alice" / "vault1" / "copy.md"
+    assert copied.read_bytes() == content
+
+
+def test_push_req_dedup_does_not_match_a_different_vault(tmp_path, repo):
+    repo.create_device_token("tok-bob", "bob", "bobs-device", 0)
+    bob_servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo)
+    bob_sender = RecordingSender()
+    bob_session = SyncWsSession(repo, bob_servicer, bob_sender.send_json, send_binary=bob_sender.send_binary)
+    bob_session.handle_text_message('{"op":"init","payload":{"token":"tok-bob","vaultId":"vault1"}}')
+    push(bob_session, bob_sender, "bobs-file.md", b"shared content")
+
+    session, sender, servicer = make_authenticated_session(tmp_path, repo)
+    # Drives the full round trip (push() feeds the binary frame once push_res arrives) -- a bare
+    # send_text()+run() would hang forever here since _run_push awaits a binary frame that
+    # nothing would ever send.
+    push(session, sender, "alice-file.md", b"shared content")
+
+    # Bob's file must not leak into alice's dedup lookup -- this had to actually ask for bytes
+    # (a dedup hit would have skipped straight to push_ack with no push_res at all).
+    assert sender.json_messages("push_res") == [{"op": "push_res", "payload": {"needData": True}}]
 
 
 # ─── download end-to-end ─────────────────────────────────────────────────────────────────────
@@ -285,12 +277,28 @@ def test_history_dl_req_streams_a_backed_up_version(tmp_path, repo):
 def test_second_streaming_op_is_rejected_while_one_is_active(tmp_path, repo):
     session, sender, servicer = make_authenticated_session(tmp_path, repo)
 
-    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 1})  # left open (no eof yet)
+    # Deliberately left open (never scheduled/awaited, no binary sent) -- only the synchronous
+    # claim in handle_text_message matters for this test. Closed explicitly so pytest doesn't
+    # warn about an unawaited coroutine.
+    open_push_coro = send_text(session, "push_req", {"vaultId": "vault1", "path": "a.md", "contentHash": "h", "sizeBytes": 1, "modifiedAtMs": 1})
     coro = send_text(session, "download_req", {"vaultId": "vault1", "paths": ["note.md"]})
 
     assert coro is None
     err = sender.json_messages("error")[-1]
     assert err["payload"]["code"] == "STREAM_IN_PROGRESS"
+    open_push_coro.close()
+
+
+def test_a_second_push_req_is_rejected_while_one_is_already_active(tmp_path, repo):
+    session, sender, servicer = make_authenticated_session(tmp_path, repo)
+
+    first = send_text(session, "push_req", {"vaultId": "vault1", "path": "a.md", "contentHash": "h", "sizeBytes": 1, "modifiedAtMs": 1})
+    second = send_text(session, "push_req", {"vaultId": "vault1", "path": "b.md", "contentHash": "h2", "sizeBytes": 1, "modifiedAtMs": 1})
+
+    assert second is None
+    err = sender.json_messages("error")[-1]
+    assert err["payload"]["code"] == "STREAM_IN_PROGRESS"
+    first.close()
 
 
 def test_stream_lock_is_released_after_completion_allowing_the_next_one(tmp_path, repo):

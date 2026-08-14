@@ -89,6 +89,15 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
+    def find_live_file_by_content_hash(self, owner_username: str, vault_id: str, content_hash: str) -> Optional[Dict[str, Any]]:
+        """PR6 of #14_옵시디언싱크_정렬_구현계획.md: content-addressed upload dedup. Returns one
+        live (is_deleted=False) file_metadata row whose content_hash matches, or None -- scoped
+        to (owner, vault), never cross-vault/cross-owner (see the caller for why). Always None
+        for content_hash="" (the tombstone/placeholder sentinel elsewhere in this codebase, not
+        a real hash)."""
+        pass
+
+    @abstractmethod
     def get_history(self, owner_username: str, vault_id: str, path: str) -> list:
         pass
 
@@ -645,6 +654,20 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 )
             ).scalar()
             return int(result) if result is not None else 0
+
+    def find_live_file_by_content_hash(self, owner_username: str, vault_id: str, content_hash: str) -> Optional[Dict[str, Any]]:
+        if not content_hash:
+            return None
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._file_metadata).where(
+                    self._file_metadata.c.owner_username == owner_username,
+                    self._file_metadata.c.vault_id == vault_id,
+                    self._file_metadata.c.content_hash == content_hash,
+                    self._file_metadata.c.is_deleted.is_(False),
+                )
+            ).fetchone()
+            return self._row_to_meta(row) if row else None
 
     @contextmanager
     def batch(self):

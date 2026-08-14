@@ -517,6 +517,138 @@ class SyncServiceServicer:
                 os.remove(current_temp_path)
             return False, f"File move failed: {e}"
 
+    def finalize_pushed_file(self, owner_username: str, vault_id: str, rel_path: str, data: bytes,
+                              declared_size: int, modified_at_ms: int, declared_hash: str,
+                              device_name: str, user_name: str):
+        """PR6 of #14_옵시디언싱크_정렬_구현계획.md: finalizes one push_req's binary frame (the
+        dedup-miss case -- see finalize_deduped_file for the hit case). Per-file, not batched --
+        see the module docstring for why this looks up just this one path via
+        repository.load_one() instead of a pre-loaded whole-vault cache the way
+        _finalize_uploaded_file does."""
+        calculated_hash = hashlib.sha256(data).hexdigest()
+        if declared_hash and calculated_hash != declared_hash:
+            return False, "Header/eof content hash mismatch"
+        if len(data) != declared_size:
+            return False, f"Size mismatch: declared {declared_size}, got {len(data)}"
+
+        vault_path = self._get_vault_path(owner_username, vault_id)
+        current_file_path = os.path.join(vault_path, rel_path)
+        temp_path = current_file_path + f".tmp-{secrets.token_hex(4)}"
+
+        try:
+            os.makedirs(os.path.dirname(current_file_path), exist_ok=True)
+            with open(temp_path, "wb") as f:
+                f.write(data)
+
+            is_new_file = not os.path.exists(current_file_path)
+            should_backup = True
+            if is_history_excluded_path(rel_path):
+                should_backup = False
+            elif not is_new_file:
+                old_meta = self.repository.load_one(owner_username, vault_id, rel_path)
+                old_hash = old_meta.get("content_hash") if old_meta else None
+                if old_hash == calculated_hash:
+                    history_rows = self.repository.get_history(owner_username, vault_id, rel_path)
+                    should_backup = not history_rows
+
+            if os.path.exists(current_file_path):
+                os.remove(current_file_path)
+            os.rename(temp_path, current_file_path)
+            mtime_sec = modified_at_ms / 1000.0
+            os.utime(current_file_path, (mtime_sec, mtime_sec))
+
+            meta = {
+                "path": rel_path,
+                "modified_at_ms": modified_at_ms,
+                "size_bytes": len(data),
+                "content_hash": calculated_hash,
+                "is_deleted": False,
+            }
+
+            backup_file_path = None
+            if should_backup:
+                try:
+                    timestamp = int(time.time() * 1000)
+                    backup_dir = os.path.join(self.data_dir, "history", owner_username, vault_id)
+                    os.makedirs(backup_dir, exist_ok=True)
+                    backup_file_path = os.path.join(backup_dir, f"{timestamp}_{secrets.token_hex(4)}.bak")
+                    _backup_file(current_file_path, backup_file_path)
+                except Exception as backup_err:
+                    logger.error(f"Failed to create backup version for {rel_path}: {backup_err}")
+                    backup_file_path = None
+
+            with self.repository.batch() as batch:
+                batch.save_one(owner_username, vault_id, rel_path, meta)
+                batch.record_change(owner_username, vault_id, rel_path, meta)
+                if backup_file_path:
+                    batch.add_history(
+                        owner_username=owner_username, vault_id=vault_id, path=rel_path,
+                        modified_at_ms=modified_at_ms, size_bytes=len(data),
+                        content_hash=calculated_hash, backup_file_path=backup_file_path,
+                        device_name=device_name, user_name=user_name,
+                    )
+
+            if self.change_notifier is not None:
+                self.change_notifier.notify_change(owner_username, vault_id, meta)
+
+            return True, ""
+        except Exception as e:
+            logger.error(f"push finalize failed for {rel_path}: {e}", exc_info=True)
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return False, f"File move failed: {e}"
+
+    def finalize_deduped_file(self, owner_username: str, vault_id: str, rel_path: str,
+                               source_meta: dict, modified_at_ms: int,
+                               device_name: str, user_name: str) -> None:
+        """PR6: the server already has this exact content live at some other path in this vault
+        (a content-hash dedup hit -- see ws_sync_resource.py's push_req handling), so no bytes
+        were transferred. Hard-links (or copies, see _backup_file) the source file onto the new
+        path and records it exactly like a real upload would."""
+        vault_path = self._get_vault_path(owner_username, vault_id)
+        source_path = os.path.join(vault_path, source_meta["path"])
+        dest_path = os.path.join(vault_path, rel_path)
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        _backup_file(source_path, dest_path)
+        mtime_sec = modified_at_ms / 1000.0
+        os.utime(dest_path, (mtime_sec, mtime_sec))
+
+        meta = {
+            "path": rel_path,
+            "modified_at_ms": modified_at_ms,
+            "size_bytes": source_meta["size_bytes"],
+            "content_hash": source_meta["content_hash"],
+            "is_deleted": False,
+        }
+
+        backup_file_path = None
+        if not is_history_excluded_path(rel_path):
+            try:
+                timestamp = int(time.time() * 1000)
+                backup_dir = os.path.join(self.data_dir, "history", owner_username, vault_id)
+                os.makedirs(backup_dir, exist_ok=True)
+                backup_file_path = os.path.join(backup_dir, f"{timestamp}_{secrets.token_hex(4)}.bak")
+                _backup_file(dest_path, backup_file_path)
+            except Exception as backup_err:
+                logger.error(f"Failed to create backup version for deduped {rel_path}: {backup_err}")
+                backup_file_path = None
+
+        with self.repository.batch() as batch:
+            batch.save_one(owner_username, vault_id, rel_path, meta)
+            batch.record_change(owner_username, vault_id, rel_path, meta)
+            if backup_file_path:
+                batch.add_history(
+                    owner_username=owner_username, vault_id=vault_id, path=rel_path,
+                    modified_at_ms=modified_at_ms, size_bytes=meta["size_bytes"],
+                    content_hash=meta["content_hash"], backup_file_path=backup_file_path,
+                    device_name=device_name, user_name=user_name,
+                )
+
+        if self.change_notifier is not None:
+            self.change_notifier.notify_change(owner_username, vault_id, meta)
+
     async def UploadFiles(self, request, context):
         logger.info("gRPC UploadFiles batch started.")
         current_file_path = None

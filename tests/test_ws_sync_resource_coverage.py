@@ -53,6 +53,9 @@ class FakeRepository:
     def get_latest_change_id(self, owner_username, vault_id):
         return 0
 
+    def find_live_file_by_content_hash(self, owner_username, vault_id, content_hash):
+        return None  # always a dedup miss -- push_req tests below drive the "needs data" path
+
 
 class RecordingSender:
     def __init__(self):
@@ -179,106 +182,53 @@ def test_run_stream_request_turns_an_unexpected_servicer_exception_into_an_inter
     assert session._stream_active is False
 
 
-# ─── _finish_upload: same, for the buffered upload batch call ──────────────────────────────
+# ─── _run_push: same, for push_req's finalize call (PR6) ───────────────────────────────────
+#
+# Unlike _run_request/_run_stream_request, _run_push has no separate `except WsAborted` branch
+# -- finalize_pushed_file/finalize_deduped_file are plain synchronous methods, not RPC-style
+# servicer methods invoked through a WsServicerContext, so they have no context.abort() to raise
+# it from. Any unexpected exception (e.g. an unhandled disk error) becomes a generic INTERNAL
+# error, same shape as every other op's catch-all.
 
 
-class AbortingUploadServicer(PlainServicer):
-    async def UploadFiles(self, batch, context):
-        context.abort(StatusCode.INVALID_ARGUMENT, "batch rejected")
-        yield  # pragma: no cover -- unreachable; keeps this an async generator function
+class CrashingPushServicer(PlainServicer):
+    def finalize_pushed_file(self, *args, **kwargs):
+        raise RuntimeError("push boom")
 
 
-class CrashingUploadServicer(PlainServicer):
-    async def UploadFiles(self, batch, context):
-        raise RuntimeError("upload boom")
-        yield  # pragma: no cover -- unreachable; keeps this an async generator function
+def _run_single_push(session):
+    coro = send_text(session, "push_req", {"vaultId": "vault1", "path": "a.md", "contentHash": "deadbeef", "sizeBytes": 3, "modifiedAtMs": 1})
+
+    async def drive():
+        task = asyncio.ensure_future(coro)
+        await asyncio.sleep(0.01)
+        session.handle_binary_frame(b"abc")
+        await task
+
+    asyncio.run(drive())
 
 
-def _run_single_file_upload(session):
-    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 1})
-    send_text(session, "file_chunk_header", {"vaultId": "vault1", "path": "a.md", "totalBytes": 3, "modifiedAtMs": 1})
-    session.handle_binary_frame(b"abc")
-    run(send_text(session, "file_chunk_eof", {"path": "a.md", "contentHash": "deadbeef"}))
+def test_run_push_turns_an_unexpected_finalize_exception_into_an_internal_error_op():
+    session, sender = make_authenticated_session(CrashingPushServicer())
 
-
-def test_finish_upload_turns_a_ws_aborted_servicer_call_into_an_error_op_and_frees_the_lock():
-    session, sender = make_authenticated_session(AbortingUploadServicer())
-
-    _run_single_file_upload(session)
-
-    assert sender.last == {
-        "op": "error",
-        "payload": {"code": "INVALID_ARGUMENT", "message": "batch rejected"},
-    }
-    assert session._stream_active is False
-
-
-def test_finish_upload_turns_an_unexpected_servicer_exception_into_an_internal_error_op():
-    session, sender = make_authenticated_session(CrashingUploadServicer())
-
-    _run_single_file_upload(session)
-
-    assert sender.last["op"] == "error"
-    assert sender.last["payload"]["code"] == "INTERNAL"
-    assert "upload boom" in sender.last["payload"]["message"]
-    assert session._stream_active is False
-
-
-# ─── upload accumulator: STREAM_IN_PROGRESS / INVALID_STATE rejections ─────────────────────
-
-
-def test_upload_begin_while_a_stream_is_already_active_is_rejected_via_its_own_claim_check():
-    # Distinct from test_ws_sync_streaming_ops.py's
-    # test_second_streaming_op_is_rejected_while_one_is_active, which rejects the SECOND op
-    # (download_req) through handle_text_message's pre-dispatch claim. Here the second op is
-    # itself upload_begin, so the rejection instead has to happen inside
-    # _handle_upload_begin's own _try_claim_stream() call.
-    session, sender = make_authenticated_session(PlainServicer())
-
-    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 2})
-    send_text(session, "upload_begin", {"vaultId": "vault1", "fileCount": 1})
+    _run_single_push(session)
 
     err = sender.find("error")[-1]
-    assert err["payload"]["code"] == "STREAM_IN_PROGRESS"
-    # The first claim/accumulator must be left completely untouched by the rejected second call.
-    assert session._stream_active is True
-    assert session._upload_accumulator.file_count == 2
+    assert err["payload"]["code"] == "INTERNAL"
+    assert "push boom" in err["payload"]["message"]
+    assert session._stream_active is False
 
 
-def test_file_chunk_header_without_a_prior_upload_begin_is_rejected():
+def test_binary_frame_with_no_active_push_is_dropped_and_logged(caplog):
     session, sender = make_authenticated_session(PlainServicer())
-
-    send_text(session, "file_chunk_header", {"vaultId": "vault1", "path": "a.md", "totalBytes": 3, "modifiedAtMs": 1})
-
-    assert sender.last == {
-        "op": "error",
-        "payload": {"code": "INVALID_STATE", "message": "file_chunk_header without an active upload_begin"},
-    }
-    assert session._upload_accumulator is None
-
-
-def test_file_chunk_eof_without_a_prior_upload_begin_is_rejected():
-    session, sender = make_authenticated_session(PlainServicer())
-
-    result = send_text(session, "file_chunk_eof", {"path": "a.md", "contentHash": "deadbeef"})
-
-    assert result is None  # no batch was ever started, so there's nothing to finalize
-    assert sender.last == {
-        "op": "error",
-        "payload": {"code": "INVALID_STATE", "message": "file_chunk_eof without an active upload_begin"},
-    }
-
-
-def test_binary_frame_with_no_active_upload_is_dropped_and_logged(caplog):
-    session, sender = make_authenticated_session(PlainServicer())
-    sent_before = len(sender.sent)  # init_ok was already recorded by make_authenticated_session
+    sent_before = len(sender.sent)  # init_ok/ready were already recorded by make_authenticated_session
 
     with caplog.at_level(logging.WARNING, logger="pumice_server.ws_sync_resource"):
         session.handle_binary_frame(b"stray-data")
 
     # Dropped silently on the wire -- only a server-side log, no error op sent to the client.
     assert len(sender.sent) == sent_before
-    assert "no active upload in progress" in caplog.text
+    assert "no push_req waiting for data" in caplog.text
 
 
 # ─── SyncWebSocketProtocol: the autobahn glue (onOpen/onMessage/onClose/init-timeout) ───────
@@ -347,23 +297,22 @@ def test_on_message_dispatches_binary_and_text_frames_and_cancels_init_timeout_a
     assert protocol._session.authenticated is True
     assert init_timeout_call.active() is False
 
-    protocol.onMessage(json.dumps(
-        {"op": "upload_begin", "payload": {"vaultId": "vault1", "fileCount": 1}}
-    ).encode("utf-8"), False)
-    protocol.onMessage(json.dumps(
-        {"op": "file_chunk_header", "payload": {"vaultId": "vault1", "path": "a.md", "totalBytes": 3, "modifiedAtMs": 1}}
-    ).encode("utf-8"), False)
-
-    # The isBinary branch: dispatched straight to handle_binary_frame, not JSON-decoded.
-    protocol.onMessage(b"abc", True)
-    assert protocol._session._upload_current_sequence == 1
+    content = b"abc"
+    content_hash = hashlib.sha256(content).hexdigest()
 
     async def finish():
-        # file_chunk_eof completes the batch and returns a coroutine that onMessage must
-        # schedule via asyncio.ensure_future rather than run synchronously.
+        # push_req itself returns a coroutine (unlike init/ping, which resolve synchronously)
+        # that onMessage must schedule via asyncio.ensure_future rather than run inline -- it
+        # awaits the binary frame the isBinary branch below delivers via handle_binary_frame.
         protocol.onMessage(json.dumps(
-            {"op": "file_chunk_eof", "payload": {"path": "a.md", "contentHash": hashlib.sha256(b"abc").hexdigest()}}
+            {"op": "push_req", "payload": {"vaultId": "vault1", "path": "a.md", "contentHash": content_hash, "sizeBytes": len(content), "modifiedAtMs": 1}}
         ).encode("utf-8"), False)
+        for _ in range(200):
+            ops_so_far = [json.loads(d)["op"] for d, is_binary in sent if not is_binary]
+            if "push_res" in ops_so_far:
+                break
+            await asyncio.sleep(0.005)
+        protocol.onMessage(content, True)  # isBinary branch: dispatched straight to handle_binary_frame
         pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         if pending:
             await asyncio.gather(*pending)
@@ -371,7 +320,7 @@ def test_on_message_dispatches_binary_and_text_frames_and_cancels_init_timeout_a
     asyncio.run(finish())
 
     ops = [json.loads(data)["op"] for data, is_binary in sent if not is_binary]
-    assert "upload_ack" in ops
+    assert "push_ack" in ops
 
 
 def test_on_close_cancels_the_init_timeout_and_unsubscribes_from_change_notifications(tmp_path, repo):

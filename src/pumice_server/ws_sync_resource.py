@@ -243,39 +243,6 @@ _STREAM_HANDLERS: Dict[str, Callable] = {
 }
 
 
-class _UploadAccumulator:
-    """Buffers incoming file_chunk_header/binary/file_chunk_eof frames for one upload_begin
-    batch into FileChunk protos -- exactly the shape UploadBatch.chunks already has for the
-    existing (unmodified) UploadFiles RPC. The whole batch is handed to UploadFiles() only once
-    every declared file has its EOF (see SyncWsSession._finish_upload). Real incremental
-    (constant-memory) upload streaming, mirroring streaming_upload_resource.py's per-chunk
-    finalize, is a possible future optimization -- out of scope here, and not a regression
-    since UploadFiles's existing gRPC-Web path already fully buffers a batch today too."""
-
-    def __init__(self, vault_id: str, file_count: int):
-        self.vault_id = vault_id
-        self.file_count = file_count
-        self.chunks: list = []
-        self.files_completed = 0
-
-    def add_header(self, path: str, total_bytes: int, modified_at_ms: int, content_hash: str = "") -> None:
-        self.chunks.append(wire_types.FileChunk(header=wire_types.ChunkHeader(
-            vault_id=self.vault_id, path=path, total_bytes=total_bytes, modified_at_ms=modified_at_ms,
-            content_hash=content_hash,
-        )))
-
-    def add_data(self, path: str, sequence: int, data: bytes) -> None:
-        self.chunks.append(wire_types.FileChunk(data=wire_types.ChunkData(path=path, sequence=sequence, data=data)))
-
-    def add_eof(self, path: str, content_hash: str) -> None:
-        self.chunks.append(wire_types.FileChunk(eof=wire_types.ChunkEOF(path=path, content_hash=content_hash)))
-        self.files_completed += 1
-
-    @property
-    def is_complete(self) -> bool:
-        return self.files_completed >= self.file_count
-
-
 class SyncWsSession:
     def __init__(self, repository, servicer, send: SendFn, send_binary: Optional[Callable[[bytes], None]] = None,
                  on_authenticated: Optional[Callable[[str, str], None]] = None):
@@ -291,20 +258,21 @@ class SyncWsSession:
         self.user_name: str = ""
         self.token: str = ""
 
-        # Streaming (binary file-chunk) op state -- see the module-level note above
-        # _UploadAccumulator for why only one of these can be active at a time.
+        # Streaming (binary file-chunk) op state -- exactly one of upload/download/history-
+        # download may be active on a connection at a time (see _try_claim_stream). For push_req
+        # (PR6 of #14_옵시디언싱크_정렬_구현계획.md), _push_data_future is how the async
+        # _run_push() coroutine awaits the next raw binary WS frame: handle_binary_frame() is
+        # invoked synchronously by the autobahn protocol's onMessage, with no coroutine of its
+        # own to hand the bytes to directly, so it just resolves this future if one is waiting.
         self._stream_active: bool = False
-        self._upload_accumulator: Optional[_UploadAccumulator] = None
-        self._upload_current_path: Optional[str] = None
-        self._upload_current_sequence: int = 0
+        self._push_data_future: Optional["asyncio.Future"] = None
 
     def handle_text_message(self, raw: str) -> Optional["asyncio.Future"]:
-        """Handles one text frame. init/ping/parse-errors/upload-chunk-control are resolved
-        synchronously (return None). An op needing an async servicer call returns a coroutine
-        the caller must schedule (e.g. asyncio.ensure_future) -- kept as a plain coroutine
-        rather than being scheduled in here so this stays synchronously testable without a
-        running event loop. file_chunk_eof is the one exception that *may* return a coroutine
-        (when it completes an upload batch, triggering UploadFiles)."""
+        """Handles one text frame. init/ping/parse-errors are resolved synchronously (return
+        None). An op needing an async servicer call (or, for push_req, a round trip to the
+        client for binary data) returns a coroutine the caller must schedule (e.g.
+        asyncio.ensure_future) -- kept as a plain coroutine rather than being scheduled in here
+        so this stays synchronously testable without a running event loop."""
         try:
             envelope = json.loads(raw)
         except (ValueError, TypeError):
@@ -325,14 +293,12 @@ class SyncWsSession:
             self._send_pong()
             return None
 
-        if op == "upload_begin":
-            self._handle_upload_begin(payload)
-            return None
-        if op == "file_chunk_header":
-            self._handle_file_chunk_header(payload)
-            return None
-        if op == "file_chunk_eof":
-            return self._handle_file_chunk_eof(payload)
+        if op == "push_req":
+            # Claimed synchronously (not inside the coroutine below) so a second streaming op
+            # is rejected immediately, before any scheduling -- same as every other stream op.
+            if not self._try_claim_stream():
+                return None
+            return self._run_push(payload)
 
         handler = _REQUEST_HANDLERS.get(op)
         if handler is not None:
@@ -401,68 +367,51 @@ class SyncWsSession:
         finally:
             self._stream_active = False
 
-    def _handle_upload_begin(self, payload: dict) -> None:
-        if not self._try_claim_stream():
-            return
-        vault_id = payload.get("vaultId", self.vault_id or "")
-        file_count = payload.get("fileCount", 0)
-        self._upload_accumulator = _UploadAccumulator(vault_id, file_count)
-        self._upload_current_path = None
-        self._upload_current_sequence = 0
-
-    def _handle_file_chunk_header(self, payload: dict) -> None:
-        if not self._stream_active or self._upload_accumulator is None:
-            self._send_error("INVALID_STATE", "file_chunk_header without an active upload_begin")
-            return
-        path = payload.get("path", "")
-        self._upload_accumulator.add_header(
-            path, payload.get("totalBytes", 0), payload.get("modifiedAtMs", 0), payload.get("contentHash", "")
-        )
-        self._upload_current_path = path
-        self._upload_current_sequence = 0
-
     def handle_binary_frame(self, data: bytes) -> None:
-        if not self._stream_active or self._upload_accumulator is None or self._upload_current_path is None:
-            logger.warning("WS: received a binary frame with no active upload in progress")
-            return
-        self._upload_accumulator.add_data(self._upload_current_path, self._upload_current_sequence, data)
-        self._upload_current_sequence += 1
-
-    def _handle_file_chunk_eof(self, payload: dict) -> Optional["asyncio.Future"]:
-        if not self._stream_active or self._upload_accumulator is None:
-            self._send_error("INVALID_STATE", "file_chunk_eof without an active upload_begin")
-            return None
-        path = payload.get("path", "")
-        self._upload_accumulator.add_eof(path, payload.get("contentHash", ""))
-        self._upload_current_path = None
-
-        if not self._upload_accumulator.is_complete:
-            return None
-
-        accumulator = self._upload_accumulator
-        self._upload_accumulator = None
-        return self._finish_upload(accumulator)
-
-    async def _finish_upload(self, accumulator: _UploadAccumulator) -> None:
-        try:
-            batch = wire_types.UploadBatch(chunks=accumulator.chunks)
-            async for ack in self.servicer.UploadFiles(batch, WsServicerContext(self)):
-                self._send({
-                    "op": "upload_ack",
-                    "payload": {"path": ack.path, "ok": ack.ok, "error": ack.error},
-                })
-        except WsAborted as e:
-            self._send_error(e.code.name, e.details or "")
-        except Exception as e:
-            logger.error(f"WS upload failed: {e}")
-            self._send_error("INTERNAL", str(e))
+        if self._push_data_future is not None and not self._push_data_future.done():
+            self._push_data_future.set_result(data)
+            self._push_data_future = None
         else:
-            # Same terminal signal as the download/history-download streams (see
-            # _run_stream_request) -- keeps the client's "how do I know this stream is done"
-            # logic uniform across every streaming op instead of needing upload-specific
-            # ack-counting against fileCount.
-            self._send({"op": "stream_end", "payload": {}})
+            logger.warning("WS: received a binary frame with no push_req waiting for data")
+
+    async def _run_push(self, payload: dict) -> None:
+        """PR6 of #14_옵시디언싱크_정렬_구현계획.md: one push_req end to end. Content-addressed
+        dedup (mirrors real Obsidian Sync's own `push` op, confirmed via obsidian.asar analysis)
+        -- if the declared contentHash already matches a live file elsewhere in this vault, the
+        server hard-links/copies it onto the new path and skips the byte transfer entirely
+        (push_ack with needData=false, no push_res, no binary frame). Otherwise push_res tells
+        the client to send exactly one raw binary frame with the whole file, which
+        finalize_pushed_file() verifies and writes."""
+        vault_id = payload.get("vaultId", self.vault_id or "")
+        rel_path = payload.get("path", "")
+        content_hash = payload.get("contentHash", "")
+        size_bytes = payload.get("sizeBytes", 0)
+        modified_at_ms = payload.get("modifiedAtMs", 0)
+        try:
+            dedup_source = await asyncio.to_thread(
+                self.repository.find_live_file_by_content_hash, self.owner_username, vault_id, content_hash
+            )
+            if dedup_source is not None and dedup_source["path"] != rel_path:
+                await asyncio.to_thread(
+                    self.servicer.finalize_deduped_file, self.owner_username, vault_id, rel_path,
+                    dedup_source, modified_at_ms, self.device_name, self.user_name,
+                )
+                self._send({"op": "push_ack", "payload": {"ok": True, "needData": False, "error": ""}})
+            else:
+                self._send({"op": "push_res", "payload": {"needData": True}})
+                self._push_data_future = asyncio.get_event_loop().create_future()
+                data = await self._push_data_future
+                ok, err = await asyncio.to_thread(
+                    self.servicer.finalize_pushed_file, self.owner_username, vault_id, rel_path,
+                    data, size_bytes, modified_at_ms, content_hash, self.device_name, self.user_name,
+                )
+                self._send({"op": "push_ack", "payload": {"ok": ok, "needData": True, "error": err}})
+        except Exception as e:
+            logger.error(f"WS push failed for {rel_path}: {e}")
+            self._send_error("INTERNAL", str(e))
         finally:
+            self._push_data_future = None
+            self._send({"op": "stream_end", "payload": {}})
             self._stream_active = False
 
     def _handle_init(self, payload: dict) -> None:
