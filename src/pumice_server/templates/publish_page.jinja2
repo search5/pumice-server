@@ -331,6 +331,11 @@
         <main class="container markdown-body">
             {% if files is not none -%}
             <h1>{{ site_name }}</h1>{% if files %}<ul>{% for f in files %}<li><a href="{{ file_hrefs[f] }}">{{ f }}</a></li>{% endfor %}</ul>{% else %}<p>{{ t('publish_public.empty_no_files') }}</p>{% endif %}
+            {%- elif client_rendered -%}
+            {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
+            <div id="pumice-note-root" data-note-path="{{ path }}"></div>
+            <script>window.pumicePreload = {{ preload_json | safe }};</script>
+            <script defer src="/static/publish_render.js"></script>
             {%- else -%}
             {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
             {{ content | safe }}

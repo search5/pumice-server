@@ -18,6 +18,7 @@ from .plugin_registry import discover_plugins
 from .plugin_loader import load_plugin_autofill_paths, load_plugin_config_fields, run_enabled_plugins, suggest_plugin_autofill
 from .plugin_config_crypto import PluginConfigEncryptionError, decrypt_json, encrypt_json
 from .plugin_resolve_disk_cache import make_disk_cache
+from .metadata_cache import extract_metadata_cache_entry
 from .plugin_autofill import read_vault_files, sanitize_autofill_suggestions
 from . import oauth_server
 
@@ -311,6 +312,33 @@ def save_publish_meta(data_dir: str, owner_username: str, vault_id: str, filenam
     path = os.path.join(meta_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+_METADATA_CACHE_FILENAME = "metadata_cache.json"
+
+def _update_metadata_cache_entry(data_dir: str, owner_username: str, vault_id: str, path: str, file_path: str) -> None:
+    """Keeps `metadata_cache.json` (see 28_실제_아키텍처_전환_Phase1_노트본문.md, pumice repo)
+    up to date incrementally on every upload -- mirrors _warm_plugin_resolve_cache's existing
+    "compute once at upload time" pattern rather than re-parsing the whole vault on every page
+    view. Non-markdown files (media, publish.css/js, ...) get a `null` entry, matching what real
+    Obsidian's own /cache/{uid} payload does for non-note paths (confirmed via 27_...md)."""
+    cache = load_publish_meta(data_dir, owner_username, vault_id, _METADATA_CACHE_FILENAME, {})
+    if path.lower().endswith(".md"):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw_md = f.read()
+            cache[path] = extract_metadata_cache_entry(raw_md)
+        except Exception as e:
+            logger.error(f"Failed to update metadata cache entry for '{path}' in vault={vault_id}: {e}")
+            cache[path] = None
+    else:
+        cache[path] = None
+    save_publish_meta(data_dir, owner_username, vault_id, _METADATA_CACHE_FILENAME, cache)
+
+def _remove_metadata_cache_entry(data_dir: str, owner_username: str, vault_id: str, path: str) -> None:
+    cache = load_publish_meta(data_dir, owner_username, vault_id, _METADATA_CACHE_FILENAME, {})
+    if path in cache:
+        del cache[path]
+        save_publish_meta(data_dir, owner_username, vault_id, _METADATA_CACHE_FILENAME, cache)
 
 @view_config(route_name='root', permission='authenticated')
 def root_view(request):
@@ -905,6 +933,7 @@ def publish_upload_view(request):
         request.repository.set_published_file_aliases(request.context.owner, vault_id, path, aliases)
         logger.info(f"Published file saved: vault={vault_id}, path={path}, hash={obs_hash}")
 
+        _update_metadata_cache_entry(data_dir, username, vault_id, path, dest_file_path)
         _warm_plugin_resolve_cache(request, username, vault_id, dest_file_path, data_dir)
 
         return {"ok": True}
@@ -976,6 +1005,7 @@ def publish_remove_view(request):
         # A removed file's old-URL redirects must go with it -- otherwise they'd point at
         # content that no longer exists (see 22_aliases_리다이렉트_및_파비콘_자동감지.md).
         request.repository.set_published_file_aliases(request.context.owner, vault_id, path, [])
+        _remove_metadata_cache_entry(data_dir, username, vault_id, path)
         logger.info(f"Published file removed: vault={vault_id}, path={path}")
 
         return {"ok": True}
@@ -1075,6 +1105,45 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
     data_dir = request.registry.settings.get("data_dir")
     published_base = os.path.abspath(os.path.join(data_dir, "published", username, vault_id))
 
+    # Real Obsidian Publish's client-side renderer (see 27_실제_퍼블리시_사이트_아키텍처_조사.md/
+    # 28_실제_아키텍처_전환_Phase1_노트본문.md, pumice repo) fetches a whole-vault metadata cache
+    # and each note's raw markdown separately, then renders client-side -- these two reserved
+    # sub-paths mirror that (adapted to this server's username/vault_id URL scheme instead of
+    # real Obsidian's opaque site uid). Handled here, before the normal path-lookup/permalink/
+    # alias logic below, so a real published file can never collide with them -- an actual vault
+    # file literally named "_cache.json" (or under a "_raw/" folder) is assumed not to occur in
+    # practice; if it ever does, the reserved path wins.
+    if path == "_cache.json":
+        cache = load_publish_meta(data_dir, username, vault_id, "metadata_cache.json", {})
+        # Permalinks live in the DB (get_published_files), not the markdown-derived cache file,
+        # so they're merged in here rather than baked into metadata_cache.json -- a permalink can
+        # change independently of a note's content, and this way there's nothing to go stale.
+        # The client renderer needs this to turn a `[[wikilink]]` target into the same pretty URL
+        # parse_wikilinks already produces server-side (see 19_permalink_지원.md).
+        permalink_by_path = {
+            f["path"]: f["permalink"] for f in request.repository.get_published_files(username, vault_id)
+            if f.get("permalink")
+        }
+        enriched = {}
+        for file_path_key, entry in cache.items():
+            if entry is None:
+                enriched[file_path_key] = None
+                continue
+            enriched_entry = dict(entry)
+            permalink = permalink_by_path.get(file_path_key)
+            if permalink:
+                enriched_entry["permalink"] = permalink
+            enriched[file_path_key] = enriched_entry
+        return Response(body=json.dumps(enriched, ensure_ascii=False).encode("utf-8"), content_type="application/json")
+    if path.startswith("_raw/"):
+        raw_rel_path = path[len("_raw/"):]
+        raw_file_path = os.path.abspath(os.path.join(published_base, raw_rel_path))
+        if not raw_file_path.startswith(published_base) or not os.path.exists(raw_file_path):
+            return Response("Not found", status=404)
+        with open(raw_file_path, "rb") as f:
+            raw_bytes = f.read()
+        return Response(body=raw_bytes, content_type="text/markdown; charset=utf-8")
+
     # Fetched once and shared by both branches below -- used for permalink/description/image
     # lookups on a note page, and for favicon/static-asset detection (both site-wide concerns)
     # on both.
@@ -1122,6 +1191,7 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
                 "files": files, "file_hrefs": _published_file_hrefs(url_prefix, files),
                 "content": None, "description": None, "image": None, "favicons": favicon_links,
                 "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
+                "client_rendered": False, "path": None, "preload_json": None,
                 **common_option_fields,
             }
 
@@ -1198,12 +1268,26 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
     description = own.get("description") or _auto_generate_description(html_content)
     image = _resolve_og_image_url(own.get("image"), request, url_prefix)
 
+    # 28_실제_아키텍처_전환_Phase1_노트본문.md: notes render client-side (raw markdown + the
+    # metadata cache built above, fetched by static/publish_render.js) to match real Obsidian
+    # Publish's actual architecture -- EXCEPT when this vault has enabled plugins. Plugins
+    # transform `processed_md` (already wikilink-resolved by parse_wikilinks) before it reaches
+    # Python-Markdown; moving wikilink resolution client-side would hand plugins a different
+    # input shape than they're written to expect, so plugin-enabled vaults keep the old
+    # fully-server-rendered path unchanged for now (see Phase 1's explicitly-out-of-scope list).
+    # `html_content`/`description` are computed unconditionally either way -- description/
+    # og:description must stay server-rendered regardless, since crawlers read <meta> tags
+    # without executing JS.
+    client_rendered = not enabled_plugin_ids
+    preload_json = json.dumps({"url_prefix": url_prefix, "path": path}, ensure_ascii=False) if client_rendered else None
+
     return {
         "lang": lang, "t": lambda key, **params: t(key, lang, **params),
         "title": title,
         "files": None, "file_hrefs": {}, "content": html_content,
         "description": description, "image": image, "favicons": favicon_links,
         "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
+        "client_rendered": client_rendered, "path": path, "preload_json": preload_json,
         **common_option_fields,
     }
 

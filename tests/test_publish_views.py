@@ -668,3 +668,101 @@ def test_custom_domain_view_404s_for_a_domain_that_was_just_released(repo, tmp_p
     response = web.custom_domain_view(request)
 
     assert response.status_code == 404
+
+
+# ─── metadata cache (28_실제_아키텍처_전환_Phase1_노트본문.md) ──────────────────────────────────
+
+def test_upload_records_a_metadata_cache_entry_for_a_markdown_file(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n\n[[Other]]\n")
+
+    cache = web.load_publish_meta(str(tmp_path), "alice", "vault1", "metadata_cache.json")
+    assert cache["note.md"]["headings"] == [
+        {"heading": "Title", "level": 1, "pos": [0, 0, 0, 0, 7, 7]}
+    ]
+    assert [l["link"] for l in cache["note.md"]["links"]] == ["Other"]
+
+
+def test_upload_records_a_null_entry_for_a_non_markdown_file(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "image.png", b"\x89PNG")
+
+    cache = web.load_publish_meta(str(tmp_path), "alice", "vault1", "metadata_cache.json")
+    assert cache["image.png"] is None
+
+
+def test_reuploading_a_file_recomputes_its_metadata_cache_entry(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# First\n")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Second\n")
+
+    cache = web.load_publish_meta(str(tmp_path), "alice", "vault1", "metadata_cache.json")
+    assert cache["note.md"]["headings"][0]["heading"] == "Second"
+
+
+def test_removing_a_file_deletes_its_metadata_cache_entry(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+    request = FakeRequest(repo, tmp_path, owner="alice", vault_id="vault1", json_body={"path": "note.md"})
+    result = web.publish_remove_view(request)
+    assert result == {"ok": True}
+
+    cache = web.load_publish_meta(str(tmp_path), "alice", "vault1", "metadata_cache.json")
+    assert "note.md" not in cache
+
+
+def test_render_cache_json_reserved_path_returns_the_metadata_cache(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+
+    response = render(repo, tmp_path, "alice", "vault1", "_cache.json")
+
+    assert response.content_type == "application/json"
+    assert json.loads(response.body)["note.md"]["headings"][0]["heading"] == "Title"
+
+
+def test_render_cache_json_merges_in_permalinks_from_the_db(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n", permalink="/pretty/")
+
+    response = render(repo, tmp_path, "alice", "vault1", "_cache.json")
+
+    assert json.loads(response.body)["note.md"]["permalink"] == "/pretty/"
+
+
+def test_render_raw_reserved_path_returns_raw_markdown(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n\n[[Wikilink]]\n")
+
+    response = render(repo, tmp_path, "alice", "vault1", "_raw/note.md")
+
+    assert response.content_type == "text/markdown"
+    assert response.body == b"# Title\n\n[[Wikilink]]\n"
+
+
+def test_render_raw_reserved_path_404s_for_a_missing_file(repo, tmp_path):
+    response = render(repo, tmp_path, "alice", "vault1", "_raw/missing.md")
+
+    assert response.status_code == 404
+
+
+def test_render_raw_reserved_path_blocks_path_traversal(repo, tmp_path):
+    response = render(repo, tmp_path, "alice", "vault1", "_raw/../../etc/passwd")
+
+    assert response.status_code == 404
+
+
+def test_note_without_enabled_plugins_is_client_rendered(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n\nHello.\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["client_rendered"] is True
+    assert result["path"] == "note.md"
+    assert json.loads(result["preload_json"]) == {"url_prefix": "/publish/alice/vault1/", "path": "note.md"}
+    # description auto-generation still relies on server-side html_content -- unaffected.
+    assert result["description"] == "Title Hello."
+
+
+def test_note_with_an_enabled_plugin_stays_server_rendered(repo, tmp_path):
+    repo.enable_plugin("alice", "vault1", "immich", 1000)
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n\nHello.\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["client_rendered"] is False
+    assert result["preload_json"] is None
+    assert "Hello" in result["content"]

@@ -22,6 +22,7 @@ dependencies = [
     "babel>=2.18.0",
     "pumice-plugin-immich>=0.1.0",
     "autobahn[twisted]>=26.7.1",
+    "pyyaml>=6.0.3",
 ]
 
 [project.urls]
