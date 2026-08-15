@@ -4,6 +4,7 @@ import logging
 import re
 import os
 import uuid
+from typing import Optional
 from babel.messages.pofile import read_po
 from babel.support import Translations
 from urllib.parse import quote, unquote
@@ -682,36 +683,64 @@ FRONTMATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
 def strip_frontmatter(md_content: str) -> str:
     return FRONTMATTER_RE.sub("", md_content, count=1)
 
-def parse_wikilinks(text: str, username: str, vault_id: str) -> str:
+def _build_path_to_permalink(files: list) -> dict:
+    """Builds a wikilink-target -> permalink lookup from get_published_files()'s result, so
+    parse_wikilinks can resolve each link's pretty URL with plain dict lookups instead of a
+    DB query per link (see 19_permalink_지원.md, pumice repo). Each stored path is registered
+    under both its full form ("notes/a.md") and, for .md files, its extension-stripped form
+    ("notes/a") -- wikilink targets are written either way."""
+    lookup = {}
+    for f in files:
+        permalink = f.get("permalink")
+        if not permalink:
+            continue
+        path = f["path"]
+        lookup[path] = permalink
+        if path.lower().endswith(".md"):
+            lookup[path[:-3]] = permalink
+    return lookup
+
+def parse_wikilinks(text: str, username: str, vault_id: str, path_to_permalink: Optional[dict] = None) -> str:
+    path_to_permalink = path_to_permalink or {}
+
     # 1. Handle image wikilinks: ![[image.png|width]]
     def repl_img(match):
         target = match.group(1).strip()
-        safe_target = quote(target, safe='/')
-        src = f"/publish/{username}/{vault_id}/{safe_target}"
+        permalink = path_to_permalink.get(target)
+        if permalink:
+            src = f"/publish/{username}/{vault_id}/{quote(permalink, safe='/')}"
+        else:
+            safe_target = quote(target, safe='/')
+            src = f"/publish/{username}/{vault_id}/{safe_target}"
         width_attr = ""
         if match.group(2):
             width = match.group(2).strip()
             if width.isdigit():
                 width_attr = f' width="{width}"'
         return f'<img src="{src}" alt="{target}"{width_attr}>'
-        
+
     text = re.sub(r'!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]', repl_img, text)
 
     # 2. Handle regular document wikilinks: [[target|label]] or [[target]]
     def repl_link(match):
         target = match.group(1).strip()
         label = match.group(2).strip() if match.group(2) else target
-        
+
+        permalink = path_to_permalink.get(target)
+        if permalink:
+            href = f"/publish/{username}/{vault_id}/{quote(permalink, safe='/')}"
+            return f'<a href="{href}" class="wiki-link">{label}</a>'
+
         base_target, ext = os.path.splitext(target)
         if ext.lower() == ".md":
             url_target = base_target
         else:
             url_target = target
-            
+
         safe_target = quote(url_target, safe='/')
         href = f"/publish/{username}/{vault_id}/{safe_target}"
         return f'<a href="{href}" class="wiki-link">{label}</a>'
-        
+
     text = re.sub(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]', repl_link, text)
     return text
 
@@ -756,11 +785,13 @@ def publish_upload_view(request):
         vault_id = request.context.vault_id
         obs_path_enc = request.headers.get("obs-path")
         obs_hash = request.headers.get("obs-hash")
+        obs_permalink_enc = request.headers.get("obs-permalink")
 
         if not obs_path_enc or not obs_hash:
             return Response(body=json.dumps({"error": "Missing obs-id, obs-path or obs-hash header"}).encode("utf-8"), status=400, content_type="application/json")
 
         path = unquote(obs_path_enc)
+        permalink = unquote(obs_permalink_enc) if obs_permalink_enc else None
 
         # File storage location: data_dir/published/username/vault_id/path
         data_dir = request.registry.settings.get("data_dir")
@@ -777,7 +808,15 @@ def publish_upload_view(request):
         with open(dest_file_path, "wb") as f:
             f.write(body_data)
             
-        request.repository.add_published_file(request.context.owner, vault_id, path, obs_hash)
+        if permalink:
+            existing = request.repository.get_published_file_by_permalink(request.context.owner, vault_id, permalink)
+            if existing and existing["path"] != path:
+                logger.warning(
+                    f"permalink collision: '{permalink}' now points to '{path}' "
+                    f"(was '{existing['path']}') in vault={vault_id}"
+                )
+
+        request.repository.add_published_file(request.context.owner, vault_id, path, obs_hash, permalink=permalink)
         logger.info(f"Published file saved: vault={vault_id}, path={path}, hash={obs_hash}")
 
         _warm_plugin_resolve_cache(request, username, vault_id, dest_file_path, data_dir)
@@ -807,7 +846,8 @@ def _warm_plugin_resolve_cache(request, owner: str, vault_id: str, file_path: st
 
         with open(file_path, "r", encoding="utf-8") as f:
             md_content = f.read()
-        processed_md = parse_wikilinks(strip_frontmatter(md_content), owner, vault_id)
+        path_to_permalink = _build_path_to_permalink(request.repository.get_published_files(owner, vault_id))
+        processed_md = parse_wikilinks(strip_frontmatter(md_content), owner, vault_id, path_to_permalink)
         plugin_configs = _load_decrypted_plugin_configs(request, owner, vault_id, enabled_plugin_ids)
         cache_get, cache_set = make_disk_cache(data_dir)
         run_enabled_plugins(
@@ -944,6 +984,14 @@ def publish_view(request):
             "content": None,
         }
 
+    # permalink routing takes priority over the literal path lookup below, matching real
+    # Obsidian's Site router (see 19_permalink_지원.md, pumice repo) -- a miss just falls
+    # through to the unchanged literal-path handling, so the original path URL stays valid
+    # even for a file that also has a permalink set.
+    resolved = request.repository.get_published_file_by_permalink(username, vault_id, path)
+    if resolved:
+        path = resolved["path"]
+
     file_path = os.path.abspath(os.path.join(published_base, path))
 
     if not file_path.startswith(published_base):
@@ -973,7 +1021,8 @@ def publish_view(request):
     except Exception as e:
         return Response(f"Failed to read file: {e}", status=500)
         
-    processed_md = parse_wikilinks(strip_frontmatter(md_content), username, vault_id)
+    path_to_permalink = _build_path_to_permalink(request.repository.get_published_files(username, vault_id))
+    processed_md = parse_wikilinks(strip_frontmatter(md_content), username, vault_id, path_to_permalink)
 
     enabled_plugin_ids = [p["plugin_id"] for p in request.repository.list_enabled_plugins(username, vault_id)]
     if enabled_plugin_ids:

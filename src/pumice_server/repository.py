@@ -114,7 +114,8 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
-    def add_published_file(self, owner_username: str, vault_id: str, path: str, content_hash: str) -> None:
+    def add_published_file(self, owner_username: str, vault_id: str, path: str, content_hash: str,
+                            permalink: Optional[str] = None, updated_at_ms: Optional[int] = None) -> None:
         pass
 
     @abstractmethod
@@ -127,6 +128,10 @@ class MetadataRepository(ABC):
 
     @abstractmethod
     def get_published_files(self, owner_username: str, vault_id: str) -> list:
+        pass
+
+    @abstractmethod
+    def get_published_file_by_permalink(self, owner_username: str, vault_id: str, permalink: str) -> Optional[dict]:
         pass
 
     @abstractmethod
@@ -328,7 +333,15 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             Column("vault_id", String(255), primary_key=True),
             Column("path", String(500), primary_key=True),
             Column("content_hash", String(64), nullable=False),
+            # permalink: mirrors real Obsidian Publish's frontmatter `permalink` override (see
+            # 19_permalink_지원.md, pumice repo). Nullable -- most files don't set one.
+            # updated_at_ms: which of two files sharing the same permalink wins on lookup (real
+            # Obsidian has no defined tie-break here; we define ours as "most recently published").
+            Column("permalink", String(500), nullable=True),
+            Column("updated_at_ms", BigInteger, nullable=True),
         )
+        Index("idx_published_files_permalink", self._published_files.c.owner_username,
+              self._published_files.c.vault_id, self._published_files.c.permalink)
 
         self._users = Table("users", self._meta,
             Column("username", String(100), primary_key=True),
@@ -450,6 +463,17 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             except Exception:
                 pass  # the column already exists
 
+        # Same idempotent backfill for published_files' permalink support (see
+        # 19_permalink_지원.md, pumice repo).
+        for col in (self._published_files.c.permalink, self._published_files.c.updated_at_ms):
+            col_type = col.type.compile(dialect=self.engine.dialect)
+            stmt = f"ALTER TABLE published_files ADD COLUMN {col.name} {col_type}"
+            try:
+                with self.engine.begin() as conn:
+                    conn.exec_driver_sql(stmt)
+            except Exception:
+                pass  # the column already exists
+
         self._migrate_to_owner_scoped_schema()
         self._migrate_plugin_enablement_to_vault_scoped_schema()
 
@@ -537,7 +561,7 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         # replacement is fully built (see that method's docstring for the incidents this avoids).
         for table, cols in (
             (self._file_metadata, ["vault_id", "path", "modified_at_ms", "size_bytes", "content_hash", "is_deleted"]),
-            (self._published_files, ["vault_id", "path", "content_hash"]),
+            (self._published_files, ["vault_id", "path", "content_hash", "permalink", "updated_at_ms"]),
         ):
             name = table.name
             # Recovers from a hard crash between a previous attempt's rename-aside and its final
@@ -780,13 +804,16 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             ).fetchone()
             return dict(row._mapping) if row else None
 
-    def add_published_file(self, owner_username: str, vault_id: str, path: str, content_hash: str) -> None:
+    def add_published_file(self, owner_username: str, vault_id: str, path: str, content_hash: str,
+                            permalink: Optional[str] = None, updated_at_ms: Optional[int] = None) -> None:
         with self.engine.begin() as conn:
             self._upsert(conn, self._published_files, {
                 "owner_username": owner_username,
                 "vault_id": vault_id,
                 "path": path,
                 "content_hash": content_hash,
+                "permalink": permalink,
+                "updated_at_ms": updated_at_ms if updated_at_ms is not None else int(time.time() * 1000),
             }, ["owner_username", "vault_id", "path"])
 
     def remove_published_file(self, owner_username: str, vault_id: str, path: str) -> None:
@@ -807,7 +834,23 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                     self._published_files.c.vault_id == vault_id,
                 )
             ).fetchall()
-            return [{"path": r.path, "hash": r.content_hash} for r in rows]
+            return [{"path": r.path, "hash": r.content_hash, "permalink": r.permalink} for r in rows]
+
+    def get_published_file_by_permalink(self, owner_username: str, vault_id: str, permalink: str) -> Optional[dict]:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._published_files).where(
+                    self._published_files.c.owner_username == owner_username,
+                    self._published_files.c.vault_id == vault_id,
+                    self._published_files.c.permalink == permalink,
+                )
+                # Collision tie-break (see 19_permalink_지원.md): the most recently published file
+                # wins when two files share a permalink -- deterministic, unlike real Obsidian's own
+                # unspecified iteration-order behavior.
+                .order_by(self._published_files.c.updated_at_ms.desc())
+                .limit(1)
+            ).fetchone()
+            return {"path": row.path, "hash": row.content_hash} if row else None
 
     def enable_plugin(self, owner_username: str, vault_id: str, plugin_id: str, enabled_at_ms: int) -> None:
         with self.engine.begin() as conn:

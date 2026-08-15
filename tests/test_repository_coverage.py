@@ -104,7 +104,7 @@ def test_init_db_migrates_legacy_tables_using_the_vault_owner_table():
             "modified_at_ms": 1000, "size_bytes": 100, "content_hash": "hash-a", "is_deleted": False,
         }
     }
-    assert r.get_published_files("alice", "vault-1") == [{"path": "pub.md", "hash": "hash-pub"}]
+    assert r.get_published_files("alice", "vault-1") == [{"path": "pub.md", "hash": "hash-pub", "permalink": None}]
 
     history = r.get_history("alice", "vault-1", "a.md")
     assert len(history) == 1
@@ -157,7 +157,7 @@ def test_init_db_migration_tolerates_a_malformed_vault_owner_table():
 
     r.init_db()  # must not raise despite the malformed legacy table
 
-    assert r.get_published_files("", "vault-3") == [{"path": "c.md", "hash": "hash-c"}]
+    assert r.get_published_files("", "vault-3") == [{"path": "c.md", "hash": "hash-c", "permalink": None}]
 
 
 def test_init_db_is_a_no_op_for_an_already_owner_scoped_database(repo):
@@ -405,14 +405,14 @@ def test_get_published_files_is_empty_initially(repo):
 def test_add_published_file_then_get_returns_it(repo):
     repo.add_published_file("alice", "vault-1", "note.md", "hash-1")
 
-    assert repo.get_published_files("alice", "vault-1") == [{"path": "note.md", "hash": "hash-1"}]
+    assert repo.get_published_files("alice", "vault-1") == [{"path": "note.md", "hash": "hash-1", "permalink": None}]
 
 
 def test_add_published_file_upserts_the_hash_for_the_same_path(repo):
     repo.add_published_file("alice", "vault-1", "note.md", "hash-1")
     repo.add_published_file("alice", "vault-1", "note.md", "hash-2")
 
-    assert repo.get_published_files("alice", "vault-1") == [{"path": "note.md", "hash": "hash-2"}]
+    assert repo.get_published_files("alice", "vault-1") == [{"path": "note.md", "hash": "hash-2", "permalink": None}]
 
 
 def test_get_published_files_scopes_by_owner_and_vault(repo):
@@ -420,7 +420,7 @@ def test_get_published_files_scopes_by_owner_and_vault(repo):
     repo.add_published_file("alice", "vault-2", "b.md", "h2")
     repo.add_published_file("bob", "vault-1", "c.md", "h3")
 
-    assert repo.get_published_files("alice", "vault-1") == [{"path": "a.md", "hash": "h1"}]
+    assert repo.get_published_files("alice", "vault-1") == [{"path": "a.md", "hash": "h1", "permalink": None}]
 
 
 def test_remove_published_file_removes_only_the_matching_row(repo):
@@ -432,13 +432,86 @@ def test_remove_published_file_removes_only_the_matching_row(repo):
 
     remaining = {p["path"] for p in repo.get_published_files("alice", "vault-1")}
     assert remaining == {"b.md"}
-    assert repo.get_published_files("bob", "vault-1") == [{"path": "a.md", "hash": "h3"}]
+    assert repo.get_published_files("bob", "vault-1") == [{"path": "a.md", "hash": "h3", "permalink": None}]
 
 
 def test_remove_published_file_is_a_no_op_when_absent(repo):
     repo.remove_published_file("alice", "vault-1", "missing.md")  # must not raise
 
     assert repo.get_published_files("alice", "vault-1") == []
+
+
+# ─── permalink support (see 19_permalink_지원.md, pumice repo) ─────────────────────────────────
+
+def test_add_published_file_with_permalink_then_lookup_returns_it(repo):
+    repo.add_published_file("alice", "vault-1", "note.md", "hash-1", permalink="p/slug")
+
+    assert repo.get_published_file_by_permalink("alice", "vault-1", "p/slug") == {"path": "note.md", "hash": "hash-1"}
+
+
+def test_get_published_file_by_permalink_returns_none_when_no_file_has_it(repo):
+    repo.add_published_file("alice", "vault-1", "note.md", "hash-1")
+
+    assert repo.get_published_file_by_permalink("alice", "vault-1", "p/slug") is None
+
+
+def test_get_published_files_includes_the_permalink(repo):
+    repo.add_published_file("alice", "vault-1", "note.md", "hash-1", permalink="p/slug")
+
+    assert repo.get_published_files("alice", "vault-1") == [{"path": "note.md", "hash": "hash-1", "permalink": "p/slug"}]
+
+
+def test_permalink_collision_resolves_to_the_most_recently_published_file(repo):
+    # Real Obsidian has no defined tie-break for this (see 19_permalink_지원.md); pumice-server
+    # picks the file published most recently, deterministically, via updated_at_ms.
+    repo.add_published_file("alice", "vault-1", "old.md", "hash-old", permalink="shared", updated_at_ms=1000)
+    repo.add_published_file("alice", "vault-1", "new.md", "hash-new", permalink="shared", updated_at_ms=2000)
+
+    assert repo.get_published_file_by_permalink("alice", "vault-1", "shared") == {"path": "new.md", "hash": "hash-new"}
+
+    # Re-publishing the older file bumps it back in front.
+    repo.add_published_file("alice", "vault-1", "old.md", "hash-old-2", permalink="shared", updated_at_ms=3000)
+    assert repo.get_published_file_by_permalink("alice", "vault-1", "shared") == {"path": "old.md", "hash": "hash-old-2"}
+
+
+def test_permalink_lookup_scopes_by_owner_and_vault(repo):
+    repo.add_published_file("alice", "vault-1", "note.md", "hash-1", permalink="shared")
+    repo.add_published_file("bob", "vault-1", "other.md", "hash-2", permalink="shared", updated_at_ms=999999999999)
+
+    assert repo.get_published_file_by_permalink("alice", "vault-1", "shared") == {"path": "note.md", "hash": "hash-1"}
+
+
+def test_clearing_the_permalink_by_republishing_without_it_removes_the_lookup(repo):
+    repo.add_published_file("alice", "vault-1", "note.md", "hash-1", permalink="p/slug")
+    repo.add_published_file("alice", "vault-1", "note.md", "hash-2")  # re-published without a permalink
+
+    assert repo.get_published_file_by_permalink("alice", "vault-1", "p/slug") is None
+    assert repo.get_published_files("alice", "vault-1") == [{"path": "note.md", "hash": "hash-2", "permalink": None}]
+
+
+def test_init_db_migrates_a_pre_permalink_published_files_table(repo):
+    # Simulates a deployment from before permalink/updated_at_ms existed -- the plain ADD COLUMN
+    # backfill (same pattern as file_history's deleted/related_path columns) must tolerate
+    # running against a published_files table that already has the modern owner-scoped PK but
+    # not yet these two columns.
+    with repo.engine.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE published_files")
+        conn.exec_driver_sql(
+            "CREATE TABLE published_files ("
+            "owner_username VARCHAR(100) NOT NULL, vault_id VARCHAR(255) NOT NULL, "
+            "path VARCHAR(500) NOT NULL, content_hash VARCHAR(64) NOT NULL, "
+            "PRIMARY KEY (owner_username, vault_id, path))"
+        )
+        conn.exec_driver_sql("INSERT INTO published_files VALUES ('alice', 'vault-1', 'old.md', 'hash-old')")
+
+    repo.init_db()  # must not raise
+    repo.init_db()  # idempotent -- must not raise a second time either
+
+    assert repo.get_published_files("alice", "vault-1") == [{"path": "old.md", "hash": "hash-old", "permalink": None}]
+
+    # And the new columns are now genuinely usable.
+    repo.add_published_file("alice", "vault-1", "new.md", "hash-new", permalink="p/slug")
+    assert repo.get_published_file_by_permalink("alice", "vault-1", "p/slug") == {"path": "new.md", "hash": "hash-new"}
 
 
 # ─── create_user / get_user_by_username ────────────────────────────────────────────────────────
