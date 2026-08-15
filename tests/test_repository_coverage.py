@@ -592,6 +592,66 @@ def test_init_db_migrates_a_pre_description_image_published_files_table(repo):
     assert by_path["new.md"]["description"] == "d"
 
 
+# ─── aliases-based old-URL redirect (see 22_aliases_리다이렉트_및_파비콘_자동감지.md) ──────────
+
+def test_set_published_file_aliases_then_lookup_returns_the_target_path(repo):
+    repo.set_published_file_aliases("alice", "vault-1", "Tutorials/How to make friends.md",
+                                     ["Guides/Making friends"])
+
+    assert repo.get_published_file_by_alias("alice", "vault-1", "Guides/Making friends") \
+        == "Tutorials/How to make friends.md"
+
+
+def test_alias_lookup_is_case_insensitive(repo):
+    repo.set_published_file_aliases("alice", "vault-1", "target.md", ["Guides/Making Friends"])
+
+    assert repo.get_published_file_by_alias("alice", "vault-1", "guides/making friends") == "target.md"
+    assert repo.get_published_file_by_alias("alice", "vault-1", "GUIDES/MAKING FRIENDS") == "target.md"
+
+
+def test_alias_lookup_returns_none_when_unmatched(repo):
+    assert repo.get_published_file_by_alias("alice", "vault-1", "no/such/alias") is None
+
+
+def test_a_file_can_have_multiple_aliases(repo):
+    repo.set_published_file_aliases("alice", "vault-1", "target.md",
+                                     ["Guides/Making friends", "Developing friendships"])
+
+    assert repo.get_published_file_by_alias("alice", "vault-1", "Guides/Making friends") == "target.md"
+    assert repo.get_published_file_by_alias("alice", "vault-1", "Developing friendships") == "target.md"
+
+
+def test_republishing_with_a_shorter_alias_list_drops_the_removed_aliases(repo):
+    repo.set_published_file_aliases("alice", "vault-1", "target.md", ["a", "b"])
+    repo.set_published_file_aliases("alice", "vault-1", "target.md", ["a"])
+
+    assert repo.get_published_file_by_alias("alice", "vault-1", "a") == "target.md"
+    assert repo.get_published_file_by_alias("alice", "vault-1", "b") is None
+
+
+def test_republishing_with_no_aliases_clears_them_all(repo):
+    repo.set_published_file_aliases("alice", "vault-1", "target.md", ["a"])
+    repo.set_published_file_aliases("alice", "vault-1", "target.md", [])
+
+    assert repo.get_published_file_by_alias("alice", "vault-1", "a") is None
+
+
+def test_alias_lookup_scopes_by_owner_and_vault(repo):
+    repo.set_published_file_aliases("alice", "vault-1", "target.md", ["shared"])
+    repo.set_published_file_aliases("bob", "vault-1", "other.md", ["shared"])
+
+    assert repo.get_published_file_by_alias("alice", "vault-1", "shared") == "target.md"
+    assert repo.get_published_file_by_alias("bob", "vault-1", "shared") == "other.md"
+    assert repo.get_published_file_by_alias("alice", "vault-2", "shared") is None
+
+
+def test_a_later_file_claiming_the_same_alias_overwrites_the_earlier_one(repo):
+    repo.set_published_file_aliases("alice", "vault-1", "old.md", ["shared"])
+    repo.set_published_file_aliases("alice", "vault-1", "new.md", ["shared"])
+
+    assert repo.get_published_file_by_alias("alice", "vault-1", "shared") == "new.md"
+
+
 # ─── create_user / get_user_by_username ────────────────────────────────────────────────────────
 
 def test_create_user_succeeds_for_a_new_username(repo):

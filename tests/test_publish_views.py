@@ -8,6 +8,8 @@ exactly what these views read (.context/.headers/.body/.registry.settings/.match
 enforcement (unchanged code) isn't re-verified here, only the view bodies' actual behavior against
 a real repository and real filesystem (via tmp_path, since these views do direct file I/O)."""
 
+import json
+
 import pytest
 
 from pumice_server import web
@@ -39,7 +41,8 @@ class FakeRegistry:
 
 class FakeRequest:
     def __init__(self, repository, data_dir, owner=None, vault_id=None,
-                 headers=None, body=b"", matchdict=None, scheme="https", host="example.com"):
+                 headers=None, body=b"", matchdict=None, scheme="https", host="example.com",
+                 json_body=None):
         self.repository = repository
         self.context = FakeContext(owner, vault_id) if owner is not None else None
         self.headers = headers or {}
@@ -49,10 +52,15 @@ class FakeRequest:
         self.accept_language = FakeAcceptLanguage()
         self.scheme = scheme
         self.host = host
+        self._json_body = json_body if json_body is not None else {}
+
+    @property
+    def json_body(self):
+        return self._json_body
 
 
 def upload(repo, tmp_path, owner, vault_id, path, content: bytes, permalink=None, content_hash="h",
-           description=None, image=None):
+           description=None, image=None, aliases=None):
     headers = {"obs-path": path, "obs-hash": content_hash}
     if permalink is not None:
         headers["obs-permalink"] = permalink
@@ -60,6 +68,8 @@ def upload(repo, tmp_path, owner, vault_id, path, content: bytes, permalink=None
         headers["obs-description"] = description
     if image is not None:
         headers["obs-image"] = image
+    if aliases is not None:
+        headers["obs-aliases"] = json.dumps(aliases)
     request = FakeRequest(repo, tmp_path, owner=owner, vault_id=vault_id, headers=headers, body=content)
     result = web.publish_upload_view(request)
     assert result == {"ok": True}
@@ -225,3 +235,126 @@ def test_root_file_list_page_has_no_description_or_image(repo, tmp_path):
 
     assert result["description"] is None
     assert result["image"] is None
+
+
+# ─── publish_view: aliases-based old-URL redirect (see 22_aliases_리다이렉트_및_파비콘_자동감지.md) ─
+
+def test_visiting_an_old_url_registered_as_an_alias_serves_the_current_note(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "Tutorials/How to make friends.md", b"# New home",
+           aliases=["Guides/Making friends"])
+
+    result = render(repo, tmp_path, "alice", "vault1", "Guides/Making friends")
+
+    assert "New home" in result["content"]
+
+
+def test_alias_lookup_is_case_insensitive(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "target.md", b"# Target", aliases=["Guides/Old Path"])
+
+    result = render(repo, tmp_path, "alice", "vault1", "guides/old path")
+
+    assert "Target" in result["content"]
+
+
+def test_alias_is_only_consulted_after_permalink_and_literal_path_both_miss(repo, tmp_path):
+    # A literal file genuinely living at this path must win over some other file's alias
+    # claiming the same string -- aliases are the last-resort fallback, not a first check.
+    upload(repo, tmp_path, "alice", "vault1", "real.md", b"# Real")
+    upload(repo, tmp_path, "alice", "vault1", "other.md", b"# Other", aliases=["real.md"])
+
+    result = render(repo, tmp_path, "alice", "vault1", "real.md")
+
+    assert "Real" in result["content"]
+    assert "Other" not in result["content"]
+
+
+def test_republishing_without_the_alias_stops_the_redirect(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "target.md", b"# Target", aliases=["old/path"])
+    upload(repo, tmp_path, "alice", "vault1", "target.md", b"# Target")  # re-published, no aliases
+
+    response = render(repo, tmp_path, "alice", "vault1", "old/path")
+
+    assert response.status_code == 404
+
+
+def test_removing_a_published_file_also_removes_its_aliases(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "target.md", b"# Target", aliases=["old/path"])
+    request = FakeRequest(repo, tmp_path, owner="alice", vault_id="vault1",
+                           json_body={"path": "target.md"})
+    result = web.publish_remove_view(request)
+    assert result == {"ok": True}
+
+    response = render(repo, tmp_path, "alice", "vault1", "old/path")
+
+    assert response.status_code == 404
+
+
+def test_unmatched_alias_still_404s(repo, tmp_path):
+    response = render(repo, tmp_path, "alice", "vault1", "no/such/alias")
+
+    assert response.status_code == 404
+
+
+# ─── publish_view: favicon auto-detection (see 22_aliases_리다이렉트_및_파비콘_자동감지.md) ────
+
+def test_favicon_ico_produces_a_plain_icon_link(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "favicon.ico", b"fake-ico-bytes")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["favicons"] == [{"href": "/publish/alice/vault1/favicon.ico", "sizes": None}]
+
+
+def test_sized_favicon_png_produces_a_sizes_attribute(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "favicon-32x32.png", b"fake-png-bytes")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["favicons"] == [{"href": "/publish/alice/vault1/favicon-32x32.png", "sizes": "32x32"}]
+
+
+def test_favicon_without_the_x_dimension_still_gets_a_square_sizes_attribute(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "favicon-32.png", b"fake-png-bytes")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["favicons"] == [{"href": "/publish/alice/vault1/favicon-32.png", "sizes": "32x32"}]
+
+
+def test_multiple_favicon_sizes_all_produce_links(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "favicon-32x32.png", b"a")
+    upload(repo, tmp_path, "alice", "vault1", "favicon-192x192.png", b"b")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    sizes = {icon["sizes"] for icon in result["favicons"]}
+    assert sizes == {"32x32", "192x192"}
+
+
+def test_no_favicon_files_means_an_empty_list(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["favicons"] == []
+
+
+def test_an_unrelated_png_is_not_mistaken_for_a_favicon(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "Attachments/cover.png", b"a")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["favicons"] == []
+
+
+def test_root_file_list_page_also_gets_favicon_links(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "favicon.ico", b"a")
+
+    result = render(repo, tmp_path, "alice", "vault1", "")
+
+    assert result["favicons"] == [{"href": "/publish/alice/vault1/favicon.ico", "sizes": None}]

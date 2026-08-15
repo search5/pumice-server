@@ -136,6 +136,14 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
+    def set_published_file_aliases(self, owner_username: str, vault_id: str, path: str, aliases: list) -> None:
+        pass
+
+    @abstractmethod
+    def get_published_file_by_alias(self, owner_username: str, vault_id: str, alias_path: str) -> Optional[str]:
+        pass
+
+    @abstractmethod
     def enable_plugin(self, owner_username: str, vault_id: str, plugin_id: str, enabled_at_ms: int) -> None:
         pass
 
@@ -447,6 +455,20 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
               self._vault_shares.c.vault_id)
         Index("idx_vault_shares_email", self._vault_shares.c.email)
         Index("idx_vault_shares_uid", self._vault_shares.c.uid, unique=True)
+
+        # Old-URL redirects for published notes (see 22_aliases_리다이렉트_및_파비콘_자동감지.md,
+        # pumice repo): mirrors real Obsidian Publish's aliases-based redirect -- a note's
+        # `aliases` frontmatter can list the vault-relative paths it used to live at, so visitors
+        # following a stale link still land on the current file. One row per (owner, vault, alias)
+        # -- alias_path is stored lowercased since real Obsidian's own aliases lookup is
+        # case-insensitive. A brand-new table (unlike published_files' bolted-on columns), so no
+        # ALTER-TABLE backfill is needed -- create_all() below handles it.
+        self._published_file_aliases = Table("published_file_aliases", self._meta,
+            Column("owner_username", String(100), primary_key=True),
+            Column("vault_id", String(255), primary_key=True),
+            Column("alias_path", String(500), primary_key=True),
+            Column("path", String(500), nullable=False),
+        )
 
     def init_db(self) -> None:
         # Runs before the owner-scoping migration below: file_metadata/published_files may still
@@ -867,6 +889,40 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 .limit(1)
             ).fetchone()
             return {"path": row.path, "hash": row.content_hash} if row else None
+
+    def set_published_file_aliases(self, owner_username: str, vault_id: str, path: str, aliases: list) -> None:
+        # Full replace, not incremental upsert: a republish's alias list is the complete current
+        # truth for this file, so any alias no longer present (removed from frontmatter, or the
+        # list shrank) must stop redirecting -- same reasoning as add_published_file's
+        # permalink=None clearing a previously-set permalink.
+        with self.engine.begin() as conn:
+            conn.execute(
+                delete(self._published_file_aliases).where(
+                    self._published_file_aliases.c.owner_username == owner_username,
+                    self._published_file_aliases.c.vault_id == vault_id,
+                    self._published_file_aliases.c.path == path,
+                )
+            )
+            for alias in aliases:
+                self._upsert(conn, self._published_file_aliases, {
+                    "owner_username": owner_username,
+                    "vault_id": vault_id,
+                    # Stored lowercased: real Obsidian's own aliases lookup is case-insensitive
+                    # (confirmed via obsidian.asar -- see 22_aliases_리다이렉트_및_파비콘_자동감지.md).
+                    "alias_path": alias.lower(),
+                    "path": path,
+                }, ["owner_username", "vault_id", "alias_path"])
+
+    def get_published_file_by_alias(self, owner_username: str, vault_id: str, alias_path: str) -> Optional[str]:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._published_file_aliases.c.path).where(
+                    self._published_file_aliases.c.owner_username == owner_username,
+                    self._published_file_aliases.c.vault_id == vault_id,
+                    self._published_file_aliases.c.alias_path == alias_path.lower(),
+                )
+            ).fetchone()
+            return row.path if row else None
 
     def enable_plugin(self, owner_username: str, vault_id: str, plugin_id: str, enabled_at_ms: int) -> None:
         with self.engine.begin() as conn:

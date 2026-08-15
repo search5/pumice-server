@@ -778,6 +778,28 @@ def _resolve_og_image_url(image_value: Optional[str], request, username: str, va
         f"{quote(username, safe='')}/{quote(vault_id, safe='')}/{quote(image_value, safe='/')}"
     )
 
+_FAVICON_SIZED_RE = re.compile(r"^favicon-([0-9]+)(x[0-9]+)?\.png$", re.IGNORECASE)
+
+def _build_favicon_links(files: list, username: str, vault_id: str) -> list:
+    """Real Obsidian Publish auto-detects any published favicon.ico or favicon-NN(xNN).png file
+    and adds a <link rel="icon"> tag for each -- confirmed via obsidian.asar's own
+    `Q$ = /^favicon-([0-9]+)(x[0-9]+)?.png$/i` pattern and Customize your site.md's documented
+    size list (see 22_aliases_리다이렉트_및_파비콘_자동감지.md). A bare `favicon-32.png` (no `x32`
+    part) is treated as square, same as the real formula: `G[1] + (G[2] || "x" + G[1])`."""
+    icons = []
+    for f in files:
+        basename = os.path.basename(f["path"])
+        href = f"/publish/{quote(username, safe='')}/{quote(vault_id, safe='')}/{quote(f['path'], safe='/')}"
+        if basename.lower() == "favicon.ico":
+            icons.append({"href": href, "sizes": None})
+            continue
+        m = _FAVICON_SIZED_RE.match(basename)
+        if m:
+            size, dim = m.group(1), m.group(2)
+            sizes = f"{size}x{dim[1:]}" if dim else f"{size}x{size}"
+            icons.append({"href": href, "sizes": sizes})
+    return icons
+
 @view_config(route_name='publish_list', renderer='json', permission='vault-access')
 def publish_list_view(request):
     try:
@@ -822,6 +844,7 @@ def publish_upload_view(request):
         obs_permalink_enc = request.headers.get("obs-permalink")
         obs_description_enc = request.headers.get("obs-description")
         obs_image_enc = request.headers.get("obs-image")
+        obs_aliases_enc = request.headers.get("obs-aliases")
 
         if not obs_path_enc or not obs_hash:
             return Response(body=json.dumps({"error": "Missing obs-id, obs-path or obs-hash header"}).encode("utf-8"), status=400, content_type="application/json")
@@ -830,6 +853,14 @@ def publish_upload_view(request):
         permalink = unquote(obs_permalink_enc) if obs_permalink_enc else None
         description = unquote(obs_description_enc) if obs_description_enc else None
         image = unquote(obs_image_enc) if obs_image_enc else None
+        aliases = []
+        if obs_aliases_enc:
+            try:
+                parsed = json.loads(unquote(obs_aliases_enc))
+                if isinstance(parsed, list):
+                    aliases = [a for a in parsed if isinstance(a, str) and a]
+            except Exception as e:
+                logger.warning(f"Ignoring malformed obs-aliases header for path={path}: {e}")
 
         # File storage location: data_dir/published/username/vault_id/path
         data_dir = request.registry.settings.get("data_dir")
@@ -858,6 +889,7 @@ def publish_upload_view(request):
             request.context.owner, vault_id, path, obs_hash,
             permalink=permalink, description=description, image=image,
         )
+        request.repository.set_published_file_aliases(request.context.owner, vault_id, path, aliases)
         logger.info(f"Published file saved: vault={vault_id}, path={path}, hash={obs_hash}")
 
         _warm_plugin_resolve_cache(request, username, vault_id, dest_file_path, data_dir)
@@ -927,8 +959,11 @@ def publish_remove_view(request):
                 pass
                 
         request.repository.remove_published_file(request.context.owner, vault_id, path)
+        # A removed file's old-URL redirects must go with it -- otherwise they'd point at
+        # content that no longer exists (see 22_aliases_리다이렉트_및_파비콘_자동감지.md).
+        request.repository.set_published_file_aliases(request.context.owner, vault_id, path, [])
         logger.info(f"Published file removed: vault={vault_id}, path={path}")
-        
+
         return {"ok": True}
     except Exception as e:
         logger.error(f"HTTP publish_remove failed: {e}")
@@ -1007,6 +1042,11 @@ def publish_view(request):
     data_dir = request.registry.settings.get("data_dir")
     published_base = os.path.abspath(os.path.join(data_dir, "published", username, vault_id))
 
+    # Fetched once and shared by both branches below -- used for permalink/description/image
+    # lookups on a note page, and for favicon auto-detection (a site-wide concern) on both.
+    published_files = request.repository.get_published_files(username, vault_id)
+    favicon_links = _build_favicon_links(published_files, username, vault_id)
+
     # Root: show the list of published files. `files=None` is how the template tells this
     # branch apart from an actual note's rendered content -- an empty *list* still means "show
     # the (empty) file list", not "render a note".
@@ -1022,7 +1062,7 @@ def publish_view(request):
             "lang": lang, "t": lambda key, **params: t(key, lang, **params),
             "username": username, "vault_id": vault_id, "title": "",
             "files": files, "file_hrefs": _published_file_hrefs(username, vault_id, files),
-            "content": None, "description": None, "image": None,
+            "content": None, "description": None, "image": None, "favicons": favicon_links,
         }
 
     # permalink routing takes priority over the literal path lookup below, matching real
@@ -1039,15 +1079,25 @@ def publish_view(request):
         return Response("Forbidden", status=403)
 
     if not os.path.exists(file_path):
+        resolved_via_ext_fallback = False
         if not os.path.splitext(file_path)[1]:
             alt_path = file_path + ".md"
             if os.path.exists(alt_path):
                 file_path = alt_path
+                resolved_via_ext_fallback = True
+
+        if not resolved_via_ext_fallback:
+            # Last-resort fallback: an old/removed note's URL, redirected via `aliases` (see
+            # 22_aliases_리다이렉트_및_파비콘_자동감지.md) -- matches real Obsidian's own routing
+            # precedence: permalink -> literal path (+.md) -> aliases -> 404.
+            alias_target = request.repository.get_published_file_by_alias(username, vault_id, path)
+            alias_file_path = os.path.abspath(os.path.join(published_base, alias_target)) if alias_target else None
+            if alias_target and alias_file_path.startswith(published_base) and os.path.exists(alias_file_path):
+                path = alias_target
+                file_path = alias_file_path
             else:
                 return Response(f"Page not found: {path}", status=404)
-        else:
-            return Response(f"Page not found: {path}", status=404)
-            
+
     _, ext = os.path.splitext(file_path)
     ext = ext.lower()
 
@@ -1062,7 +1112,6 @@ def publish_view(request):
     except Exception as e:
         return Response(f"Failed to read file: {e}", status=500)
         
-    published_files = request.repository.get_published_files(username, vault_id)
     path_to_permalink = _build_path_to_permalink(published_files)
     processed_md = parse_wikilinks(strip_frontmatter(md_content), username, vault_id, path_to_permalink)
     own = next((f for f in published_files if f["path"] == path), {})
@@ -1090,7 +1139,7 @@ def publish_view(request):
         "lang": lang, "t": lambda key, **params: t(key, lang, **params),
         "username": username, "vault_id": vault_id, "title": title,
         "files": None, "file_hrefs": {}, "content": html_content,
-        "description": description, "image": image,
+        "description": description, "image": image, "favicons": favicon_links,
     }
 
 
