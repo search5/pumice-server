@@ -408,3 +408,153 @@ def test_root_file_list_page_also_gets_publish_css_link(repo, tmp_path):
     result = render(repo, tmp_path, "alice", "vault1", "")
 
     assert result["publish_css_href"] == "/publish/alice/vault1/publish.css"
+
+
+# ─── publish_view: first-batch site options (see 25_사이트_옵션_1차_구현.md) ────────────────
+
+def save_options(repo, tmp_path, owner, vault_id, options):
+    request = FakeRequest(repo, tmp_path, owner=owner, vault_id=vault_id, json_body={"options": options})
+    result = web.publish_options_view(request)
+    assert "error" not in result
+    return result
+
+
+def test_site_name_defaults_to_the_vault_id(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["site_name"] == "vault1"
+
+
+def test_site_name_override_is_used_instead(repo, tmp_path):
+    save_options(repo, tmp_path, "alice", "vault1", {"siteName": "My Cool Site"})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["site_name"] == "My Cool Site"
+
+
+def test_logo_path_resolves_to_a_published_url(repo, tmp_path):
+    save_options(repo, tmp_path, "alice", "vault1", {"logo": "Attachments/logo.png"})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["logo_href"] == "https://example.com/publish/alice/vault1/Attachments/logo.png"
+
+
+def test_no_logo_set_means_no_logo_href(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["logo_href"] is None
+
+
+def test_noindex_defaults_to_false(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["noindex"] is False
+
+
+def test_noindex_can_be_enabled(repo, tmp_path):
+    save_options(repo, tmp_path, "alice", "vault1", {"noindex": True})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["noindex"] is True
+
+
+def test_hide_title_defaults_to_false(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["hide_title"] is False
+
+
+def test_hide_title_can_be_enabled(repo, tmp_path):
+    save_options(repo, tmp_path, "alice", "vault1", {"hideTitle": True})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["hide_title"] is True
+
+
+def test_readable_line_length_defaults_to_true(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["readable_line_length"] is True
+
+
+def test_readable_line_length_can_be_disabled(repo, tmp_path):
+    save_options(repo, tmp_path, "alice", "vault1", {"readableLineLength": False})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["readable_line_length"] is False
+
+
+def test_strict_line_breaks_off_by_default_collapses_single_newlines(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"line one\nline two")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert "<br" not in result["content"]
+
+
+def test_strict_line_breaks_enabled_turns_single_newlines_into_br(repo, tmp_path):
+    save_options(repo, tmp_path, "alice", "vault1", {"strictLineBreaks": True})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"line one\nline two")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert "<br" in result["content"]
+
+
+def test_google_analytics_is_stored_but_never_rendered(repo, tmp_path):
+    # Real Obsidian only activates analytics on a custom domain (same reasoning as publish.js) --
+    # pumice-server has no such isolation yet, so this stays inert (see 25_사이트_옵션_1차_구현.md).
+    save_options(repo, tmp_path, "alice", "vault1", {"googleAnalytics": "G-ABC123"})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert "G-ABC123" not in result["content"]
+    assert "google_analytics_id" not in result or not result.get("google_analytics_id")
+
+
+def test_index_file_is_served_at_the_root_when_set_and_published(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "Home.md", b"# Welcome home")
+    save_options(repo, tmp_path, "alice", "vault1", {"indexFile": "Home.md"})
+
+    result = render(repo, tmp_path, "alice", "vault1", "")
+
+    assert result["files"] is None
+    assert "Welcome home" in result["content"]
+
+
+def test_index_file_falls_back_to_the_file_list_when_not_published(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+    save_options(repo, tmp_path, "alice", "vault1", {"indexFile": "Missing.md"})
+
+    result = render(repo, tmp_path, "alice", "vault1", "")
+
+    assert result["files"] is not None
+
+
+def test_no_index_file_set_shows_the_file_list_as_before(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "")
+
+    assert result["files"] is not None

@@ -1069,24 +1069,42 @@ def publish_view(request):
         if _CUSTOM_DOMAINS_SUPPORTED else None
     )
 
-    # Root: show the list of published files. `files=None` is how the template tells this
-    # branch apart from an actual note's rendered content -- an empty *list* still means "show
-    # the (empty) file list", not "render a note".
+    # First batch of the "Change site options" dialog (see
+    # 25_사이트_옵션_1차_구현.md, pumice repo) -- shared by both branches below since siteName/
+    # logo/noindex are header/meta concerns that apply to every page, not just note pages.
+    options = _load_site_options(data_dir, username, vault_id)
+    site_name = options["siteName"] or vault_id
+    logo_href = _resolve_og_image_url(options["logo"], request, username, vault_id)
+    common_option_fields = {
+        "site_name": site_name, "logo_href": logo_href, "noindex": options["noindex"],
+        "hide_title": options["hideTitle"], "readable_line_length": options["readableLineLength"],
+    }
+
+    # Root: show the list of published files, UNLESS an indexFile is configured and actually
+    # published, in which case it's served here instead (matches real Obsidian's `indexFile`
+    # site option) -- falls through to the normal note-rendering code below rather than
+    # returning, so it gets the exact same permalink/alias/plugin handling as any other note.
     if not path:
-        files = []
-        if os.path.isdir(published_base):
-            for root, _, fnames in os.walk(published_base):
-                for fname in fnames:
-                    rel = os.path.relpath(os.path.join(root, fname), published_base)
-                    files.append(rel.replace(os.sep, "/"))
-        files = sorted(files)
-        return {
-            "lang": lang, "t": lambda key, **params: t(key, lang, **params),
-            "username": username, "vault_id": vault_id, "title": "",
-            "files": files, "file_hrefs": _published_file_hrefs(username, vault_id, files),
-            "content": None, "description": None, "image": None, "favicons": favicon_links,
-            "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
-        }
+        index_file = options["indexFile"]
+        has_index_file = index_file and any(f["path"] == index_file for f in published_files)
+        if has_index_file:
+            path = index_file
+        else:
+            files = []
+            if os.path.isdir(published_base):
+                for root, _, fnames in os.walk(published_base):
+                    for fname in fnames:
+                        rel = os.path.relpath(os.path.join(root, fname), published_base)
+                        files.append(rel.replace(os.sep, "/"))
+            files = sorted(files)
+            return {
+                "lang": lang, "t": lambda key, **params: t(key, lang, **params),
+                "username": username, "vault_id": vault_id, "title": "",
+                "files": files, "file_hrefs": _published_file_hrefs(username, vault_id, files),
+                "content": None, "description": None, "image": None, "favicons": favicon_links,
+                "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
+                **common_option_fields,
+            }
 
     # permalink routing takes priority over the literal path lookup below, matching real
     # Obsidian's Site router (see 19_permalink_지원.md, pumice repo) -- a miss just falls
@@ -1149,7 +1167,10 @@ def publish_view(request):
         )
 
     import markdown
-    html_content = markdown.markdown(processed_md, extensions=['extra', 'codehilite', 'toc'])
+    md_extensions = ['extra', 'codehilite', 'toc']
+    if options["strictLineBreaks"]:
+        md_extensions.append('nl2br')
+    html_content = markdown.markdown(processed_md, extensions=md_extensions)
 
     title = os.path.basename(path)
     if title.endswith(".md"):
@@ -1164,6 +1185,7 @@ def publish_view(request):
         "files": None, "file_hrefs": {}, "content": html_content,
         "description": description, "image": image, "favicons": favicon_links,
         "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
+        **common_option_fields,
     }
 
 
@@ -1220,6 +1242,46 @@ def publish_site_view(request):
 @view_config(route_name='publish_customurl', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def publish_customurl_view(request):
     return {"url": "", "redirect": False}
+
+# First batch of real Obsidian Publish's "Change site options" dialog (~20 settings total, see
+# 24_사이트_옵션_다이얼로그_실제_옵시디언과_비교.md) -- the ones that only need a stored value
+# plus a template conditional, no new site feature (graph/search/outline/backlinks/sliding
+# window/navigation sidebar/custom domain/collaboration are deferred, see that doc). Defaults are
+# real Obsidian's own (confirmed via obsidian.asar's XQ defaults table -- see
+# 25_사이트_옵션_1차_구현.md), notably readableLineLength defaulting to True (readable by
+# default, not full-width) and googleAnalytics being stored but never rendered here (real
+# Obsidian itself only activates it on a custom domain -- same reasoning as publish.js in
+# 23_사이트_커스터마이징_정적_에셋.md, and pumice-server has no such isolation yet).
+_SITE_OPTIONS_DEFAULTS = {
+    "siteName": "",
+    "indexFile": "",
+    "logo": "",
+    "noindex": False,
+    "hideTitle": False,
+    "readableLineLength": True,
+    "strictLineBreaks": False,
+    "googleAnalytics": "",
+}
+
+def _load_site_options(data_dir: str, owner: str, vault_id: str) -> dict:
+    stored = load_publish_meta(data_dir, owner, vault_id, "options.json", {})
+    return {**_SITE_OPTIONS_DEFAULTS, **{k: v for k, v in stored.items() if k in _SITE_OPTIONS_DEFAULTS}}
+
+@view_config(route_name='publish_options', renderer='json', permission='vault-access')
+def publish_options_view(request):
+    try:
+        vault_id = request.context.vault_id
+        owner = request.context.owner
+        data_dir = request.registry.settings.get("data_dir")
+        incoming = request.json_body.get("options")
+        if isinstance(incoming, dict):
+            current = load_publish_meta(data_dir, owner, vault_id, "options.json", {})
+            current.update({k: v for k, v in incoming.items() if k in _SITE_OPTIONS_DEFAULTS})
+            save_publish_meta(data_dir, owner, vault_id, "options.json", current)
+        return {"options": _load_site_options(data_dir, owner, vault_id)}
+    except Exception as e:
+        logger.error(f"HTTP publish_options failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
 @view_config(route_name='publish_slug', renderer='json', permission='vault-access')
 def publish_slug_view(request):
@@ -1954,6 +2016,7 @@ def create_pyramid_app(repository, data_dir):
     config.add_route('publish_slugs', '/api/slugs')
     config.add_route('publish_site', '/api/site')
     config.add_route('publish_customurl', '/api/customurl')
+    config.add_route('publish_options', '/api/options', factory=VaultContext)
     config.add_route('publish_slug', '/api/slug', factory=VaultContext)
     config.add_route('publish_password', '/api/password', factory=VaultContext)
     config.add_route('publish_plugins', '/api/publish/plugins', factory=VaultContext)

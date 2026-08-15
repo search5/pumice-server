@@ -3,8 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ title }} - {{ vault_id }} Publish</title>
-    <meta property="og:title" content="{{ title }} - {{ vault_id }} Publish">
+    <title>{{ title }} - {{ site_name }} Publish</title>
+    <meta property="og:title" content="{{ title }} - {{ site_name }} Publish">
+    {% if noindex %}
+    <meta name="robots" content="noindex">
+    {% endif %}
     {% if description %}
     <meta name="description" content="{{ description }}">
     <meta property="og:description" content="{{ description }}">
@@ -56,6 +59,17 @@
             margin: 0 auto;
         }
 
+        .layout.wide {
+            max-width: 1400px;
+        }
+
+        .site-logo {
+            height: 24px;
+            width: 24px;
+            border-radius: 4px;
+            object-fit: cover;
+        }
+
         header {
             display: flex;
             align-items: center;
@@ -82,6 +96,10 @@
         .site-title::before {
             content: "🚀";
             font-size: 20px;
+        }
+
+        .site-title.has-logo::before {
+            content: none;
         }
 
         .vault-badge {
@@ -292,15 +310,16 @@
     {% endif %}
 </head>
 <body>
-    <div class="layout">
+    <div class="layout{% if not readable_line_length %} wide{% endif %}">
         <header>
-            <a href="/publish/{{ username }}/{{ vault_id }}/" class="site-title">{{ vault_id }} Publish</a>
+            <a href="/publish/{{ username }}/{{ vault_id }}/" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
             <span class="vault-badge">Vault: {{ vault_id }}</span>
         </header>
         <main class="container markdown-body">
             {% if files is not none -%}
-            <h1>{{ vault_id }}</h1>{% if files %}<ul>{% for f in files %}<li><a href="{{ file_hrefs[f] }}">{{ f }}</a></li>{% endfor %}</ul>{% else %}<p>{{ t('publish_public.empty_no_files') }}</p>{% endif %}
+            <h1>{{ site_name }}</h1>{% if files %}<ul>{% for f in files %}<li><a href="{{ file_hrefs[f] }}">{{ f }}</a></li>{% endfor %}</ul>{% else %}<p>{{ t('publish_public.empty_no_files') }}</p>{% endif %}
             {%- else -%}
+            {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
             {{ content | safe }}
             {%- endif %}
         </main>
