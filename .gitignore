@@ -20,3 +20,8 @@ logs/
 # pytest-cov's data file / html report
 .coverage
 htmlcov/
+
+# Local-only session notes for Claude's own work log -- never committed/pushed (see pumice
+# repo's feedback_never_git_add_dash_a memory: llm-wiki was previously committed by mistake
+# and had to be purged from pushed history).
+llm-wiki/
