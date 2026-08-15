@@ -4,6 +4,7 @@ import logging
 import re
 import os
 import uuid
+import html as html_module
 from typing import Optional
 from babel.messages.pofile import read_po
 from babel.support import Translations
@@ -744,6 +745,39 @@ def parse_wikilinks(text: str, username: str, vault_id: str, path_to_permalink: 
     text = re.sub(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]', repl_link, text)
     return text
 
+_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+def _auto_generate_description(rendered_html: str, limit: int = 200) -> str:
+    """Real Obsidian Publish auto-generates a description from note content when the
+    `description` frontmatter override isn't set (see 20_description_image_지원.md, pumice
+    repo) -- the exact truncation length isn't reverse-engineerable (that logic lives in
+    Publish's site-side renderer, not the desktop app this session otherwise reverses), so 200
+    chars is this implementation's own reasonable default, not a confirmed match. Cuts at the
+    last word boundary before the limit rather than mid-word."""
+    plain = html_module.unescape(_TAG_RE.sub(" ", rendered_html))
+    plain = _WHITESPACE_RE.sub(" ", plain).strip()
+    if len(plain) <= limit:
+        return plain
+    truncated = plain[:limit]
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    return truncated.rstrip() + "..."
+
+def _resolve_og_image_url(image_value: Optional[str], request, username: str, vault_id: str) -> Optional[str]:
+    """An `image`/`cover` frontmatter value is either an external absolute URL (used as-is) or a
+    vault-relative path to a file that must itself be published (resolved into this server's own
+    /publish/... URL) -- see 20_description_image_지원.md."""
+    if not image_value:
+        return None
+    if image_value.startswith("http://") or image_value.startswith("https://"):
+        return image_value
+    return (
+        f"{request.scheme}://{request.host}/publish/"
+        f"{quote(username, safe='')}/{quote(vault_id, safe='')}/{quote(image_value, safe='/')}"
+    )
+
 @view_config(route_name='publish_list', renderer='json', permission='vault-access')
 def publish_list_view(request):
     try:
@@ -786,12 +820,16 @@ def publish_upload_view(request):
         obs_path_enc = request.headers.get("obs-path")
         obs_hash = request.headers.get("obs-hash")
         obs_permalink_enc = request.headers.get("obs-permalink")
+        obs_description_enc = request.headers.get("obs-description")
+        obs_image_enc = request.headers.get("obs-image")
 
         if not obs_path_enc or not obs_hash:
             return Response(body=json.dumps({"error": "Missing obs-id, obs-path or obs-hash header"}).encode("utf-8"), status=400, content_type="application/json")
 
         path = unquote(obs_path_enc)
         permalink = unquote(obs_permalink_enc) if obs_permalink_enc else None
+        description = unquote(obs_description_enc) if obs_description_enc else None
+        image = unquote(obs_image_enc) if obs_image_enc else None
 
         # File storage location: data_dir/published/username/vault_id/path
         data_dir = request.registry.settings.get("data_dir")
@@ -816,7 +854,10 @@ def publish_upload_view(request):
                     f"(was '{existing['path']}') in vault={vault_id}"
                 )
 
-        request.repository.add_published_file(request.context.owner, vault_id, path, obs_hash, permalink=permalink)
+        request.repository.add_published_file(
+            request.context.owner, vault_id, path, obs_hash,
+            permalink=permalink, description=description, image=image,
+        )
         logger.info(f"Published file saved: vault={vault_id}, path={path}, hash={obs_hash}")
 
         _warm_plugin_resolve_cache(request, username, vault_id, dest_file_path, data_dir)
@@ -981,7 +1022,7 @@ def publish_view(request):
             "lang": lang, "t": lambda key, **params: t(key, lang, **params),
             "username": username, "vault_id": vault_id, "title": "",
             "files": files, "file_hrefs": _published_file_hrefs(username, vault_id, files),
-            "content": None,
+            "content": None, "description": None, "image": None,
         }
 
     # permalink routing takes priority over the literal path lookup below, matching real
@@ -1021,8 +1062,10 @@ def publish_view(request):
     except Exception as e:
         return Response(f"Failed to read file: {e}", status=500)
         
-    path_to_permalink = _build_path_to_permalink(request.repository.get_published_files(username, vault_id))
+    published_files = request.repository.get_published_files(username, vault_id)
+    path_to_permalink = _build_path_to_permalink(published_files)
     processed_md = parse_wikilinks(strip_frontmatter(md_content), username, vault_id, path_to_permalink)
+    own = next((f for f in published_files if f["path"] == path), {})
 
     enabled_plugin_ids = [p["plugin_id"] for p in request.repository.list_enabled_plugins(username, vault_id)]
     if enabled_plugin_ids:
@@ -1040,10 +1083,14 @@ def publish_view(request):
     if title.endswith(".md"):
         title = title[:-3]
 
+    description = own.get("description") or _auto_generate_description(html_content)
+    image = _resolve_og_image_url(own.get("image"), request, username, vault_id)
+
     return {
         "lang": lang, "t": lambda key, **params: t(key, lang, **params),
         "username": username, "vault_id": vault_id, "title": title,
         "files": None, "file_hrefs": {}, "content": html_content,
+        "description": description, "image": image,
     }
 
 

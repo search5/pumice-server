@@ -39,7 +39,7 @@ class FakeRegistry:
 
 class FakeRequest:
     def __init__(self, repository, data_dir, owner=None, vault_id=None,
-                 headers=None, body=b"", matchdict=None):
+                 headers=None, body=b"", matchdict=None, scheme="https", host="example.com"):
         self.repository = repository
         self.context = FakeContext(owner, vault_id) if owner is not None else None
         self.headers = headers or {}
@@ -47,12 +47,19 @@ class FakeRequest:
         self.registry = FakeRegistry({"data_dir": str(data_dir)})
         self.matchdict = matchdict or {}
         self.accept_language = FakeAcceptLanguage()
+        self.scheme = scheme
+        self.host = host
 
 
-def upload(repo, tmp_path, owner, vault_id, path, content: bytes, permalink=None, content_hash="h"):
+def upload(repo, tmp_path, owner, vault_id, path, content: bytes, permalink=None, content_hash="h",
+           description=None, image=None):
     headers = {"obs-path": path, "obs-hash": content_hash}
     if permalink is not None:
         headers["obs-permalink"] = permalink
+    if description is not None:
+        headers["obs-description"] = description
+    if image is not None:
+        headers["obs-image"] = image
     request = FakeRequest(repo, tmp_path, owner=owner, vault_id=vault_id, headers=headers, body=content)
     result = web.publish_upload_view(request)
     assert result == {"ok": True}
@@ -69,7 +76,7 @@ def test_upload_writes_the_file_and_records_it_without_a_permalink(repo, tmp_pat
     upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello", content_hash="hash-1")
 
     assert repo.get_published_files("alice", "vault1") == [
-        {"path": "note.md", "hash": "hash-1", "permalink": None}
+        {"path": "note.md", "hash": "hash-1", "permalink": None, "description": None, "image": None}
     ]
     assert (tmp_path / "published" / "alice" / "vault1" / "note.md").read_bytes() == b"# Hello"
 
@@ -155,3 +162,66 @@ def test_wikilinks_to_a_note_without_a_permalink_use_the_literal_path(repo, tmp_
     result = render(repo, tmp_path, "alice", "vault1", "source.md")
 
     assert '/publish/alice/vault1/target' in result["content"]
+
+
+# ─── publish_view: description/image social-preview meta tags (see 20_description_image_지원.md) ─
+
+def test_explicit_description_is_used_as_is(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello\n\nSome body text.",
+           description="A custom description.")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["description"] == "A custom description."
+
+
+def test_description_is_auto_generated_from_content_when_not_set(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello\n\nJust a short note.")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert "Just a short note." in result["description"]
+    assert "<" not in result["description"]  # HTML tags stripped out
+
+
+def test_auto_generated_description_is_truncated_for_long_content(repo, tmp_path):
+    long_body = "word " * 100  # far past the 200-char limit
+    upload(repo, tmp_path, "alice", "vault1", "note.md", f"# Title\n\n{long_body}".encode())
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert len(result["description"]) <= 210
+    assert result["description"].endswith("...")
+
+
+def test_explicit_image_path_resolves_to_an_absolute_published_url(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello", image="Attachments/cover.png")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["image"] == "https://example.com/publish/alice/vault1/Attachments/cover.png"
+
+
+def test_explicit_external_image_url_is_used_as_is(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello", image="https://cdn.example.com/cover.png")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["image"] == "https://cdn.example.com/cover.png"
+
+
+def test_no_image_means_no_og_image(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["image"] is None
+
+
+def test_root_file_list_page_has_no_description_or_image(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello", description="d", image="i.png")
+
+    result = render(repo, tmp_path, "alice", "vault1", "")
+
+    assert result["description"] is None
+    assert result["image"] is None

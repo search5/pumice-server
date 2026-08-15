@@ -115,7 +115,8 @@ class MetadataRepository(ABC):
 
     @abstractmethod
     def add_published_file(self, owner_username: str, vault_id: str, path: str, content_hash: str,
-                            permalink: Optional[str] = None, updated_at_ms: Optional[int] = None) -> None:
+                            permalink: Optional[str] = None, updated_at_ms: Optional[int] = None,
+                            description: Optional[str] = None, image: Optional[str] = None) -> None:
         pass
 
     @abstractmethod
@@ -339,6 +340,11 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             # Obsidian has no defined tie-break here; we define ours as "most recently published").
             Column("permalink", String(500), nullable=True),
             Column("updated_at_ms", BigInteger, nullable=True),
+            # description/image: frontmatter overrides for this note's social-media preview meta
+            # tags (see 20_description_image_지원.md, pumice repo). image holds either a
+            # vault-relative path or an external absolute URL, as-is -- resolved at render time.
+            Column("description", Text, nullable=True),
+            Column("image", String(1000), nullable=True),
         )
         Index("idx_published_files_permalink", self._published_files.c.owner_username,
               self._published_files.c.vault_id, self._published_files.c.permalink)
@@ -465,7 +471,10 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
 
         # Same idempotent backfill for published_files' permalink support (see
         # 19_permalink_지원.md, pumice repo).
-        for col in (self._published_files.c.permalink, self._published_files.c.updated_at_ms):
+        for col in (
+            self._published_files.c.permalink, self._published_files.c.updated_at_ms,
+            self._published_files.c.description, self._published_files.c.image,
+        ):
             col_type = col.type.compile(dialect=self.engine.dialect)
             stmt = f"ALTER TABLE published_files ADD COLUMN {col.name} {col_type}"
             try:
@@ -561,7 +570,7 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         # replacement is fully built (see that method's docstring for the incidents this avoids).
         for table, cols in (
             (self._file_metadata, ["vault_id", "path", "modified_at_ms", "size_bytes", "content_hash", "is_deleted"]),
-            (self._published_files, ["vault_id", "path", "content_hash", "permalink", "updated_at_ms"]),
+            (self._published_files, ["vault_id", "path", "content_hash", "permalink", "updated_at_ms", "description", "image"]),
         ):
             name = table.name
             # Recovers from a hard crash between a previous attempt's rename-aside and its final
@@ -805,7 +814,8 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             return dict(row._mapping) if row else None
 
     def add_published_file(self, owner_username: str, vault_id: str, path: str, content_hash: str,
-                            permalink: Optional[str] = None, updated_at_ms: Optional[int] = None) -> None:
+                            permalink: Optional[str] = None, updated_at_ms: Optional[int] = None,
+                            description: Optional[str] = None, image: Optional[str] = None) -> None:
         with self.engine.begin() as conn:
             self._upsert(conn, self._published_files, {
                 "owner_username": owner_username,
@@ -814,6 +824,8 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 "content_hash": content_hash,
                 "permalink": permalink,
                 "updated_at_ms": updated_at_ms if updated_at_ms is not None else int(time.time() * 1000),
+                "description": description,
+                "image": image,
             }, ["owner_username", "vault_id", "path"])
 
     def remove_published_file(self, owner_username: str, vault_id: str, path: str) -> None:
@@ -834,7 +846,11 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                     self._published_files.c.vault_id == vault_id,
                 )
             ).fetchall()
-            return [{"path": r.path, "hash": r.content_hash, "permalink": r.permalink} for r in rows]
+            return [
+                {"path": r.path, "hash": r.content_hash, "permalink": r.permalink,
+                 "description": r.description, "image": r.image}
+                for r in rows
+            ]
 
     def get_published_file_by_permalink(self, owner_username: str, vault_id: str, permalink: str) -> Optional[dict]:
         with self.engine.connect() as conn:
