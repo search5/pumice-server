@@ -13,6 +13,7 @@ from pyramid.config import Configurator
 from pyramid.response import Response
 from pyramid.view import view_config
 
+from .repository import CustomDomainAlreadyClaimedError
 from .plugin_registry import discover_plugins
 from .plugin_loader import load_plugin_autofill_paths, load_plugin_config_fields, run_enabled_plugins, suggest_plugin_autofill
 from .plugin_config_crypto import PluginConfigEncryptionError, decrypt_json, encrypt_json
@@ -167,7 +168,7 @@ def clear_session_cookie(request) -> None:
 from pyramid.authorization import Allow, Authenticated, Everyone, ACLHelper
 from pyramid.security import NO_PERMISSION_REQUIRED
 from pyramid.view import forbidden_view_config
-from pyramid.httpexceptions import HTTPForbidden, HTTPFound
+from pyramid.httpexceptions import HTTPForbidden, HTTPFound, HTTPMovedPermanently, HTTPNotFound
 
 class DeviceTokenSecurityPolicy:
     def identity(self, request):
@@ -701,7 +702,7 @@ def _build_path_to_permalink(files: list) -> dict:
             lookup[path[:-3]] = permalink
     return lookup
 
-def parse_wikilinks(text: str, username: str, vault_id: str, path_to_permalink: Optional[dict] = None) -> str:
+def parse_wikilinks(text: str, url_prefix: str, path_to_permalink: Optional[dict] = None) -> str:
     path_to_permalink = path_to_permalink or {}
 
     # 1. Handle image wikilinks: ![[image.png|width]]
@@ -709,10 +710,10 @@ def parse_wikilinks(text: str, username: str, vault_id: str, path_to_permalink: 
         target = match.group(1).strip()
         permalink = path_to_permalink.get(target)
         if permalink:
-            src = f"/publish/{username}/{vault_id}/{quote(permalink, safe='/')}"
+            src = f"{url_prefix}{quote(permalink, safe='/')}"
         else:
             safe_target = quote(target, safe='/')
-            src = f"/publish/{username}/{vault_id}/{safe_target}"
+            src = f"{url_prefix}{safe_target}"
         width_attr = ""
         if match.group(2):
             width = match.group(2).strip()
@@ -729,7 +730,7 @@ def parse_wikilinks(text: str, username: str, vault_id: str, path_to_permalink: 
 
         permalink = path_to_permalink.get(target)
         if permalink:
-            href = f"/publish/{username}/{vault_id}/{quote(permalink, safe='/')}"
+            href = f"{url_prefix}{quote(permalink, safe='/')}"
             return f'<a href="{href}" class="wiki-link">{label}</a>'
 
         base_target, ext = os.path.splitext(target)
@@ -739,7 +740,7 @@ def parse_wikilinks(text: str, username: str, vault_id: str, path_to_permalink: 
             url_target = target
 
         safe_target = quote(url_target, safe='/')
-        href = f"/publish/{username}/{vault_id}/{safe_target}"
+        href = f"{url_prefix}{safe_target}"
         return f'<a href="{href}" class="wiki-link">{label}</a>'
 
     text = re.sub(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]', repl_link, text)
@@ -765,22 +766,27 @@ def _auto_generate_description(rendered_html: str, limit: int = 200) -> str:
         truncated = truncated[:last_space]
     return truncated.rstrip() + "..."
 
-def _resolve_og_image_url(image_value: Optional[str], request, username: str, vault_id: str) -> Optional[str]:
+def _resolve_og_image_url(image_value: Optional[str], request, url_prefix: str) -> Optional[str]:
     """An `image`/`cover` frontmatter value is either an external absolute URL (used as-is) or a
     vault-relative path to a file that must itself be published (resolved into this server's own
-    /publish/... URL) -- see 20_description_image_지원.md."""
+    /publish/... URL) -- see 20_description_image_지원.md.
+
+    `url_prefix` is already absolute (`https://customdomain/`) when the vault has a custom
+    domain configured (see 26_커스텀_도메인_지원.md), in which case it's used as-is -- appending
+    `request.scheme`/`request.host` in that case would be wrong whenever the *request* came in
+    via the old /publish/{user}/{vault}/ path while the vault's canonical URL is now the custom
+    domain (request.host is this server's own host, not the vault's real origin)."""
     if not image_value:
         return None
     if image_value.startswith("http://") or image_value.startswith("https://"):
         return image_value
-    return (
-        f"{request.scheme}://{request.host}/publish/"
-        f"{quote(username, safe='')}/{quote(vault_id, safe='')}/{quote(image_value, safe='/')}"
-    )
+    if url_prefix.startswith("http://") or url_prefix.startswith("https://"):
+        return f"{url_prefix}{quote(image_value, safe='/')}"
+    return f"{request.scheme}://{request.host}{url_prefix}{quote(image_value, safe='/')}"
 
 _FAVICON_SIZED_RE = re.compile(r"^favicon-([0-9]+)(x[0-9]+)?\.png$", re.IGNORECASE)
 
-def _build_favicon_links(files: list, username: str, vault_id: str) -> list:
+def _build_favicon_links(files: list, url_prefix: str) -> list:
     """Real Obsidian Publish auto-detects any published favicon.ico or favicon-NN(xNN).png file
     and adds a <link rel="icon"> tag for each -- confirmed via obsidian.asar's own
     `Q$ = /^favicon-([0-9]+)(x[0-9]+)?.png$/i` pattern and Customize your site.md's documented
@@ -789,7 +795,7 @@ def _build_favicon_links(files: list, username: str, vault_id: str) -> list:
     icons = []
     for f in files:
         basename = os.path.basename(f["path"])
-        href = f"/publish/{quote(username, safe='')}/{quote(vault_id, safe='')}/{quote(f['path'], safe='/')}"
+        href = f"{url_prefix}{quote(f['path'], safe='/')}"
         if basename.lower() == "favicon.ico":
             icons.append({"href": href, "sizes": None})
             continue
@@ -800,21 +806,12 @@ def _build_favicon_links(files: list, username: str, vault_id: str) -> list:
             icons.append({"href": href, "sizes": sizes})
     return icons
 
-# publish.js only ever loads on a genuine custom domain in real Obsidian Publish (untrusted
-# uploaded JS running on the shared publish.obsidian.md origin would be a real security hole --
-# see Customize your site.md: "To use custom JavaScript with publish.js, you need Custom
-# domains"). pumice-server has no such per-vault origin isolation today -- publish_customurl_view
-# is a stub -- so this stays hardcoded False rather than silently executing arbitrary uploaded
-# JS on the shared origin. Flip this on only once real custom-domain hosting exists (see
-# 23_사이트_커스터마이징_정적_에셋.md).
-_CUSTOM_DOMAINS_SUPPORTED = False
-
-def _find_root_asset_href(files: list, filename: str, username: str, vault_id: str) -> Optional[str]:
+def _find_root_asset_href(files: list, filename: str, url_prefix: str) -> Optional[str]:
     """publish.css/publish.js must sit at the vault root (see Customize your site.md) --
     a same-named file in a subfolder doesn't count."""
     if not any(f["path"] == filename for f in files):
         return None
-    return f"/publish/{quote(username, safe='')}/{quote(vault_id, safe='')}/{quote(filename, safe='')}"
+    return f"{url_prefix}{quote(filename, safe='')}"
 
 @view_config(route_name='publish_list', renderer='json', permission='vault-access')
 def publish_list_view(request):
@@ -935,8 +932,9 @@ def _warm_plugin_resolve_cache(request, owner: str, vault_id: str, file_path: st
 
         with open(file_path, "r", encoding="utf-8") as f:
             md_content = f.read()
+        url_prefix, _, _ = _resolve_publish_url_prefix(request.repository, owner, vault_id)
         path_to_permalink = _build_path_to_permalink(request.repository.get_published_files(owner, vault_id))
-        processed_md = parse_wikilinks(strip_frontmatter(md_content), owner, vault_id, path_to_permalink)
+        processed_md = parse_wikilinks(strip_frontmatter(md_content), url_prefix, path_to_permalink)
         plugin_configs = _load_decrypted_plugin_configs(request, owner, vault_id, enabled_plugin_ids)
         cache_get, cache_set = make_disk_cache(data_dir)
         run_enabled_plugins(
@@ -1026,11 +1024,8 @@ _PUBLISH_MEDIA_MIME_TYPES = {
     ".wav": "audio/wav",
 }
 
-def _published_file_hrefs(username: str, vault_id: str, files: list) -> dict:
-    return {
-        f: f'/publish/{quote(username, safe="")}/{quote(vault_id, safe="")}/{quote(f, safe="/")}'
-        for f in files
-    }
+def _published_file_hrefs(url_prefix: str, files: list) -> dict:
+    return {f: f'{url_prefix}{quote(f, safe="/")}' for f in files}
 
 def _load_decrypted_plugin_configs(request, owner: str, vault_id: str, enabled_plugin_ids: list) -> dict:
     """{plugin_id: {entry_id: decrypted_config_dict}} for every plugin in enabled_plugin_ids --
@@ -1048,12 +1043,34 @@ def _load_decrypted_plugin_configs(request, owner: str, vault_id: str, enabled_p
         plugin_configs[plugin_id] = entries
     return plugin_configs
 
-@view_config(route_name='publish_view', permission=NO_PERMISSION_REQUIRED, renderer='templates/publish_page.jinja2')
-def publish_view(request):
-    username = request.matchdict.get("username")
-    vault_id = request.matchdict.get("vault_id")
-    path = request.matchdict.get("path", "")
+def _resolve_publish_url_prefix(repository, owner_username: str, vault_id: str):
+    """(url_prefix, is_custom_domain, domain) -- matches real Obsidian's own `isCustomDomain()`
+    exactly (confirmed via obsidian.asar: `!!this.customurl`, which only checks whether the site
+    *has* a custom domain configured, not which URL the current request came in on). So a vault
+    with a custom domain gets its custom-domain url_prefix and is_custom_domain=True regardless
+    of whether this particular request arrived via the old /publish/{user}/{vault}/ path or the
+    custom domain itself -- see 26_커스텀_도메인_지원.md."""
+    domain = repository.get_custom_domain(owner_username, vault_id)
+    if domain:
+        return f"https://{domain['hostname']}/", True, domain
+    return f"/publish/{quote(owner_username, safe='')}/{quote(vault_id, safe='')}/", False, None
+
+def _render_publish_page(request, username: str, vault_id: str, path: str, via_custom_domain_route: bool):
     lang = detect_lang(request)
+    url_prefix, is_custom_domain, domain = _resolve_publish_url_prefix(request.repository, username, vault_id)
+
+    # "Redirect to your custom domain" (see Custom domains.md) -- only fires when visiting the
+    # *old* URL while the vault has both a custom domain and the redirect toggle configured.
+    # Unlike permalink/alias redirects (client-side history.replaceState, see
+    # 19_permalink_지원.md/22_aliases_리다이렉트_및_파비콘_자동감지.md), this is a genuine
+    # cross-origin move -- there's no way to fake that with same-origin JS -- so a real HTTP 301
+    # is the only option (and the semantically correct one: the user configuring this is
+    # explicitly saying "I've permanently moved").
+    if is_custom_domain and not via_custom_domain_route and domain["redirect_to_custom_domain"]:
+        target = f"{url_prefix}{quote(path, safe='/')}"
+        if request.query_string:
+            target += f"?{request.query_string}"
+        return HTTPMovedPermanently(location=target)
 
     data_dir = request.registry.settings.get("data_dir")
     published_base = os.path.abspath(os.path.join(data_dir, "published", username, vault_id))
@@ -1062,22 +1079,24 @@ def publish_view(request):
     # lookups on a note page, and for favicon/static-asset detection (both site-wide concerns)
     # on both.
     published_files = request.repository.get_published_files(username, vault_id)
-    favicon_links = _build_favicon_links(published_files, username, vault_id)
-    publish_css_href = _find_root_asset_href(published_files, "publish.css", username, vault_id)
-    publish_js_href = (
-        _find_root_asset_href(published_files, "publish.js", username, vault_id)
-        if _CUSTOM_DOMAINS_SUPPORTED else None
-    )
+    favicon_links = _build_favicon_links(published_files, url_prefix)
+    publish_css_href = _find_root_asset_href(published_files, "publish.css", url_prefix)
+    publish_js_href = _find_root_asset_href(published_files, "publish.js", url_prefix) if is_custom_domain else None
 
     # First batch of the "Change site options" dialog (see
     # 25_사이트_옵션_1차_구현.md, pumice repo) -- shared by both branches below since siteName/
     # logo/noindex are header/meta concerns that apply to every page, not just note pages.
     options = _load_site_options(data_dir, username, vault_id)
     site_name = options["siteName"] or vault_id
-    logo_href = _resolve_og_image_url(options["logo"], request, username, vault_id)
+    logo_href = _resolve_og_image_url(options["logo"], request, url_prefix)
     common_option_fields = {
         "site_name": site_name, "logo_href": logo_href, "noindex": options["noindex"],
         "hide_title": options["hideTitle"], "readable_line_length": options["readableLineLength"],
+        # Real Obsidian only activates Google Analytics on a custom domain too (confirmed via
+        # obsidian.asar: the gtag setup is gated behind the same isCustomDomain() check as
+        # publish.js) -- see 26_커스텀_도메인_지원.md.
+        "google_analytics": options["googleAnalytics"] if is_custom_domain else None,
+        "url_prefix": url_prefix, "username": username, "vault_id": vault_id,
     }
 
     # Root: show the list of published files, UNLESS an indexFile is configured and actually
@@ -1099,8 +1118,8 @@ def publish_view(request):
             files = sorted(files)
             return {
                 "lang": lang, "t": lambda key, **params: t(key, lang, **params),
-                "username": username, "vault_id": vault_id, "title": "",
-                "files": files, "file_hrefs": _published_file_hrefs(username, vault_id, files),
+                "title": "",
+                "files": files, "file_hrefs": _published_file_hrefs(url_prefix, files),
                 "content": None, "description": None, "image": None, "favicons": favicon_links,
                 "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
                 **common_option_fields,
@@ -1146,15 +1165,15 @@ def publish_view(request):
         content_type = _PUBLISH_MEDIA_MIME_TYPES.get(ext, "application/octet-stream")
         with open(file_path, "rb") as f:
             return Response(body=f.read(), content_type=content_type)
-            
+
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             md_content = f.read()
     except Exception as e:
         return Response(f"Failed to read file: {e}", status=500)
-        
+
     path_to_permalink = _build_path_to_permalink(published_files)
-    processed_md = parse_wikilinks(strip_frontmatter(md_content), username, vault_id, path_to_permalink)
+    processed_md = parse_wikilinks(strip_frontmatter(md_content), url_prefix, path_to_permalink)
     own = next((f for f in published_files if f["path"] == path), {})
 
     enabled_plugin_ids = [p["plugin_id"] for p in request.repository.list_enabled_plugins(username, vault_id)]
@@ -1177,16 +1196,41 @@ def publish_view(request):
         title = title[:-3]
 
     description = own.get("description") or _auto_generate_description(html_content)
-    image = _resolve_og_image_url(own.get("image"), request, username, vault_id)
+    image = _resolve_og_image_url(own.get("image"), request, url_prefix)
 
     return {
         "lang": lang, "t": lambda key, **params: t(key, lang, **params),
-        "username": username, "vault_id": vault_id, "title": title,
+        "title": title,
         "files": None, "file_hrefs": {}, "content": html_content,
         "description": description, "image": image, "favicons": favicon_links,
         "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
         **common_option_fields,
     }
+
+@view_config(route_name='publish_view', permission=NO_PERMISSION_REQUIRED, renderer='templates/publish_page.jinja2')
+def publish_view(request):
+    username = request.matchdict.get("username")
+    vault_id = request.matchdict.get("vault_id")
+    path = request.matchdict.get("path", "")
+    return _render_publish_page(request, username, vault_id, path, via_custom_domain_route=False)
+
+def custom_domain_route_predicate(info, request):
+    """Route predicate for custom_domain_view -- registered as the very first route (see
+    create_pyramid_app below) so it gets first refusal on every request. Returning False falls
+    through to the next-registered route as normal (Pyramid's standard predicate behavior), so
+    no explicit "is this actually a custom domain" guard is needed anywhere else. A plain
+    (info, request) function rather than a predicate-factory class so it's directly unit
+    testable with a minimal fake request (see tests/test_custom_domain_predicate.py) -- see
+    26_커스텀_도메인_지원.md."""
+    return request.repository.get_vault_by_custom_domain(request.domain) is not None
+
+@view_config(route_name='custom_domain_view', permission=NO_PERMISSION_REQUIRED, renderer='templates/publish_page.jinja2')
+def custom_domain_view(request):
+    mapping = request.repository.get_vault_by_custom_domain(request.domain)
+    if not mapping:
+        return HTTPNotFound()  # predicate already guarantees this; re-checked for a race (the domain got released between predicate and view)
+    path = request.matchdict.get("path", "")
+    return _render_publish_page(request, mapping["owner_username"], mapping["vault_id"], path, via_custom_domain_route=True)
 
 
 @view_config(route_name='publish_slugs', renderer='json', permission='authenticated')
@@ -1239,9 +1283,31 @@ def publish_site_view(request):
         logger.error(f"HTTP publish_site failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_customurl', renderer='json', permission=NO_PERMISSION_REQUIRED)
+@view_config(route_name='publish_customurl', renderer='json', permission='vault-access')
 def publish_customurl_view(request):
-    return {"url": "", "redirect": False}
+    # real Obsidian's apiCustomUrl(url, redirect) posts {token, id, host, url, redirect} to this
+    # same endpoint for both fetching (called with no args) and saving (see 26_커스텀_도메인_
+    # 지원.md) -- "host" is the caller's own pumice-server instance host:port (same convention
+    # as /api/slug's "host" field), received but never stored/used here, just like /api/slug.
+    try:
+        vault_id = request.context.vault_id
+        owner = request.context.owner
+        url = request.json_body.get("url")
+        if url is not None:
+            try:
+                request.repository.set_custom_domain(owner, vault_id, url, bool(request.json_body.get("redirect", False)))
+            except CustomDomainAlreadyClaimedError:
+                return Response(
+                    body=json.dumps({"error": "This domain is already in use by a different site."}).encode("utf-8"),
+                    status=409, content_type="application/json")
+        domain = request.repository.get_custom_domain(owner, vault_id)
+        return {
+            "url": domain["hostname"] if domain else "",
+            "redirect": domain["redirect_to_custom_domain"] if domain else False,
+        }
+    except Exception as e:
+        logger.error(f"HTTP publish_customurl failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
 # First batch of real Obsidian Publish's "Change site options" dialog (~20 settings total, see
 # 24_사이트_옵션_다이얼로그_실제_옵시디언과_비교.md) -- the ones that only need a stored value
@@ -1968,6 +2034,23 @@ def create_pyramid_app(repository, data_dir):
     config.set_root_factory(RootFactory)
     config.set_default_permission("authenticated")
 
+    # custom_domain_view MUST be the very first add_route call: its pattern (`/{path:.*}`)
+    # matches literally every path, so if any more specific route were registered before it,
+    # that route would win the match first and custom_domain_route_predicate would never even
+    # run for that path. The predicate itself (checking request.domain against a registered
+    # custom domain) is what keeps this from swallowing normal traffic -- a non-matching
+    # predicate just falls through to try the next-registered route, same as any Pyramid
+    # predicate (see 26_커스텀_도메인_지원.md). add_static_view above is unaffected since static
+    # assets are dispatched before route matching.
+    # custom_predicates (rather than the newer add_route_predicate) is what actually accepts a
+    # plain (context, request) -> bool function directly -- add_route_predicate instead expects
+    # a *factory* called at config-commit time as (value, config) that must itself return the
+    # per-request predicate callable, which is a different shape (confirmed the hard way: it
+    # blew up make_wsgi_app() at commit time). custom_predicates is deprecated since Pyramid 1.5
+    # but still fully functional (just a DeprecationWarning) -- simplicity here wins over
+    # chasing the newer API's extra indirection for a single predicate.
+    config.add_route('custom_domain_view', '/{path:.*}', custom_predicates=[custom_domain_route_predicate])
+
     # Add routes. Endpoints scoped to a single vault get VaultContext as their route factory,
     # which resolves vault_id (from matchdict/params/obs-id header/JSON body, whichever that
     # endpoint uses) and builds its ACL from ownership -- paired with permission='vault-access'
@@ -2015,7 +2098,7 @@ def create_pyramid_app(repository, data_dir):
     config.add_route('publish_download', '/api/download', factory=VaultContext)
     config.add_route('publish_slugs', '/api/slugs')
     config.add_route('publish_site', '/api/site')
-    config.add_route('publish_customurl', '/api/customurl')
+    config.add_route('publish_customurl', '/api/customurl', factory=VaultContext)
     config.add_route('publish_options', '/api/options', factory=VaultContext)
     config.add_route('publish_slug', '/api/slug', factory=VaultContext)
     config.add_route('publish_password', '/api/password', factory=VaultContext)

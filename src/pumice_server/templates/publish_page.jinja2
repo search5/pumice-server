@@ -308,11 +308,24 @@
     {% if publish_js_href %}
     <script src="{{ publish_js_href }}" defer></script>
     {% endif %}
+    {% if google_analytics %}
+    <!-- Standard gtag.js snippet -- real Obsidian gates Google Analytics behind the same
+         isCustomDomain() check as publish.js (confirmed via obsidian.asar), but the exact
+         snippet it injects wasn't confirmed, so this is a reasonable default, not a byte-exact
+         match (see 26_커스텀_도메인_지원.md). -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id={{ google_analytics }}"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', '{{ google_analytics }}');
+    </script>
+    {% endif %}
 </head>
 <body>
     <div class="layout{% if not readable_line_length %} wide{% endif %}">
         <header>
-            <a href="/publish/{{ username }}/{{ vault_id }}/" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
+            <a href="{{ url_prefix }}" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
             <span class="vault-badge">Vault: {{ vault_id }}</span>
         </header>
         <main class="container markdown-body">
@@ -324,7 +337,7 @@
             {%- endif %}
         </main>
         <footer>
-            <p>Powered by Antigravity Obsidian Publish Server | <a href="/publish/{{ username }}/{{ vault_id }}/index.md">Index</a></p>
+            <p>Powered by Antigravity Obsidian Publish Server | <a href="{{ url_prefix }}index.md">Index</a></p>
         </footer>
     </div>
 </body>

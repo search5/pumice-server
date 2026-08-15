@@ -22,7 +22,7 @@ to force the rare failure branches that require an actual DB-level failure to re
 import pytest
 from sqlalchemy import inspect as sa_inspect
 
-from pumice_server.repository import SqlAlchemyMetadataRepository
+from pumice_server.repository import CustomDomainAlreadyClaimedError, SqlAlchemyMetadataRepository
 
 
 @pytest.fixture
@@ -650,6 +650,76 @@ def test_a_later_file_claiming_the_same_alias_overwrites_the_earlier_one(repo):
     repo.set_published_file_aliases("alice", "vault-1", "new.md", ["shared"])
 
     assert repo.get_published_file_by_alias("alice", "vault-1", "shared") == "new.md"
+
+
+# ─── custom domains (see 26_커스텀_도메인_지원.md, pumice repo) ────────────────────────────────
+
+def test_set_custom_domain_then_lookup_by_hostname(repo):
+    repo.set_custom_domain("alice", "vault-1", "notes.example.com", redirect=True)
+
+    assert repo.get_vault_by_custom_domain("notes.example.com") == {
+        "owner_username": "alice", "vault_id": "vault-1", "redirect_to_custom_domain": True,
+    }
+
+
+def test_get_custom_domain_returns_the_vaults_own_setting(repo):
+    repo.set_custom_domain("alice", "vault-1", "notes.example.com", redirect=False)
+
+    assert repo.get_custom_domain("alice", "vault-1") == {
+        "hostname": "notes.example.com", "redirect_to_custom_domain": False,
+    }
+
+
+def test_get_custom_domain_returns_none_when_unset(repo):
+    assert repo.get_custom_domain("alice", "vault-1") is None
+
+
+def test_get_vault_by_custom_domain_returns_none_for_an_unregistered_hostname(repo):
+    assert repo.get_vault_by_custom_domain("nowhere.example.com") is None
+
+
+def test_hostname_lookup_is_case_insensitive(repo):
+    repo.set_custom_domain("alice", "vault-1", "Notes.Example.com")
+
+    assert repo.get_vault_by_custom_domain("notes.example.com") is not None
+    assert repo.get_vault_by_custom_domain("NOTES.EXAMPLE.COM") is not None
+
+
+def test_resetting_a_vaults_domain_releases_the_old_hostname(repo):
+    repo.set_custom_domain("alice", "vault-1", "old.example.com")
+    repo.set_custom_domain("alice", "vault-1", "new.example.com")
+
+    assert repo.get_vault_by_custom_domain("old.example.com") is None
+    assert repo.get_vault_by_custom_domain("new.example.com") == {
+        "owner_username": "alice", "vault_id": "vault-1", "redirect_to_custom_domain": False,
+    }
+
+
+def test_setting_an_empty_hostname_releases_the_domain(repo):
+    repo.set_custom_domain("alice", "vault-1", "notes.example.com")
+    repo.set_custom_domain("alice", "vault-1", "")
+
+    assert repo.get_custom_domain("alice", "vault-1") is None
+    assert repo.get_vault_by_custom_domain("notes.example.com") is None
+
+
+def test_a_hostname_already_claimed_by_another_vault_is_rejected(repo):
+    repo.set_custom_domain("alice", "vault-1", "notes.example.com")
+
+    with pytest.raises(CustomDomainAlreadyClaimedError):
+        repo.set_custom_domain("bob", "vault-1", "notes.example.com")
+
+    # The original claim is untouched.
+    assert repo.get_vault_by_custom_domain("notes.example.com") == {
+        "owner_username": "alice", "vault_id": "vault-1", "redirect_to_custom_domain": False,
+    }
+
+
+def test_re_setting_the_same_hostname_for_the_same_vault_is_not_a_conflict(repo):
+    repo.set_custom_domain("alice", "vault-1", "notes.example.com", redirect=False)
+    repo.set_custom_domain("alice", "vault-1", "notes.example.com", redirect=True)  # must not raise
+
+    assert repo.get_custom_domain("alice", "vault-1")["redirect_to_custom_domain"] is True
 
 
 # ─── create_user / get_user_by_username ────────────────────────────────────────────────────────

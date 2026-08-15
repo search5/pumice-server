@@ -37,6 +37,13 @@ class VaultAccessDenied(Exception):
     pumice's 14_vault_sharing_설계.md for the full design."""
 
 
+class CustomDomainAlreadyClaimedError(Exception):
+    """Raised by set_custom_domain() when the requested hostname is already claimed by a
+    different (owner, vault) pair -- see pumice's 26_커스텀_도메인_지원.md. A hostname is a
+    DNS asset someone already pointed at this server; silently letting a second vault take it
+    over would break the original owner's site without warning."""
+
+
 class MetadataRepository(ABC):
     @abstractmethod
     def init_db(self) -> None:
@@ -141,6 +148,19 @@ class MetadataRepository(ABC):
 
     @abstractmethod
     def get_published_file_by_alias(self, owner_username: str, vault_id: str, alias_path: str) -> Optional[str]:
+        pass
+
+    @abstractmethod
+    def set_custom_domain(self, owner_username: str, vault_id: str, hostname: str,
+                           redirect: bool = False) -> None:
+        pass
+
+    @abstractmethod
+    def get_vault_by_custom_domain(self, hostname: str) -> Optional[dict]:
+        pass
+
+    @abstractmethod
+    def get_custom_domain(self, owner_username: str, vault_id: str) -> Optional[dict]:
         pass
 
     @abstractmethod
@@ -469,6 +489,23 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             Column("alias_path", String(500), primary_key=True),
             Column("path", String(500), nullable=False),
         )
+
+        # Custom domains (see 26_커스텀_도메인_지원.md, pumice repo) -- hostname is the PK
+        # since the hot path (a Pyramid route predicate, evaluated on every incoming request) is
+        # exactly "which vault does this Host header belong to", a PK lookup. Stored lowercased
+        # for case-insensitive matching, same reasoning as published_file_aliases. The
+        # (owner_username, vault_id) unique index enforces "at most one custom domain per vault"
+        # at the DB level too -- set_custom_domain()'s delete-then-upsert is the primary
+        # enforcement, this is a safety net. New table, no ALTER-TABLE backfill needed.
+        self._custom_domains = Table("custom_domains", self._meta,
+            Column("hostname", String(255), primary_key=True),
+            Column("owner_username", String(100), nullable=False),
+            Column("vault_id", String(255), nullable=False),
+            Column("redirect_to_custom_domain", Boolean, nullable=False, default=False),
+            Column("updated_at_ms", BigInteger, nullable=False),
+        )
+        Index("idx_custom_domains_owner_vault", self._custom_domains.c.owner_username,
+              self._custom_domains.c.vault_id, unique=True)
 
     def init_db(self) -> None:
         # Runs before the owner-scoping migration below: file_metadata/published_files may still
@@ -923,6 +960,57 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 )
             ).fetchone()
             return row.path if row else None
+
+    def set_custom_domain(self, owner_username: str, vault_id: str, hostname: str,
+                           redirect: bool = False) -> None:
+        hostname = (hostname or "").strip().lower()
+        with self.engine.begin() as conn:
+            if hostname:
+                existing = conn.execute(
+                    select(self._custom_domains.c.owner_username, self._custom_domains.c.vault_id)
+                    .where(self._custom_domains.c.hostname == hostname)
+                ).fetchone()
+                if existing and (existing.owner_username, existing.vault_id) != (owner_username, vault_id):
+                    raise CustomDomainAlreadyClaimedError(hostname)
+            # A vault has at most one custom domain -- full replace, same pattern as
+            # set_published_file_aliases (delete this vault's row, then re-add if a hostname
+            # was given). hostname="" just releases it.
+            conn.execute(delete(self._custom_domains).where(
+                self._custom_domains.c.owner_username == owner_username,
+                self._custom_domains.c.vault_id == vault_id,
+            ))
+            if hostname:
+                self._upsert(conn, self._custom_domains, {
+                    "hostname": hostname,
+                    "owner_username": owner_username,
+                    "vault_id": vault_id,
+                    "redirect_to_custom_domain": redirect,
+                    "updated_at_ms": int(time.time() * 1000),
+                }, ["hostname"])
+
+    def get_vault_by_custom_domain(self, hostname: str) -> Optional[dict]:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._custom_domains).where(
+                    self._custom_domains.c.hostname == (hostname or "").strip().lower()
+                )
+            ).fetchone()
+            return {
+                "owner_username": row.owner_username, "vault_id": row.vault_id,
+                "redirect_to_custom_domain": bool(row.redirect_to_custom_domain),
+            } if row else None
+
+    def get_custom_domain(self, owner_username: str, vault_id: str) -> Optional[dict]:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._custom_domains).where(
+                    self._custom_domains.c.owner_username == owner_username,
+                    self._custom_domains.c.vault_id == vault_id,
+                )
+            ).fetchone()
+            return {
+                "hostname": row.hostname, "redirect_to_custom_domain": bool(row.redirect_to_custom_domain),
+            } if row else None
 
     def enable_plugin(self, owner_username: str, vault_id: str, plugin_id: str, enabled_at_ms: int) -> None:
         with self.engine.begin() as conn:

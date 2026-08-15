@@ -42,7 +42,7 @@ class FakeRegistry:
 class FakeRequest:
     def __init__(self, repository, data_dir, owner=None, vault_id=None,
                  headers=None, body=b"", matchdict=None, scheme="https", host="example.com",
-                 json_body=None):
+                 json_body=None, query_string="", domain=None):
         self.repository = repository
         self.context = FakeContext(owner, vault_id) if owner is not None else None
         self.headers = headers or {}
@@ -52,6 +52,8 @@ class FakeRequest:
         self.accept_language = FakeAcceptLanguage()
         self.scheme = scheme
         self.host = host
+        self.query_string = query_string
+        self.domain = domain if domain is not None else host.split(":")[0]
         self._json_body = json_body if json_body is not None else {}
 
     @property
@@ -558,3 +560,111 @@ def test_no_index_file_set_shows_the_file_list_as_before(repo, tmp_path):
     result = render(repo, tmp_path, "alice", "vault1", "")
 
     assert result["files"] is not None
+
+
+# ─── custom domains (see 26_커스텀_도메인_지원.md) ──────────────────────────────────────────────
+
+def test_no_custom_domain_still_hides_publish_js_and_google_analytics(repo, tmp_path):
+    # Regression guard for the previously-hardcoded _CUSTOM_DOMAINS_SUPPORTED flag.
+    save_options(repo, tmp_path, "alice", "vault1", {"googleAnalytics": "G-ABC123"})
+    upload(repo, tmp_path, "alice", "vault1", "publish.js", b"alert(1)")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["publish_js_href"] is None
+    assert result["google_analytics"] is None
+
+
+def test_custom_domain_configured_renders_publish_js_and_google_analytics(repo, tmp_path):
+    repo.set_custom_domain("alice", "vault1", "notes.example.com")
+    save_options(repo, tmp_path, "alice", "vault1", {"googleAnalytics": "G-ABC123"})
+    upload(repo, tmp_path, "alice", "vault1", "publish.js", b"alert(1)")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["publish_js_href"] == "https://notes.example.com/publish.js"
+    assert result["google_analytics"] == "G-ABC123"
+
+
+def test_this_applies_even_when_visited_via_the_old_publish_path_url(repo, tmp_path):
+    # Core design decision: is_custom_domain reflects the vault's own configuration, not which
+    # route this particular request came in through (matches real Obsidian's isCustomDomain()).
+    repo.set_custom_domain("alice", "vault1", "notes.example.com", redirect=False)
+    upload(repo, tmp_path, "alice", "vault1", "publish.js", b"alert(1)")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["publish_js_href"] is not None
+
+
+def test_hrefs_use_the_custom_domain_root_when_configured(repo, tmp_path):
+    repo.set_custom_domain("alice", "vault1", "notes.example.com")
+    upload(repo, tmp_path, "alice", "vault1", "favicon.ico", b"a")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["favicons"] == [{"href": "https://notes.example.com/favicon.ico", "sizes": None}]
+    assert result["url_prefix"] == "https://notes.example.com/"
+
+
+def test_wikilinks_use_the_custom_domain_root_when_configured(repo, tmp_path):
+    repo.set_custom_domain("alice", "vault1", "notes.example.com")
+    upload(repo, tmp_path, "alice", "vault1", "target.md", b"# Target")
+    upload(repo, tmp_path, "alice", "vault1", "source.md", b"See [[target]] for more.")
+
+    result = render(repo, tmp_path, "alice", "vault1", "source.md")
+
+    assert 'https://notes.example.com/target' in result["content"]
+
+
+def test_og_image_uses_the_custom_domain_origin_not_the_request_host(repo, tmp_path):
+    # Regression test: the request may still arrive via the old /publish/{user}/{vault}/ path
+    # (request.host is this server's own host there), but the vault's canonical origin is the
+    # custom domain -- og:image must reflect that, not request.host.
+    repo.set_custom_domain("alice", "vault1", "notes.example.com")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello", image="Attachments/cover.png")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["image"] == "https://notes.example.com/Attachments/cover.png"
+
+
+def test_visiting_the_old_url_redirects_when_the_toggle_is_on(repo, tmp_path):
+    repo.set_custom_domain("alice", "vault1", "notes.example.com", redirect=True)
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    response = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert response.status_code == 301
+    assert response.location == "https://notes.example.com/note.md"
+
+
+def test_visiting_the_old_url_does_not_redirect_when_the_toggle_is_off(repo, tmp_path):
+    repo.set_custom_domain("alice", "vault1", "notes.example.com", redirect=False)
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert "Hello" in result["content"]
+
+
+def test_custom_domain_view_resolves_the_owner_from_the_hostname_and_does_not_redirect(repo, tmp_path):
+    repo.set_custom_domain("alice", "vault1", "notes.example.com", redirect=True)
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    request = FakeRequest(repo, tmp_path, matchdict={"path": "note.md"}, domain="notes.example.com")
+    result = web.custom_domain_view(request)
+
+    assert "Hello" in result["content"]
+
+
+def test_custom_domain_view_404s_for_a_domain_that_was_just_released(repo, tmp_path):
+    request = FakeRequest(repo, tmp_path, matchdict={"path": ""}, domain="nowhere.example.com")
+
+    response = web.custom_domain_view(request)
+
+    assert response.status_code == 404
