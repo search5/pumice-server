@@ -33,9 +33,14 @@ test("resolveWikilinkHref falls back to the literal target with .md stripped", (
   assert.equal(renderer.resolveWikilinkHref("Folder/Note", {}, "/publish/alice/vault1/"), "/publish/alice/vault1/Folder/Note");
 });
 
-test("renderMarkdown renders headings and a paragraph", () => {
+test("renderMarkdown renders headings (with a slugified id for outline anchors) and a paragraph", () => {
   const html = renderer.renderMarkdown("# Title\n\nHello world.\n", {}, "/publish/alice/vault1/");
-  assert.equal(html, "<h1>Title</h1>\n<p>Hello world.</p>");
+  assert.equal(html, '<h1 id="title">Title</h1>\n<p>Hello world.</p>');
+});
+
+test("renderMarkdown de-duplicates heading ids the same way buildOutline does", () => {
+  const html = renderer.renderMarkdown("# Same\n\n# Same\n", {}, "/publish/alice/vault1/");
+  assert.equal(html, '<h1 id="same">Same</h1>\n<h1 id="same-1">Same</h1>');
 });
 
 test("renderMarkdown renders bold, italic and inline code without cross-contamination", () => {
@@ -90,4 +95,57 @@ test("renderMarkdown renders an image embed resolved against the cache", () => {
 test("renderInline escapes raw HTML in the source text", () => {
   const html = renderer.renderMarkdown("<script>alert(1)</script>\n", {}, "/publish/alice/vault1/");
   assert.equal(html, "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>");
+});
+
+// ─── Phase 2: outline + backlinks (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 2 follow-up) ──
+
+test("buildOutline turns a cache entry's headings into a slugged, ordered outline", () => {
+  const entry = { headings: [{ heading: "Intro", level: 1 }, { heading: "Sub Point", level: 2 }] };
+  assert.deepEqual(renderer.buildOutline(entry), [
+    { level: 1, heading: "Intro", slug: "intro" },
+    { level: 2, heading: "Sub Point", slug: "sub-point" },
+  ]);
+});
+
+test("buildOutline de-duplicates identical heading text the same way as renderMarkdown", () => {
+  const entry = { headings: [{ heading: "Same", level: 1 }, { heading: "Same", level: 1 }] };
+  assert.deepEqual(renderer.buildOutline(entry).map((o) => o.slug), ["same", "same-1"]);
+});
+
+test("buildOutline returns an empty list for a note with no headings", () => {
+  assert.deepEqual(renderer.buildOutline({ headings: [] }), []);
+  assert.deepEqual(renderer.buildOutline(null), []);
+});
+
+test("linkTargetMatchesPath matches a wikilink target against the .md-suffixed stored path", () => {
+  assert.equal(renderer.linkTargetMatchesPath("Note", "Note.md"), true);
+  assert.equal(renderer.linkTargetMatchesPath("Note.md", "Note.md"), true);
+  assert.equal(renderer.linkTargetMatchesPath("Other", "Note.md"), false);
+});
+
+test("buildBacklinks finds every other note whose links[] targets the current path", () => {
+  const cache = {
+    "Home.md": { links: [{ link: "Note" }] },
+    "Note.md": { links: [] },
+    "Unrelated.md": { links: [{ link: "SomethingElse" }] },
+  };
+  const backlinks = renderer.buildBacklinks(cache, "Note.md", "/publish/alice/vault1/");
+  assert.deepEqual(backlinks, [{ path: "Home.md", href: "/publish/alice/vault1/Home" }]);
+});
+
+test("buildBacklinks excludes the current note itself and skips null cache entries", () => {
+  const cache = {
+    "Note.md": { links: [{ link: "Note" }] },
+    "publish.js": null,
+  };
+  assert.deepEqual(renderer.buildBacklinks(cache, "Note.md", "/publish/alice/vault1/"), []);
+});
+
+test("buildBacklinks resolves the backlinking note's own permalink when it has one", () => {
+  const cache = {
+    "Home.md": { links: [{ link: "Note" }], permalink: "/welcome/" },
+    "Note.md": { links: [] },
+  };
+  const backlinks = renderer.buildBacklinks(cache, "Note.md", "/publish/alice/vault1/");
+  assert.deepEqual(backlinks, [{ path: "Home.md", href: "/publish/alice/vault1/welcome/" }]);
 });

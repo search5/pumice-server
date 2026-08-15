@@ -122,6 +122,43 @@
             -webkit-backdrop-filter: blur(12px);
         }
 
+        .pumice-sidebar:empty {
+            display: none;
+        }
+
+        .pumice-sidebar {
+            margin: 24px 0;
+            padding: 16px 20px;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            background: rgba(22, 27, 34, 0.4);
+            font-size: 14px;
+        }
+
+        .pumice-sidebar h2 {
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin: 0 0 8px 0;
+        }
+
+        .pumice-sidebar ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+        }
+
+        .pumice-sidebar li {
+            margin: 4px 0;
+        }
+
+        .pumice-sidebar .outline-level-2 { padding-left: 14px; }
+        .pumice-sidebar .outline-level-3 { padding-left: 28px; }
+        .pumice-sidebar .outline-level-4 { padding-left: 42px; }
+        .pumice-sidebar .outline-level-5 { padding-left: 56px; }
+        .pumice-sidebar .outline-level-6 { padding-left: 70px; }
+
         .markdown-body h1 {
             font-family: 'Outfit', sans-serif;
             font-size: 2.2em;
@@ -333,7 +370,9 @@
             <h1>{{ site_name }}</h1>{% if files %}<ul>{% for f in files %}<li><a href="{{ file_hrefs[f] }}">{{ f }}</a></li>{% endfor %}</ul>{% else %}<p>{{ t('publish_public.empty_no_files') }}</p>{% endif %}
             {%- elif client_rendered -%}
             {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
+            <aside id="pumice-outline" class="pumice-sidebar"></aside>
             <div id="pumice-note-root" data-note-path="{{ path }}"></div>
+            <aside id="pumice-backlinks" class="pumice-sidebar"></aside>
             <script>window.pumicePreload = {{ preload_json | safe }};</script>
             <script defer src="/static/publish_render.js"></script>
             {%- else -%}
