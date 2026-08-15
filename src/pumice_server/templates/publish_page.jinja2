@@ -284,6 +284,12 @@
             }
         }
     </style>
+    {% if publish_css_href %}
+    <link rel="stylesheet" href="{{ publish_css_href }}">
+    {% endif %}
+    {% if publish_js_href %}
+    <script src="{{ publish_js_href }}" defer></script>
+    {% endif %}
 </head>
 <body>
     <div class="layout">

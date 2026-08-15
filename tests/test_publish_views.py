@@ -358,3 +358,53 @@ def test_root_file_list_page_also_gets_favicon_links(repo, tmp_path):
     result = render(repo, tmp_path, "alice", "vault1", "")
 
     assert result["favicons"] == [{"href": "/publish/alice/vault1/favicon.ico", "sizes": None}]
+
+
+# ─── publish_view: publish.css/publish.js static assets (see 23_사이트_커스터마이징_정적_에셋.md) ─
+
+def test_published_publish_css_is_linked(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "publish.css", b"body{color:red}")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["publish_css_href"] == "/publish/alice/vault1/publish.css"
+
+
+def test_no_published_publish_css_means_no_link(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["publish_css_href"] is None
+
+
+def test_a_publish_css_outside_the_vault_root_is_not_linked(repo, tmp_path):
+    # Real Obsidian requires publish.css to be in the vault root (see Customize your site.md).
+    upload(repo, tmp_path, "alice", "vault1", "Attachments/publish.css", b"body{color:red}")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["publish_css_href"] is None
+
+
+def test_published_publish_js_is_never_linked_without_a_real_custom_domain(repo, tmp_path):
+    # Real Obsidian only loads publish.js on a custom domain (untrusted JS on the shared
+    # publish.obsidian.md origin would be a real security hole) -- pumice-server has no genuine
+    # per-vault origin isolation yet (publish_customurl_view is a stub), so this must stay
+    # inert rather than executing arbitrary uploaded JS on the shared origin.
+    upload(repo, tmp_path, "alice", "vault1", "publish.js", b"alert(1)")
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["publish_js_href"] is None
+
+
+def test_root_file_list_page_also_gets_publish_css_link(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "publish.css", b"body{color:red}")
+
+    result = render(repo, tmp_path, "alice", "vault1", "")
+
+    assert result["publish_css_href"] == "/publish/alice/vault1/publish.css"

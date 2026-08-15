@@ -800,6 +800,22 @@ def _build_favicon_links(files: list, username: str, vault_id: str) -> list:
             icons.append({"href": href, "sizes": sizes})
     return icons
 
+# publish.js only ever loads on a genuine custom domain in real Obsidian Publish (untrusted
+# uploaded JS running on the shared publish.obsidian.md origin would be a real security hole --
+# see Customize your site.md: "To use custom JavaScript with publish.js, you need Custom
+# domains"). pumice-server has no such per-vault origin isolation today -- publish_customurl_view
+# is a stub -- so this stays hardcoded False rather than silently executing arbitrary uploaded
+# JS on the shared origin. Flip this on only once real custom-domain hosting exists (see
+# 23_사이트_커스터마이징_정적_에셋.md).
+_CUSTOM_DOMAINS_SUPPORTED = False
+
+def _find_root_asset_href(files: list, filename: str, username: str, vault_id: str) -> Optional[str]:
+    """publish.css/publish.js must sit at the vault root (see Customize your site.md) --
+    a same-named file in a subfolder doesn't count."""
+    if not any(f["path"] == filename for f in files):
+        return None
+    return f"/publish/{quote(username, safe='')}/{quote(vault_id, safe='')}/{quote(filename, safe='')}"
+
 @view_config(route_name='publish_list', renderer='json', permission='vault-access')
 def publish_list_view(request):
     try:
@@ -1043,9 +1059,15 @@ def publish_view(request):
     published_base = os.path.abspath(os.path.join(data_dir, "published", username, vault_id))
 
     # Fetched once and shared by both branches below -- used for permalink/description/image
-    # lookups on a note page, and for favicon auto-detection (a site-wide concern) on both.
+    # lookups on a note page, and for favicon/static-asset detection (both site-wide concerns)
+    # on both.
     published_files = request.repository.get_published_files(username, vault_id)
     favicon_links = _build_favicon_links(published_files, username, vault_id)
+    publish_css_href = _find_root_asset_href(published_files, "publish.css", username, vault_id)
+    publish_js_href = (
+        _find_root_asset_href(published_files, "publish.js", username, vault_id)
+        if _CUSTOM_DOMAINS_SUPPORTED else None
+    )
 
     # Root: show the list of published files. `files=None` is how the template tells this
     # branch apart from an actual note's rendered content -- an empty *list* still means "show
@@ -1063,6 +1085,7 @@ def publish_view(request):
             "username": username, "vault_id": vault_id, "title": "",
             "files": files, "file_hrefs": _published_file_hrefs(username, vault_id, files),
             "content": None, "description": None, "image": None, "favicons": favicon_links,
+            "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
         }
 
     # permalink routing takes priority over the literal path lookup below, matching real
@@ -1140,6 +1163,7 @@ def publish_view(request):
         "username": username, "vault_id": vault_id, "title": title,
         "files": None, "file_hrefs": {}, "content": html_content,
         "description": description, "image": image, "favicons": favicon_links,
+        "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
     }
 
 
