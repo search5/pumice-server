@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import time
+import uuid
 from typing import Callable, Dict, Any, Optional
 
 from sqlalchemy import (
@@ -27,6 +28,13 @@ logger = logging.getLogger(__name__)
 # (global, cross-vault) history_id with no check that it belonged to the vault the caller was
 # authorized for, so owning any one vault let you enumerate history_ids and pull file content from
 # other people's vaults. It now requires the caller's owner_username to match too.
+
+
+class VaultAccessDenied(Exception):
+    """Raised by resolve_vault_owner() when the caller has no right to act as the requested
+    owner for this vault -- they're not that owner themselves, and no vault_shares row matches
+    their account's own email for (requested_owner_username, vault_id). See
+    pumice's 14_vault_sharing_설계.md for the full design."""
 
 
 class MetadataRepository(ABC):
@@ -213,6 +221,35 @@ class MetadataRepository(ABC):
     def update_user_profile(self, username: str, name: str, email: str) -> None:
         pass
 
+    @abstractmethod
+    def add_vault_share(self, owner_username: str, vault_id: str, email: str) -> str:
+        pass
+
+    @abstractmethod
+    def list_vault_shares(self, owner_username: str, vault_id: str) -> list:
+        pass
+
+    @abstractmethod
+    def remove_vault_share(self, owner_username: str, vault_id: str, share_uid: str) -> bool:
+        pass
+
+    @abstractmethod
+    def remove_vault_share_by_invited_user(self, caller_username: str, owner_username: str, vault_id: str) -> bool:
+        pass
+
+    @abstractmethod
+    def list_shared_vaults_for_user(self, username: str) -> list:
+        pass
+
+    @abstractmethod
+    def get_accepted_share_usernames(self, owner_username: str, vault_id: str) -> list:
+        pass
+
+    @abstractmethod
+    def resolve_vault_owner(self, caller_username: str, requested_owner_username: str, vault_id: str,
+                             mark_accepted: bool = False) -> str:
+        pass
+
 
 class SqlAlchemyMetadataRepository(MetadataRepository):
     def __init__(self, connection_url: str):
@@ -366,6 +403,31 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             Column("config_blob", Text, nullable=False),
             Column("updated_at_ms", BigInteger, nullable=False),
         )
+
+        # Vault sync sharing (see pumice's 14_vault_sharing_설계.md) -- an owner invites another
+        # account, by email, to get full read/write sync access to one of their vaults. Deliberately
+        # a real indexed table rather than the JSON-file-per-vault pattern web.py's existing
+        # /publish/share/* uses for Publish's own (unrelated) site-viewer sharing: this table is
+        # read on every WS connect (resolve_vault_owner below), not just an occasional REST call.
+        # email is stored lowercased; matching against users.email is always done case-insensitively
+        # too, so an invite survives the invited account's email being entered with different casing.
+        # No unique DB constraint on (owner_username, vault_id, email) -- add_vault_share() enforces
+        # "no duplicate pending invite" in Python instead, same style create_user() already uses for
+        # its own existence check.
+        self._vault_shares = Table("vault_shares", self._meta,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("uid", String(36), nullable=False),
+            Column("owner_username", String(100), nullable=False),
+            Column("vault_id", String(255), nullable=False),
+            Column("email", String(255), nullable=False),
+            Column("accepted", Boolean, nullable=False, default=False),
+            Column("created_at_ms", BigInteger, nullable=False),
+            Column("accepted_at_ms", BigInteger, nullable=True),
+        )
+        Index("idx_vault_shares_owner_vault", self._vault_shares.c.owner_username,
+              self._vault_shares.c.vault_id)
+        Index("idx_vault_shares_email", self._vault_shares.c.email)
+        Index("idx_vault_shares_uid", self._vault_shares.c.uid, unique=True)
 
     def init_db(self) -> None:
         # Runs before the owner-scoping migration below: file_metadata/published_files may still
@@ -1010,6 +1072,142 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             conn.execute(
                 update(self._users).where(self._users.c.username == username).values(name=name, email=email)
             )
+
+    def add_vault_share(self, owner_username: str, vault_id: str, email: str) -> str:
+        email = email.strip().lower()
+        with self.engine.begin() as conn:
+            existing = conn.execute(
+                select(self._vault_shares).where(
+                    self._vault_shares.c.owner_username == owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                    self._vault_shares.c.email == email,
+                )
+            ).fetchone()
+            if existing:
+                return existing.uid
+
+            share_uid = str(uuid.uuid4())
+            conn.execute(insert(self._vault_shares).values(
+                uid=share_uid,
+                owner_username=owner_username,
+                vault_id=vault_id,
+                email=email,
+                accepted=False,
+                created_at_ms=int(time.time() * 1000),
+            ))
+            return share_uid
+
+    def list_vault_shares(self, owner_username: str, vault_id: str) -> list:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(self._vault_shares).where(
+                    self._vault_shares.c.owner_username == owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                ).order_by(self._vault_shares.c.created_at_ms)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def remove_vault_share(self, owner_username: str, vault_id: str, share_uid: str) -> bool:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                delete(self._vault_shares).where(
+                    self._vault_shares.c.owner_username == owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                    self._vault_shares.c.uid == share_uid,
+                )
+            )
+            return result.rowcount > 0
+
+    def remove_vault_share_by_invited_user(self, caller_username: str, owner_username: str, vault_id: str) -> bool:
+        with self.engine.begin() as conn:
+            caller = conn.execute(
+                select(self._users.c.email).where(self._users.c.username == caller_username)
+            ).fetchone()
+            if not caller or not caller.email:
+                return False
+
+            result = conn.execute(
+                delete(self._vault_shares).where(
+                    self._vault_shares.c.owner_username == owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                    self._vault_shares.c.email == caller.email.strip().lower(),
+                )
+            )
+            return result.rowcount > 0
+
+    def list_shared_vaults_for_user(self, username: str) -> list:
+        with self.engine.connect() as conn:
+            user_row = conn.execute(
+                select(self._users.c.email).where(self._users.c.username == username)
+            ).fetchone()
+            if not user_row or not user_row.email:
+                return []
+
+            rows = conn.execute(
+                select(self._vault_shares).where(
+                    self._vault_shares.c.email == user_row.email.strip().lower(),
+                ).order_by(self._vault_shares.c.created_at_ms)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def get_accepted_share_usernames(self, owner_username: str, vault_id: str) -> list:
+        with self.engine.connect() as conn:
+            share_emails = conn.execute(
+                select(self._vault_shares.c.email).where(
+                    self._vault_shares.c.owner_username == owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                    self._vault_shares.c.accepted.is_(True),
+                )
+            ).fetchall()
+            usernames = []
+            for row in share_emails:
+                user_row = conn.execute(
+                    select(self._users.c.username).where(func.lower(self._users.c.email) == row.email)
+                ).fetchone()
+                if user_row:
+                    usernames.append(user_row.username)
+            return usernames
+
+    def resolve_vault_owner(self, caller_username: str, requested_owner_username: str, vault_id: str,
+                             mark_accepted: bool = False) -> str:
+        # Self-owned short circuit: today's exact behavior, zero extra queries. Every existing
+        # (non-shared) call site keeps working byte-for-byte identically through this branch.
+        if not requested_owner_username or requested_owner_username == caller_username:
+            return caller_username
+
+        with self.engine.begin() as conn:
+            caller = conn.execute(
+                select(self._users.c.email).where(self._users.c.username == caller_username)
+            ).fetchone()
+            if not caller or not caller.email:
+                raise VaultAccessDenied(f"{caller_username} has no email on file")
+
+            caller_email = caller.email.strip().lower()
+            share = conn.execute(
+                select(self._vault_shares).where(
+                    self._vault_shares.c.owner_username == requested_owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                    self._vault_shares.c.email == caller_email,
+                )
+            ).fetchone()
+            if not share:
+                raise VaultAccessDenied(
+                    f"{caller_username} has no share for {requested_owner_username}/{vault_id}"
+                )
+
+            # Binary access, no role gate: a still-pending share already grants full access
+            # (matches real Obsidian Sync -- accepted is just an owner-facing status label, not
+            # a permission check). mark_accepted=True flips it exactly once, from the one call
+            # site (SyncWsSession._handle_init) where a live sync connection is the strongest
+            # signal of genuine access-taking.
+            if mark_accepted and not share.accepted:
+                conn.execute(
+                    update(self._vault_shares).where(self._vault_shares.c.id == share.id).values(
+                        accepted=True, accepted_at_ms=int(time.time() * 1000),
+                    )
+                )
+
+        return requested_owner_username
 
 
 class _SqlAlchemyBatch:
