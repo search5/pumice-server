@@ -14,24 +14,40 @@ import json
 
 import pytest
 
+from pumice_server.repository import VaultAccessDenied
 from pumice_server.ws_sync_resource import SyncWsSession
 
 
 class FakeRepository:
+    """`devices` and `shares` are plain public dicts a test can poke directly (e.g. add a
+    second account's token, or grant/deny a vault share) instead of needing constructor
+    params for every scenario. `shares` keys are (owner_username, vault_id, caller_username)
+    -> accepted bool, mirroring resolve_vault_owner()'s real contract (see
+    tests/test_vault_share_resolver.py for the real-repository version of this logic)."""
+
     def __init__(self, token="tok", username="alice"):
-        self._token = token
-        self._username = username
+        self.devices = {token: username}
+        self.shares = {}
 
     def get_device_token(self, token):
-        if token == self._token:
-            return {"username": self._username}
-        return None
+        username = self.devices.get(token)
+        return {"username": username} if username else None
 
     def get_changes_since(self, owner_username, vault_id, since_change_id):
         return []
 
     def get_latest_change_id(self, owner_username, vault_id):
         return 0
+
+    def resolve_vault_owner(self, caller_username, requested_owner_username, vault_id, mark_accepted=False):
+        if not requested_owner_username or requested_owner_username == caller_username:
+            return caller_username
+        key = (requested_owner_username, vault_id, caller_username)
+        if key not in self.shares:
+            raise VaultAccessDenied(f"no access for {caller_username} to {requested_owner_username}/{vault_id}")
+        if mark_accepted:
+            self.shares[key] = True
+        return requested_owner_username
 
 
 class RecordingSender:
@@ -165,3 +181,67 @@ def test_malformed_json_does_not_raise_and_sends_error():
 
     assert sender.last["op"] == "error"
     assert sender.last["payload"]["code"] == "INVALID_JSON"
+
+
+# ─── vault sharing: init with vaultOwner (see 14_vault_sharing_설계.md, pumice repo) ────────────
+
+def test_init_without_vault_owner_is_unaffected_self_owned_as_before():
+    session, sender = make_session()
+
+    send_envelope(session, "init", {"token": "tok", "vaultId": "vault1"})
+
+    assert session.authenticated is True
+    assert session.owner_username == "alice"
+    assert sender.find("error") == []
+
+
+def test_init_with_vault_owner_equal_to_caller_is_the_same_as_omitting_it():
+    session, sender = make_session()
+
+    send_envelope(session, "init", {"token": "tok", "vaultId": "vault1", "vaultOwner": "alice"})
+
+    assert session.authenticated is True
+    assert session.owner_username == "alice"
+
+
+def test_init_with_a_granted_share_connects_as_the_requested_owner():
+    repo = FakeRepository(token="tok", username="alice")
+    repo.devices["bob-tok"] = "bob"
+    repo.shares[("alice", "vault1", "bob")] = False  # pending, not yet accepted
+    session, sender = make_session(repository=repo)
+
+    send_envelope(session, "init", {"token": "bob-tok", "vaultId": "vault1", "vaultOwner": "alice"})
+
+    assert session.authenticated is True
+    assert session.owner_username == "alice"
+    assert sender.find("error") == []
+    # A pending share is enough for access (binary, no role gate) -- but the live connection
+    # itself is what flips it to accepted (mark_accepted=True from _handle_init).
+    assert repo.shares[("alice", "vault1", "bob")] is True
+
+
+def test_init_with_no_share_at_all_is_rejected_with_permission_denied():
+    repo = FakeRepository(token="tok", username="alice")
+    repo.devices["bob-tok"] = "bob"
+    session, sender = make_session(repository=repo)
+
+    send_envelope(session, "init", {"token": "bob-tok", "vaultId": "vault1", "vaultOwner": "alice"})
+
+    assert session.authenticated is False
+    assert session.owner_username is None
+    assert sender.last == {
+        "op": "error",
+        "payload": {"code": "PERMISSION_DENIED", "message": "No access to this vault"},
+    }
+
+
+def test_init_with_a_share_for_a_different_vault_id_is_still_rejected():
+    repo = FakeRepository(token="tok", username="alice")
+    repo.devices["bob-tok"] = "bob"
+    repo.shares[("alice", "vaultA", "bob")] = True
+    session, sender = make_session(repository=repo)
+
+    send_envelope(session, "init", {"token": "bob-tok", "vaultId": "vaultB", "vaultOwner": "alice"})
+
+    assert session.authenticated is False
+    assert sender.last["payload"]["code"] == "PERMISSION_DENIED"

@@ -69,6 +69,7 @@ def test_ws_servicer_context_synthesizes_invocation_metadata_from_session():
         token = "tok"
         device_name = "my device"
         user_name = "a user"
+        owner_username = "alice"
 
     context = WsServicerContext(FakeSession())
 
@@ -77,6 +78,19 @@ def test_ws_servicer_context_synthesizes_invocation_metadata_from_session():
     # url-encoded, matching what service.py's unquote() call sites expect
     assert metadata["x-device-name"] == "my%20device"
     assert metadata["x-user-name"] == "a%20user"
+    assert metadata["x-vault-owner"] == "alice"
+
+
+def test_ws_servicer_context_synthesizes_empty_vault_owner_when_session_has_none():
+    class FakeSession:
+        token = "tok"
+        device_name = ""
+        user_name = ""
+        owner_username = None
+
+    context = WsServicerContext(FakeSession())
+
+    assert dict(context.invocation_metadata())["x-vault-owner"] == ""
 
 
 def test_ws_servicer_context_abort_raises_ws_aborted_with_code_and_details():
@@ -215,6 +229,67 @@ def test_usernames_req_returns_only_the_caller(tmp_path, repo):
 
     assert sender.last["op"] == "usernames_res"
     assert sender.last["payload"] == {"usernames": ["alice"]}
+
+
+# ─── vault sharing: a collaborator's WS session end to end (14_vault_sharing_설계.md) ──────────
+
+
+def make_collaborator_session(tmp_path, repo, servicer=None):
+    """A real (not faked) owner+collaborator pair: alice owns vault1, bob has an accepted
+    share for it, and this returns bob's own authenticated session -- every op it issues below
+    goes through the real resolve_vault_owner()/x-vault-owner plumbing end to end."""
+    repo.create_device_token("alice-tok", "alice", "alice-device", 0)
+    repo.create_device_token("bob-tok", "bob", "bob-device", 0)
+    repo.create_user("bob", "hash", email="bob@example.com")
+    repo.add_vault_share("alice", "vault1", "bob@example.com")
+    servicer = servicer or SyncServiceServicer(data_dir=str(tmp_path), repository=repo)
+    sender = RecordingSender()
+    session = SyncWsSession(repo, servicer, sender)
+    session.handle_text_message(
+        '{"op":"init","payload":{"token":"bob-tok","vaultId":"vault1","vaultOwner":"alice","deviceName":"BobPC","userName":"Bob"}}'
+    )
+    assert session.authenticated
+    assert session.owner_username == "alice"
+    return session, sender, servicer
+
+
+def test_collaborator_delta_req_sees_the_owners_vault_data(tmp_path, repo):
+    vault_path = tmp_path / "vaults" / "alice" / "vault1"
+    vault_path.mkdir(parents=True)
+    (vault_path / "note.md").write_text("hello")
+
+    session, sender, servicer = make_collaborator_session(tmp_path, repo)
+    servicer._scan_and_merge(str(vault_path), "alice", "vault1")
+
+    run(session.handle_text_message('{"op":"delta_req","payload":{"vaultId":"vault1","localFiles":[]}}'))
+
+    [meta] = sender.last["payload"]["needDownload"]
+    assert meta["path"] == "note.md"
+
+
+def test_collaborator_usernames_req_lists_owner_and_self(tmp_path, repo):
+    session, sender, _ = make_collaborator_session(tmp_path, repo)
+
+    run(session.handle_text_message('{"op":"usernames_req","payload":{"vaultId":"vault1"}}'))
+
+    assert sender.last["payload"] == {"usernames": ["alice", "bob"]}
+
+
+def test_a_share_for_one_vault_does_not_grant_access_to_a_different_vault(tmp_path, repo):
+    repo.create_device_token("alice-tok", "alice", "alice-device", 0)
+    repo.create_device_token("bob-tok", "bob", "bob-device", 0)
+    repo.create_user("bob", "hash", email="bob@example.com")
+    repo.add_vault_share("alice", "vaultA", "bob@example.com")
+    servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo)
+    sender = RecordingSender()
+    session = SyncWsSession(repo, servicer, sender)
+
+    session.handle_text_message(
+        '{"op":"init","payload":{"token":"bob-tok","vaultId":"vaultB","vaultOwner":"alice"}}'
+    )
+
+    assert session.authenticated is False
+    assert sender.last["payload"]["code"] == "PERMISSION_DENIED"
 
 
 # ─── push (ChangeNotifier wiring via on_authenticated) ─────────────────────────────────────

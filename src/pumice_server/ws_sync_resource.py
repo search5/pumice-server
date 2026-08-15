@@ -36,6 +36,7 @@ from autobahn.twisted.resource import WebSocketResource
 from twisted.internet import reactor as _default_reactor
 
 from . import wire_types
+from .repository import VaultAccessDenied
 from .status_codes import StatusCode
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,10 @@ class WsServicerContext:
             ("authorization", f"Bearer {self._session.token}"),
             ("x-device-name", quote(self._session.device_name)),
             ("x-user-name", quote(self._session.user_name)),
+            # Set only from session.owner_username, which _handle_init only ever assigns the
+            # already-verified return value of resolve_vault_owner() to -- never raw client
+            # input. See vault sharing's design (pumice's 14_vault_sharing_설계.md).
+            ("x-vault-owner", quote(self._session.owner_username or "")),
         ]
 
     def abort(self, code: StatusCode, details: str):
@@ -433,8 +438,23 @@ class SyncWsSession:
             self._send_error("UNAUTHENTICATED", "Invalid or missing auth token")
             return
 
+        # Vault sharing (see 14_vault_sharing_설계.md): vaultOwner lets the caller ask to sync
+        # someone else's vault instead of their own. Empty/absent (the overwhelmingly common
+        # case) resolves to device["username"] with zero extra DB work -- see
+        # resolve_vault_owner()'s self-owned short circuit. mark_accepted=True here because a
+        # live sync connection actually pulling/pushing real content is the strongest possible
+        # signal of genuine access-taking (real Obsidian Sync has no separate "accept" API
+        # either -- see the design doc's asar analysis).
+        requested_owner = payload.get("vaultOwner") or device["username"]
+        try:
+            self.owner_username = self.repository.resolve_vault_owner(
+                device["username"], requested_owner, vault_id, mark_accepted=True,
+            )
+        except VaultAccessDenied:
+            self._send_error(StatusCode.PERMISSION_DENIED.name, "No access to this vault")
+            return
+
         self.authenticated = True
-        self.owner_username = device["username"]
         self.vault_id = vault_id
         self.device_name = payload.get("deviceName", "")
         self.user_name = payload.get("userName", "")

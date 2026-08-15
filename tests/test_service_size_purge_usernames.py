@@ -110,9 +110,7 @@ def test_purge_vault_of_a_never_synced_vault_still_succeeds(tmp_path, repo):
 # ─── GetUsernames ───────────────────────────────────────────────────────────────────────────
 
 
-def test_get_usernames_returns_only_the_authenticated_caller(tmp_path, repo):
-    """Placeholder pending a real multi-user vault-sharing/ACL system -- see
-    wire_types.UsernamesResponse's docstring."""
+def test_get_usernames_returns_only_the_owner_when_no_shares_exist(tmp_path, repo):
     repo.create_device_token("tok", "alice", "test-device", 0)
     servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo)
 
@@ -120,3 +118,20 @@ def test_get_usernames_returns_only_the_authenticated_caller(tmp_path, repo):
 
     assert isinstance(response, wire_types.UsernamesResponse)
     assert response.usernames == ["alice"]
+
+
+def test_get_usernames_includes_accepted_collaborators(tmp_path, repo):
+    """See pumice's 14_vault_sharing_설계.md -- GetUsernames now lists the owner plus every
+    account with an accepted vault-sharing invite."""
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    repo.create_user("bob", "hash", email="bob@example.com")
+    repo.create_user("carol", "hash", email="carol@example.com")
+    repo.add_vault_share("alice", "vault1", "bob@example.com")
+    repo.add_vault_share("alice", "vault1", "carol@example.com")
+    # Only accept bob's share -- carol's stays pending and must not be listed.
+    repo.resolve_vault_owner("bob", "alice", "vault1", mark_accepted=True)
+    servicer = SyncServiceServicer(data_dir=str(tmp_path), repository=repo)
+
+    response = asyncio.run(servicer.GetUsernames(wire_types.UsernamesRequest(vault_id="vault1"), FakeContext()))
+
+    assert response.usernames == ["alice", "bob"]

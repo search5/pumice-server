@@ -120,6 +120,40 @@ def test_verify_vault_access_returns_owner_username_for_valid_bearer_token(tmp_p
     assert servicer._verify_vault_access("vault1", context) == "alice"
 
 
+def test_verify_vault_access_prefers_the_x_vault_owner_hint_over_the_tokens_own_username(tmp_path, repo):
+    """See 14_vault_sharing_설계.md: the WS path (ws_sync_resource.py's WsServicerContext)
+    synthesizes this header from a session's already-resolve_vault_owner()-verified identity --
+    it's never raw client input, so trusting it here is safe."""
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    servicer = make_servicer(tmp_path, repo)
+    context = FakeContext(metadata=[
+        ("authorization", "Bearer tok"), ("x-vault-owner", "bob"),
+    ])
+
+    assert servicer._verify_vault_access("vault1", context) == "bob"
+
+
+def test_verify_vault_access_falls_back_to_own_username_when_x_vault_owner_absent(tmp_path, repo):
+    """REST callers (never sent through the WS init/resolve_vault_owner path) don't set this
+    header at all -- must keep resolving to the token's own username exactly like before vault
+    sharing existed."""
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    servicer = make_servicer(tmp_path, repo)
+    context = FakeContext(metadata=[("authorization", "Bearer tok")])
+
+    assert servicer._verify_vault_access("vault1", context) == "alice"
+
+
+def test_verify_vault_access_falls_back_to_own_username_when_x_vault_owner_empty(tmp_path, repo):
+    repo.create_device_token("tok", "alice", "test-device", 0)
+    servicer = make_servicer(tmp_path, repo)
+    context = FakeContext(metadata=[
+        ("authorization", "Bearer tok"), ("x-vault-owner", ""),
+    ])
+
+    assert servicer._verify_vault_access("vault1", context) == "alice"
+
+
 def test_get_vault_path_rejects_path_traversal_vault_id(tmp_path, repo):
     servicer = make_servicer(tmp_path, repo)
 

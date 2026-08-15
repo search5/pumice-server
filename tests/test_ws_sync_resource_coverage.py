@@ -56,6 +56,10 @@ class FakeRepository:
     def find_live_file_by_content_hash(self, owner_username, vault_id, content_hash):
         return None  # always a dedup miss -- push_req tests below drive the "needs data" path
 
+    def resolve_vault_owner(self, caller_username, requested_owner_username, vault_id, mark_accepted=False):
+        # None of these tests send vaultOwner -- self-owned short circuit only.
+        return caller_username
+
 
 class RecordingSender:
     def __init__(self):

@@ -179,6 +179,6 @@ class UsernamesRequest:
 
 @dataclass
 class UsernamesResponse:
-    # Placeholder: always exactly [the authenticated caller's own username] until pumice has an
-    # actual multi-user vault-sharing/ACL system -- see service.py's GetUsernames docstring.
+    # The vault owner's username followed by every account with an accepted vault-sharing
+    # invite for it -- see service.py's GetUsernames docstring and 14_vault_sharing_설계.md.
     usernames: List[str] = field(default_factory=list)

@@ -61,14 +61,17 @@ class SyncServiceServicer:
         os.makedirs(self.vaults_dir, exist_ok=True)
 
     def _verify_vault_access(self, vault_id: str, context) -> str:
-        """Resolves and returns the caller's own username from their device token, aborting the
-        RPC if the token is missing/invalid. A vault's identity is (owner_username, vault_id), and
-        owner_username always comes from this resolved caller identity, never from client input --
-        so there's nothing left to check beyond authentication itself: a caller can only ever
-        address vaults under their own name. (An earlier version of this checked vault_id against
-        a global vault_id -> owner registry and let the first caller "claim" an unclaimed vault_id
-        -- removed, because vault_id alone isn't globally unique: "Obsidian Vault" is Obsidian's
-        own default vault name, so two different accounts' same-named vaults collided.)"""
+        """Resolves and returns the vault owner this call is authorized against, aborting the
+        RPC if the token is missing/invalid. Still authenticates via the token exactly as
+        before; the returned owner is the caller's own username UNLESS an 'x-vault-owner'
+        metadata entry is present, in which case that value wins.
+
+        That metadata entry is never client input -- for the WS path it's synthesized by
+        WsServicerContext.invocation_metadata() straight from SyncWsSession.owner_username,
+        which _handle_init only ever assigns the verified return value of
+        repository.resolve_vault_owner() to (see 14_vault_sharing_설계.md, pumice repo). REST
+        callers of this servicer never set the header, so they keep resolving to their own
+        username exactly like before vault sharing existed."""
         metadata = dict(context.invocation_metadata())
         auth_header = metadata.get('authorization', '')
         if not auth_header:
@@ -85,7 +88,8 @@ class SyncServiceServicer:
             context.abort(StatusCode.UNAUTHENTICATED, "Invalid or missing auth token")
             return ""
 
-        return device["username"]
+        owner_hint = unquote(metadata.get('x-vault-owner', ''))
+        return owner_hint if owner_hint else device["username"]
 
     def _get_vault_path(self, owner_username: str, vault_id: str) -> str:
         owner_dir = os.path.join(self.vaults_dir, owner_username)
@@ -830,11 +834,12 @@ class SyncServiceServicer:
             return wire_types.PurgeResponse(ok=False, error=str(e))
 
     async def GetUsernames(self, request, context):
-        """Placeholder pending a real multi-user vault-sharing/ACL system -- pumice's current
-        authorization model is strictly one vault per one owning account
-        (_verify_vault_access above), so there is nothing else to list yet. Mirrors Obsidian
-        core's own Sync client's getUsernames() (used there to attribute history entries to
-        collaborators on a shared vault) -- see #11_websocket_동기화_프로토콜_설계.md's
-        re-analysis and wire_types.UsernamesResponse's docstring."""
+        """Mirrors Obsidian core's own Sync client's getUsernames() (used there to attribute
+        history entries to collaborators on a shared vault) -- see
+        #11_websocket_동기화_프로토콜_설계.md's re-analysis and
+        wire_types.UsernamesResponse's docstring. Lists the vault's owner plus every account
+        with an accepted vault-sharing invite for it (14_vault_sharing_설계.md)."""
         owner_username = self._verify_vault_access(request.vault_id, context)
-        return wire_types.UsernamesResponse(usernames=[owner_username])
+        collaborators = self.repository.get_accepted_share_usernames(owner_username, request.vault_id)
+        usernames = [owner_username] + [u for u in collaborators if u != owner_username]
+        return wire_types.UsernamesResponse(usernames=usernames)
