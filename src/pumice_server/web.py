@@ -1199,6 +1199,89 @@ def publish_share_accept_view(request):
         logger.error(f"HTTP publish_share_accept failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
+
+# ─── Vault sync sharing (see pumice's 14_vault_sharing_설계.md) ────────────────────────────────
+# Distinct from the /publish/share/* views above: those grant read access to a published static
+# site; these grant full read/write sync access to the vault itself, backed by the vault_shares
+# DB table (repository.py) rather than the JSON-file-per-vault pattern publish sharing uses --
+# sync access is checked on every WS connect (SyncWsSession._handle_init), not just an occasional
+# REST call, so an indexed table is the right fit here.
+
+@view_config(route_name='vault_share_invite', renderer='json', permission='vault-access')
+def vault_share_invite_view(request):
+    try:
+        body = request.json_body
+        email = (body.get("email") or "").strip()
+        if not email:
+            return Response(body=json.dumps({"error": "Missing email"}).encode("utf-8"), status=400, content_type="application/json")
+
+        share_uid = request.repository.add_vault_share(request.context.owner, request.context.vault_id, email)
+        return {"ok": True, "uid": share_uid}
+    except Exception as e:
+        logger.error(f"HTTP vault_share_invite failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+@view_config(route_name='vault_share_list', renderer='json', permission='vault-access')
+def vault_share_list_view(request):
+    try:
+        shares = request.repository.list_vault_shares(request.context.owner, request.context.vault_id)
+        public_shares = [
+            {"uid": s["uid"], "email": s["email"], "accepted": s["accepted"], "createdAtMs": s["created_at_ms"]}
+            for s in shares
+        ]
+        return {"shares": public_shares}
+    except Exception as e:
+        logger.error(f"HTTP vault_share_list failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+@view_config(route_name='vault_share_remove', renderer='json', permission='vault-access')
+def vault_share_remove_view(request):
+    try:
+        body = request.json_body
+        share_uid = body.get("share_uid")
+        if not share_uid:
+            return Response(body=json.dumps({"error": "Missing share_uid"}).encode("utf-8"), status=400, content_type="application/json")
+
+        ok = request.repository.remove_vault_share(request.context.owner, request.context.vault_id, share_uid)
+        return {"ok": ok}
+    except Exception as e:
+        logger.error(f"HTTP vault_share_remove failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+@view_config(route_name='vault_share_leave', renderer='json', permission='authenticated')
+def vault_share_leave_view(request):
+    # Not VaultContext-scoped: the caller here is the invited collaborator, not the vault's
+    # owner, so VaultContext.owner (always the caller's own identity) would resolve to the
+    # wrong account -- ownerUsername/vaultId are read directly from the body instead.
+    try:
+        body = request.json_body
+        owner_username = body.get("ownerUsername")
+        vault_id = body.get("vaultId")
+        if not owner_username or not vault_id:
+            return Response(body=json.dumps({"error": "Missing ownerUsername or vaultId"}).encode("utf-8"), status=400, content_type="application/json")
+
+        caller = request.identity["username"]
+        ok = request.repository.remove_vault_share_by_invited_user(caller, owner_username, vault_id)
+        return {"ok": ok}
+    except Exception as e:
+        logger.error(f"HTTP vault_share_leave failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+@view_config(route_name='vault_shared_with_me', renderer='json', permission='authenticated')
+def vault_shared_with_me_view(request):
+    try:
+        caller = request.identity["username"]
+        shared = request.repository.list_shared_vaults_for_user(caller)
+        vaults = [
+            {"ownerUsername": s["owner_username"], "vaultId": s["vault_id"], "accepted": s["accepted"], "createdAtMs": s["created_at_ms"]}
+            for s in shared
+        ]
+        return {"vaults": vaults}
+    except Exception as e:
+        logger.error(f"HTTP vault_shared_with_me failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+
 @view_config(route_name='user_logout', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def user_logout_view(request):
     token = extract_token(request)
@@ -1669,6 +1752,16 @@ def create_pyramid_app(repository, data_dir):
     config.add_route('user_devices', '/api/user/devices')
     config.add_route('user_device_create', '/api/user/devices/create')
     config.add_route('user_device_delete', '/api/user/devices/delete')
+    # Vault sync sharing (see pumice's 14_vault_sharing_설계.md) -- distinct from the
+    # /publish/share/* routes above, which grant read access to a published static site, not
+    # to a vault's own sync data. invite/list/remove are owner-only (VaultContext); leave/
+    # shared-with-me act on the caller's own account instead, so they use the default
+    # RootFactory (permission='authenticated' is all they need -- see RootFactory.__acl__).
+    config.add_route('vault_share_invite', '/api/vault/share/invite', factory=VaultContext)
+    config.add_route('vault_share_list', '/api/vault/share/list', factory=VaultContext)
+    config.add_route('vault_share_remove', '/api/vault/share/remove', factory=VaultContext)
+    config.add_route('vault_share_leave', '/api/vault/share/leave')
+    config.add_route('vault_shared_with_me', '/api/vault/shared-with-me')
     config.add_route('admin_users', '/api/admin/users')
     config.add_route('admin_user_create', '/api/admin/users/create')
     config.add_route('admin_user_delete', '/api/admin/users/delete')
