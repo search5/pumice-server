@@ -42,7 +42,7 @@ class FakeRegistry:
 class FakeRequest:
     def __init__(self, repository, data_dir, owner=None, vault_id=None,
                  headers=None, body=b"", matchdict=None, scheme="https", host="example.com",
-                 json_body=None, query_string="", domain=None):
+                 json_body=None, query_string="", domain=None, params=None):
         self.repository = repository
         self.context = FakeContext(owner, vault_id) if owner is not None else None
         self.headers = headers or {}
@@ -54,6 +54,7 @@ class FakeRequest:
         self.host = host
         self.query_string = query_string
         self.domain = domain if domain is not None else host.split(":")[0]
+        self.params = params or {}
         self._json_body = json_body if json_body is not None else {}
 
     @property
@@ -666,6 +667,72 @@ def test_custom_domain_view_404s_for_a_domain_that_was_just_released(repo, tmp_p
     request = FakeRequest(repo, tmp_path, matchdict={"path": ""}, domain="nowhere.example.com")
 
     response = web.custom_domain_view(request)
+
+    assert response.status_code == 404
+
+
+# ─── reverse-proxy custom domain (별도 대형 기능, 35_실제_아키텍처_전환_리버스_프록시_커스텀_도메인.md) ──
+
+def test_parse_custom_domain_url_param_splits_hostname_and_path():
+    assert web._parse_custom_domain_url_param("mysite.com/note.md") == ("mysite.com", "note.md")
+
+
+def test_parse_custom_domain_url_param_with_no_path():
+    assert web._parse_custom_domain_url_param("mysite.com") == ("mysite.com", "")
+
+
+def test_parse_custom_domain_url_param_lowercases_and_strips_whitespace():
+    assert web._parse_custom_domain_url_param("  MySite.COM/Note.md  ") == ("mysite.com", "Note.md")
+
+
+def test_resolve_custom_domain_hostname_prefers_the_x_header_over_request_host(repo, tmp_path):
+    request = FakeRequest(repo, tmp_path, domain="proxy-internal.example.com",
+                           headers={"x-obsidian-custom-domain": "mysite.com/sub"})
+
+    assert web._resolve_custom_domain_hostname(request) == "mysite.com"
+
+
+def test_resolve_custom_domain_hostname_falls_back_to_request_domain_without_the_header(repo, tmp_path):
+    request = FakeRequest(repo, tmp_path, domain="notes.example.com")
+
+    assert web._resolve_custom_domain_hostname(request) == "notes.example.com"
+
+
+def test_custom_domain_view_resolves_via_the_x_header_when_the_host_was_rewritten_by_a_proxy(repo, tmp_path):
+    repo.set_custom_domain("alice", "vault1", "notes.example.com", redirect=False)
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    request = FakeRequest(repo, tmp_path, matchdict={"path": "note.md"}, domain="proxy-internal.example.com",
+                           headers={"x-obsidian-custom-domain": "notes.example.com"})
+    result = web.custom_domain_view(request)
+
+    assert "Hello" in result["content"]
+
+
+def test_publish_serve_proxy_view_resolves_the_owner_and_note_path_from_the_url_param(repo, tmp_path):
+    repo.set_custom_domain("alice", "vault1", "notes.example.com", redirect=False)
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    request = FakeRequest(repo, tmp_path, params={"url": "notes.example.com/note.md"})
+    result = web.publish_serve_proxy_view(request)
+
+    assert "Hello" in result["content"]
+
+
+def test_publish_serve_proxy_view_root_path_serves_the_file_listing(repo, tmp_path):
+    repo.set_custom_domain("alice", "vault1", "notes.example.com", redirect=False)
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Hello")
+
+    request = FakeRequest(repo, tmp_path, params={"url": "notes.example.com"})
+    result = web.publish_serve_proxy_view(request)
+
+    assert result["files"] == ["note.md"]
+
+
+def test_publish_serve_proxy_view_404s_for_an_unregistered_domain(repo, tmp_path):
+    request = FakeRequest(repo, tmp_path, params={"url": "nowhere.example.com/note.md"})
+
+    response = web.publish_serve_proxy_view(request)
 
     assert response.status_code == 404
 

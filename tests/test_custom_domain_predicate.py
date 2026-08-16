@@ -2,7 +2,11 @@
 whether an incoming request's Host header belongs to a registered custom domain (see
 26_커스텀_도메인_지원.md, pumice repo). Deliberately a plain (info, request) function (not a
 predicate-factory class) so it can be unit tested here without going through real Pyramid route
-matching -- a minimal fake request exposing just .domain/.repository is enough."""
+matching -- a minimal fake request exposing just .domain/.repository/.headers is enough.
+
+The x-obsidian-custom-domain reverse-proxy header case (see
+35_실제_아키텍처_전환_리버스_프록시_커스텀_도메인.md) is covered separately, alongside
+custom_domain_view/publish_serve_proxy_view, in test_publish_views.py."""
 
 import pytest
 
@@ -21,6 +25,7 @@ class FakePredicateRequest:
     def __init__(self, domain, repository):
         self.domain = domain
         self.repository = repository
+        self.headers = {}
 
 
 def test_predicate_true_when_hostname_is_registered(repo):

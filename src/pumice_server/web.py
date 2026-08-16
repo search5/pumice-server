@@ -1312,6 +1312,31 @@ def publish_view(request):
     path = request.matchdict.get("path", "")
     return _render_publish_page(request, username, vault_id, path, via_custom_domain_route=False)
 
+def _parse_custom_domain_url_param(value: str) -> tuple:
+    """Splits a `?url=`/`x-obsidian-custom-domain` value (real Obsidian's own reverse-proxy
+    mechanism for hosts that can't forward the original Host header -- confirmed via the
+    official docs, obsidianmd/obsidian-help's "Custom domains.md", "Set up using a proxy"
+    section) into (hostname, path). Only the hostname portion is used for the vault lookup here
+    -- see get_vault_by_custom_domain's own docstring in repository.py for why pumice-server
+    only ever stores/matches a bare hostname, never a custom-domain-as-subpath-of-an-existing-
+    site (`mysite.com/my-notes`, also documented but out of scope -- see
+    35_실제_아키텍처_전환_리버스_프록시_커스텀_도메인.md)."""
+    value = (value or "").strip()
+    hostname, _, path = value.partition("/")
+    return hostname.strip().lower(), path
+
+def _resolve_custom_domain_hostname(request) -> str:
+    """The hostname to look up for this request's custom domain -- the `x-obsidian-custom-
+    domain` header (real Obsidian's proxy fallback for services that can't pass a query string,
+    see _parse_custom_domain_url_param) takes priority when present, since a request carrying it
+    is explicitly telling us the true Host was rewritten and can't be trusted; otherwise falls
+    back to the actual request Host (request.domain), the normal non-proxied case."""
+    header_value = request.headers.get("x-obsidian-custom-domain")
+    if header_value:
+        hostname, _ = _parse_custom_domain_url_param(header_value)
+        return hostname
+    return request.domain
+
 def custom_domain_route_predicate(info, request):
     """Route predicate for custom_domain_view -- registered as the very first route (see
     create_pyramid_app below) so it gets first refusal on every request. Returning False falls
@@ -1320,14 +1345,29 @@ def custom_domain_route_predicate(info, request):
     (info, request) function rather than a predicate-factory class so it's directly unit
     testable with a minimal fake request (see tests/test_custom_domain_predicate.py) -- see
     26_커스텀_도메인_지원.md."""
-    return request.repository.get_vault_by_custom_domain(request.domain) is not None
+    return request.repository.get_vault_by_custom_domain(_resolve_custom_domain_hostname(request)) is not None
 
 @view_config(route_name='custom_domain_view', permission=NO_PERMISSION_REQUIRED, renderer='templates/publish_page.jinja2')
 def custom_domain_view(request):
-    mapping = request.repository.get_vault_by_custom_domain(request.domain)
+    mapping = request.repository.get_vault_by_custom_domain(_resolve_custom_domain_hostname(request))
     if not mapping:
         return HTTPNotFound()  # predicate already guarantees this; re-checked for a race (the domain got released between predicate and view)
     path = request.matchdict.get("path", "")
+    return _render_publish_page(request, mapping["owner_username"], mapping["vault_id"], path, via_custom_domain_route=True)
+
+@view_config(route_name='publish_serve_proxy', permission=NO_PERMISSION_REQUIRED, renderer='templates/publish_page.jinja2')
+def publish_serve_proxy_view(request):
+    """`GET /serve?url=<hostname>[/<path>]` -- the other half of real Obsidian's documented
+    reverse-proxy setup (35_실제_아키텍처_전환_리버스_프록시_커스텀_도메인.md), for proxies that
+    rewrite both the Host header AND the request path (nginx/Apache/Netlify/Vercel examples in
+    the official docs all `proxy_pass`/rewrite to this exact `/serve?url=...` shape) -- unlike
+    custom_domain_view, the note path comes from the `url` param's own contents, not from
+    Pyramid's own path matching, since the visited path never reaches this route as a real path
+    segment."""
+    hostname, path = _parse_custom_domain_url_param(request.params.get("url", ""))
+    mapping = request.repository.get_vault_by_custom_domain(hostname)
+    if not mapping:
+        return HTTPNotFound()
     return _render_publish_page(request, mapping["owner_username"], mapping["vault_id"], path, via_custom_domain_route=True)
 
 
@@ -2241,6 +2281,13 @@ def create_pyramid_app(repository, data_dir):
     # but still fully functional (just a DeprecationWarning) -- simplicity here wins over
     # chasing the newer API's extra indirection for a single predicate.
     config.add_route('custom_domain_view', '/{path:.*}', custom_predicates=[custom_domain_route_predicate])
+
+    # Real Obsidian's other documented reverse-proxy custom-domain mechanism (see
+    # 35_실제_아키텍처_전환_리버스_프록시_커스텀_도메인.md) -- a fixed, non-wildcard path, so no
+    # ordering concern with custom_domain_view above (that predicate already excludes any
+    # request whose Host doesn't match a registered custom domain, and this server's own base
+    # domain is never expected to double as someone's custom domain).
+    config.add_route('publish_serve_proxy', '/serve')
 
     # Add routes. Endpoints scoped to a single vault get VaultContext as their route factory,
     # which resolves vault_id (from matchdict/params/obs-id header/JSON body, whichever that
