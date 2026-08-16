@@ -493,6 +493,9 @@ msgstr "Search..."
 msgid "publish_public.graph_view"
 msgstr "Graph view"
 
+msgid "publish_public.theme_toggle"
+msgstr "Toggle theme"
+
 msgid "devices.create_heading"
 msgstr "Create a new device"
 

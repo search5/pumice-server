@@ -850,3 +850,41 @@ def test_note_preload_json_carries_sliding_window_mode(repo, tmp_path):
     result = render(repo, tmp_path, "alice", "vault1", "note.md")
 
     assert json.loads(result["preload_json"])["sliding_window_mode"] is True
+
+
+# ─── theme switching (별도 대형 기능, 33_실제_아키텍처_전환_테마_전환.md) ────────────────────────
+
+def test_theme_defaults_to_dark_preserving_the_existing_look(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["theme_attr"] == "dark"
+    assert result["show_theme_toggle"] is False
+
+
+def test_theme_attr_reflects_a_saved_light_default(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "options.json", {"defaultTheme": "light"})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["theme_attr"] == "light"
+
+
+def test_theme_attr_is_none_for_system_so_the_page_defers_to_prefers_color_scheme(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "options.json", {"defaultTheme": "system"})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["theme_attr"] is None
+
+
+def test_show_theme_toggle_reflects_a_saved_true_value(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "options.json", {"showThemeToggle": True})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["show_theme_toggle"] is True

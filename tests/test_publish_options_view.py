@@ -45,6 +45,7 @@ DEFAULTS = {
     "readableLineLength": True, "strictLineBreaks": False, "googleAnalytics": "",
     "showSearch": True, "showNavigation": False, "slidingWindowMode": False,
     "navigationOrdering": [], "navigationHiddenItems": [],
+    "defaultTheme": "dark", "showThemeToggle": False,
 }
 
 
@@ -116,3 +117,16 @@ def test_saving_navigation_ordering_and_hidden_items_round_trips_as_lists(repo, 
     assert result["options"]["slidingWindowMode"] is True
     assert result["options"]["navigationOrdering"] == ["Notes", "Home.md"]
     assert result["options"]["navigationHiddenItems"] == ["Archive"]
+
+
+# ─── theme switching (별도 대형 기능, 33_실제_아키텍처_전환_테마_전환.md) ────────────────────────
+
+def test_saving_theme_options_round_trips(repo, tmp_path):
+    web.publish_options_view(FakeRequest(repo, tmp_path, "alice", "vault1", json_body={
+        "options": {"defaultTheme": "light", "showThemeToggle": True},
+    }))
+
+    result = web.publish_options_view(FakeRequest(repo, tmp_path, "alice", "vault1", json_body={}))
+
+    assert result["options"]["defaultTheme"] == "light"
+    assert result["options"]["showThemeToggle"] is True

@@ -1,6 +1,21 @@
 <!DOCTYPE html>
-<html lang="{{ lang }}">
+<html lang="{{ lang }}"{% if theme_attr %} data-theme="{{ theme_attr }}"{% endif %}>
 <head>
+    {% if show_theme_toggle %}
+    <script>
+    // Applies a visitor's own theme choice (see 33_실제_아키텍처_전환_테마_전환.md) before first
+    // paint, overriding whatever theme_attr the server rendered -- runs synchronously and this
+    // early in <head> specifically to avoid a flash of the wrong theme on load.
+    (function () {
+      try {
+        var saved = localStorage.getItem("pumiceTheme");
+        if (saved === "light" || saved === "dark") {
+          document.documentElement.setAttribute("data-theme", saved);
+        }
+      } catch (e) {}
+    })();
+    </script>
+    {% endif %}
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ title }} - {{ site_name }} Publish</title>
@@ -26,6 +41,14 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
+        /* Theme switching (별도 대형 기능, see 33_실제_아키텍처_전환_테마_전환.md). This page has
+           always shipped with a single hardcoded dark look, so that stays the baseline here (a
+           dark-first palette) -- a light palette is layered on top only when actually asked for
+           (OS prefers-color-scheme:light, an explicit data-theme="light" from defaultTheme, or a
+           visitor's own toggle choice via the inline <script> in <head>), never the reverse. An
+           explicit data-theme always wins over the OS preference; :root[data-theme="dark"] exists
+           mainly so a visitor's own toggle-to-dark still applies even when their OS prefers
+           light. */
         :root {
             --bg-color: #0d1117;
             --container-bg: rgba(22, 27, 34, 0.7);
@@ -37,6 +60,67 @@
             --wiki-link: #a371f7;
             --wiki-link-hover: #b893f9;
             --code-bg: #161b22;
+            --heading-color: #ffffff;
+            --link-hover-color: #79c0ff;
+            --code-text-color: #e6edf3;
+            --bg-gradient-start: #1c1d2e;
+            --bg-gradient-end: #0d1117;
+        }
+
+        @media (prefers-color-scheme: light) {
+            :root:not([data-theme="dark"]) {
+                --bg-color: #ffffff;
+                --container-bg: rgba(255, 255, 255, 0.85);
+                --border-color: rgba(31, 35, 40, 0.15);
+                --text-primary: #1f2328;
+                --text-muted: #59636e;
+                --accent-purple: #8250df;
+                --accent-blue: #0969da;
+                --wiki-link: #8250df;
+                --wiki-link-hover: #6639ba;
+                --code-bg: #f6f8fa;
+                --heading-color: #1f2328;
+                --link-hover-color: #0550ae;
+                --code-text-color: #24292f;
+                --bg-gradient-start: #eef1f5;
+                --bg-gradient-end: #ffffff;
+            }
+        }
+
+        :root[data-theme="light"] {
+            --bg-color: #ffffff;
+            --container-bg: rgba(255, 255, 255, 0.85);
+            --border-color: rgba(31, 35, 40, 0.15);
+            --text-primary: #1f2328;
+            --text-muted: #59636e;
+            --accent-purple: #8250df;
+            --accent-blue: #0969da;
+            --wiki-link: #8250df;
+            --wiki-link-hover: #6639ba;
+            --code-bg: #f6f8fa;
+            --heading-color: #1f2328;
+            --link-hover-color: #0550ae;
+            --code-text-color: #24292f;
+            --bg-gradient-start: #eef1f5;
+            --bg-gradient-end: #ffffff;
+        }
+
+        :root[data-theme="dark"] {
+            --bg-color: #0d1117;
+            --container-bg: rgba(22, 27, 34, 0.7);
+            --border-color: rgba(48, 54, 61, 0.8);
+            --text-primary: #c9d1d9;
+            --text-muted: #8b949e;
+            --accent-purple: #8ab4f8;
+            --accent-blue: #58a6ff;
+            --wiki-link: #a371f7;
+            --wiki-link-hover: #b893f9;
+            --code-bg: #161b22;
+            --heading-color: #ffffff;
+            --link-hover-color: #79c0ff;
+            --code-text-color: #e6edf3;
+            --bg-gradient-start: #1c1d2e;
+            --bg-gradient-end: #0d1117;
         }
 
         * {
@@ -46,7 +130,7 @@
         }
 
         body {
-            background: radial-gradient(circle at 50% 0%, #1c1d2e 0%, #0d1117 70%);
+            background: radial-gradient(circle at 50% 0%, var(--bg-gradient-start) 0%, var(--bg-gradient-end) 70%);
             color: var(--text-primary);
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             line-height: 1.7;
@@ -236,7 +320,7 @@
             font-size: 12px;
         }
 
-        .pumice-graph-toggle {
+        .pumice-icon-button {
             background: var(--code-bg);
             border: 1px solid var(--border-color);
             border-radius: 8px;
@@ -248,7 +332,7 @@
             margin-right: 12px;
         }
 
-        .pumice-graph-toggle:hover {
+        .pumice-icon-button:hover {
             background: rgba(138, 180, 248, 0.1);
         }
 
@@ -374,7 +458,7 @@
             font-weight: 700;
             margin-top: 0;
             margin-bottom: 24px;
-            color: #ffffff;
+            color: var(--heading-color);
             border-bottom: 1px solid rgba(48, 54, 61, 0.4);
             padding-bottom: 12px;
         }
@@ -384,7 +468,7 @@
             font-size: 1.6em;
             margin-top: 36px;
             margin-bottom: 16px;
-            color: #f0f6fc;
+            color: var(--heading-color);
             display: flex;
             align-items: center;
         }
@@ -401,7 +485,7 @@
             font-size: 1.3em;
             margin-top: 24px;
             margin-bottom: 12px;
-            color: #f0f6fc;
+            color: var(--heading-color);
         }
 
         .markdown-body p {
@@ -418,8 +502,8 @@
         }
 
         .markdown-body a:hover {
-            color: #79c0ff;
-            border-bottom-color: #79c0ff;
+            color: var(--link-hover-color);
+            border-bottom-color: var(--link-hover-color);
         }
 
         .markdown-body a.wiki-link {
@@ -471,7 +555,7 @@
             background-color: transparent;
             padding: 0;
             font-size: 90%;
-            color: #e6edf3;
+            color: var(--code-text-color);
             border-radius: 0;
         }
 
@@ -514,7 +598,7 @@
 
         .markdown-body th {
             background-color: rgba(138, 180, 248, 0.05);
-            color: #ffffff;
+            color: var(--heading-color);
             font-weight: 600;
         }
 
@@ -600,7 +684,28 @@
                 </div>
                 {% endif %}
                 {% if preload_json %}
-                <button id="pumice-graph-toggle" class="pumice-graph-toggle" type="button" aria-label="{{ t('publish_public.graph_view') }}" title="{{ t('publish_public.graph_view') }}">🕸</button>
+                <button id="pumice-graph-toggle" class="pumice-icon-button" type="button" aria-label="{{ t('publish_public.graph_view') }}" title="{{ t('publish_public.graph_view') }}">🕸</button>
+                {% endif %}
+                {% if show_theme_toggle %}
+                <button id="pumice-theme-toggle" class="pumice-icon-button" type="button" aria-label="{{ t('publish_public.theme_toggle') }}" title="{{ t('publish_public.theme_toggle') }}">🌓</button>
+                <script>
+                (function () {
+                  var btn = document.getElementById("pumice-theme-toggle");
+                  if (!btn) return;
+                  btn.addEventListener("click", function () {
+                    // No explicit data-theme yet means this page is following the OS preference
+                    // -- this CSS is dark-first (see the <style> block), so "no preference for
+                    // light" effectively means dark.
+                    var current = document.documentElement.getAttribute("data-theme");
+                    if (!current) {
+                      current = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+                    }
+                    var next = current === "dark" ? "light" : "dark";
+                    document.documentElement.setAttribute("data-theme", next);
+                    try { localStorage.setItem("pumiceTheme", next); } catch (e) {}
+                  });
+                })();
+                </script>
                 {% endif %}
                 <span class="vault-badge">Vault: {{ vault_id }}</span>
             </header>

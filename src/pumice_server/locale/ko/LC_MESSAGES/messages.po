@@ -487,6 +487,9 @@ msgstr "검색..."
 msgid "publish_public.graph_view"
 msgstr "그래프 보기"
 
+msgid "publish_public.theme_toggle"
+msgstr "테마 전환"
+
 msgid "devices.create_heading"
 msgstr "새 디바이스 생성"
 

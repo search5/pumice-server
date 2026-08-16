@@ -1171,6 +1171,8 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
         "navigation_tree": _build_navigation_tree(
             published_files, options["navigationOrdering"], options["navigationHiddenItems"], url_prefix,
         ),
+        "theme_attr": _resolve_theme_attr(options["defaultTheme"]),
+        "show_theme_toggle": options["showThemeToggle"],
     }
 
     # Root: show the list of published files, UNLESS an indexFile is configured and actually
@@ -1444,11 +1446,29 @@ _SITE_OPTIONS_DEFAULTS = {
     # _build_navigation_tree.
     "navigationOrdering": [],
     "navigationHiddenItems": [],
+    # Theme switching (별도 대형 기능 — see 33_실제_아키텍처_전환_테마_전환.md, pumice repo).
+    # Field names confirmed via the real captured /options/{uid} sample (27_...md, which had
+    # defaultTheme="light"/showThemeToggle=true), but -- unlike the Phase 3/5 fields above --
+    # this default deliberately does NOT match that sample: pumice-server's Publish page has
+    # always shipped with a single hardcoded dark look, and picking "dark" here preserves that
+    # exact look for every already-deployed site the moment this ships, with zero visual change
+    # unless the owner explicitly opts into "light"/"system" or turns the toggle on. "system"
+    # (not "light"/"dark") falls back to the visitor's OS `prefers-color-scheme`.
+    "defaultTheme": "dark",
+    "showThemeToggle": False,
 }
 
 def _load_site_options(data_dir: str, owner: str, vault_id: str) -> dict:
     stored = load_publish_meta(data_dir, owner, vault_id, "options.json", {})
     return {**_SITE_OPTIONS_DEFAULTS, **{k: v for k, v in stored.items() if k in _SITE_OPTIONS_DEFAULTS}}
+
+def _resolve_theme_attr(default_theme: str) -> Optional[str]:
+    """`<html data-theme="...">`'s value -- "light"/"dark" render that theme unconditionally,
+    everything else (including "system", the third real dropdown option) resolves to None so no
+    attribute is emitted and the page's `@media (prefers-color-scheme: dark)` rule decides
+    instead. Any unrecognized stored value degrades the same way "system" does, rather than
+    erroring -- see 33_실제_아키텍처_전환_테마_전환.md."""
+    return default_theme if default_theme in ("light", "dark") else None
 
 def _strip_md_suffix(name: str) -> str:
     return name[:-3] if name.lower().endswith(".md") else name
