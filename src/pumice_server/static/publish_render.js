@@ -97,15 +97,42 @@
     };
   }
 
-  /** Note outline (Phase 2 of 28_실제_아키텍처_전환_Phase1_노트본문.md) -- just the current
-   * note's own cache entry's `headings`, slugged to match the ids renderMarkdown puts on the
-   * actual rendered `<hN>` elements so outline links can jump to them. */
+  /** Note outline (Phase 2 of 28_실제_아키텍처_전환_Phase1_노트본문.md; nesting/positioning
+   * redesigned in 37_실제_아키텍처_전환_TOC_재설계.md after live-browser verification against real
+   * Obsidian Publish sites) -- the current note's cache entry's `headings`, slugged to match the
+   * ids renderMarkdown puts on the actual rendered `<hN>` elements, built into a nested tree the
+   * same way real Obsidian's own outline does: each heading becomes a child of the nearest
+   * preceding heading with a strictly lower level (so e.g. an H1 followed by H5s nests all of them
+   * under that H1, skipped levels and all -- confirmed live via `window.app.outline.treeView` on
+   * lab.marconoris.com/now, which does exactly this for a real H1→H5 note). No level is filtered
+   * out (confirmed live: a note's own body H1 shows up in the outline same as any other level). */
   function buildOutline(cacheEntry) {
     if (!cacheEntry || !cacheEntry.headings) return [];
     var slugger = makeSlugger();
-    return cacheEntry.headings.map(function (h) {
-      return { level: h.level, heading: h.heading, slug: slugger(h.heading) };
+    var root = [];
+    var stack = [];
+    cacheEntry.headings.forEach(function (h) {
+      var node = { level: h.level, heading: h.heading, slug: slugger(h.heading), children: [] };
+      while (stack.length && stack[stack.length - 1].level >= node.level) stack.pop();
+      (stack.length ? stack[stack.length - 1].children : root).push(node);
+      stack.push(node);
     });
+    return root;
+  }
+
+  /** Renders an outline tree (buildOutline's output) as nested `<ul>`s -- own class names
+   * (`pumice-outline-*`), not real Obsidian's (`tree-item`/`tree-item-children`/...): this is a
+   * from-scratch reimplementation informed by observed behavior, not copied markup. */
+  function renderOutlineHtml(tree) {
+    if (!tree.length) return "";
+    return "<ul>" + tree.map(renderOutlineItem).join("") + "</ul>";
+  }
+
+  function renderOutlineItem(node) {
+    var childrenHtml = node.children.length
+      ? '<ul class="pumice-outline-children">' + node.children.map(renderOutlineItem).join("") + "</ul>"
+      : "";
+    return '<li><a href="#' + escapeAttr(node.slug) + '">' + escapeHtml(node.heading) + "</a>" + childrenHtml + "</li>";
   }
 
   /** Mirrors the target-matching parse_wikilinks()/_build_path_to_permalink do server-side (see
@@ -629,12 +656,7 @@
 
         var outlineEl = document.getElementById("pumice-outline");
         if (outlineEl) {
-          var outline = buildOutline(entry);
-          outlineEl.innerHTML = outline.length
-            ? "<ul>" + outline.map(function (o) {
-                return '<li class="outline-level-' + o.level + '"><a href="#' + escapeAttr(o.slug) + '">' + escapeHtml(o.heading) + "</a></li>";
-              }).join("") + "</ul>"
-            : "";
+          outlineEl.innerHTML = renderOutlineHtml(buildOutline(entry));
         }
 
         var backlinksEl = document.getElementById("pumice-backlinks");
@@ -684,6 +706,7 @@
     renderInline: renderInline,
     renderMarkdown: renderMarkdown,
     buildOutline: buildOutline,
+    renderOutlineHtml: renderOutlineHtml,
     linkTargetMatchesPath: linkTargetMatchesPath,
     buildBacklinks: buildBacklinks,
     buildSearchIndex: buildSearchIndex,

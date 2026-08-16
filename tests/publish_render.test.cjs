@@ -107,12 +107,49 @@ test("renderInline escapes raw HTML in the source text", () => {
 
 // ─── Phase 2: outline + backlinks (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 2 follow-up) ──
 
-test("buildOutline turns a cache entry's headings into a slugged, ordered outline", () => {
+test("buildOutline nests a heading under the nearest preceding heading of a strictly lower level", () => {
   const entry = { headings: [{ heading: "Intro", level: 1 }, { heading: "Sub Point", level: 2 }] };
   assert.deepEqual(renderer.buildOutline(entry), [
-    { level: 1, heading: "Intro", slug: "intro" },
-    { level: 2, heading: "Sub Point", slug: "sub-point" },
+    {
+      level: 1, heading: "Intro", slug: "intro",
+      children: [{ level: 2, heading: "Sub Point", slug: "sub-point", children: [] }],
+    },
   ]);
+});
+
+test("buildOutline nests skipped levels (H1 then H5) under the H1, matching real Obsidian Publish's own outline tree (confirmed live via window.app.outline.treeView on lab.marconoris.com/now)", () => {
+  const entry = {
+    headings: [
+      { heading: "Title", level: 1 },
+      { heading: "A", level: 5 },
+      { heading: "B", level: 5 },
+    ],
+  };
+  const outline = renderer.buildOutline(entry);
+  assert.equal(outline.length, 1);
+  assert.equal(outline[0].heading, "Title");
+  assert.deepEqual(outline[0].children.map((c) => c.heading), ["A", "B"]);
+});
+
+test("buildOutline starts a new sibling once a heading returns to a shallower level", () => {
+  const entry = {
+    headings: [
+      { heading: "H2 One", level: 2 },
+      { heading: "H3 Under One", level: 3 },
+      { heading: "H2 Two", level: 2 },
+    ],
+  };
+  const outline = renderer.buildOutline(entry);
+  assert.equal(outline.length, 2);
+  assert.equal(outline[0].heading, "H2 One");
+  assert.deepEqual(outline[0].children.map((c) => c.heading), ["H3 Under One"]);
+  assert.equal(outline[1].heading, "H2 Two");
+  assert.deepEqual(outline[1].children, []);
+});
+
+test("buildOutline does not filter out H1 headings (confirmed live: a note's own body H1 shows up in the real outline)", () => {
+  const entry = { headings: [{ heading: "Body H1", level: 1 }] };
+  assert.equal(renderer.buildOutline(entry)[0].heading, "Body H1");
 });
 
 test("buildOutline de-duplicates identical heading text the same way as renderMarkdown", () => {
@@ -123,6 +160,31 @@ test("buildOutline de-duplicates identical heading text the same way as renderMa
 test("buildOutline returns an empty list for a note with no headings", () => {
   assert.deepEqual(renderer.buildOutline({ headings: [] }), []);
   assert.deepEqual(renderer.buildOutline(null), []);
+});
+
+test("renderOutlineHtml renders a flat outline as a single <ul>", () => {
+  const tree = [{ level: 1, heading: "Intro", slug: "intro", children: [] }];
+  assert.equal(renderer.renderOutlineHtml(tree), '<ul><li><a href="#intro">Intro</a></li></ul>');
+});
+
+test("renderOutlineHtml nests children in their own <ul class=\"pumice-outline-children\">", () => {
+  const tree = [{
+    level: 1, heading: "Intro", slug: "intro",
+    children: [{ level: 2, heading: "Sub", slug: "sub", children: [] }],
+  }];
+  assert.equal(
+    renderer.renderOutlineHtml(tree),
+    '<ul><li><a href="#intro">Intro</a><ul class="pumice-outline-children"><li><a href="#sub">Sub</a></li></ul></li></ul>',
+  );
+});
+
+test("renderOutlineHtml escapes heading text and slug attributes", () => {
+  const tree = [{ level: 1, heading: "<script>", slug: 'a"b', children: [] }];
+  assert.equal(renderer.renderOutlineHtml(tree), '<ul><li><a href="#a&quot;b">&lt;script&gt;</a></li></ul>');
+});
+
+test("renderOutlineHtml returns an empty string for an empty outline", () => {
+  assert.equal(renderer.renderOutlineHtml([]), "");
 });
 
 test("linkTargetMatchesPath matches a wikilink target against the .md-suffixed stored path", () => {

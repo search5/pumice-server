@@ -147,15 +147,25 @@
             max-width: 1400px;
         }
 
-        .layout.has-nav {
+        .layout.has-nav,
+        .layout.has-outline {
             max-width: 1200px;
             display: flex;
             align-items: flex-start;
             gap: 24px;
         }
 
-        .layout.has-nav.wide {
+        .layout.has-nav.wide,
+        .layout.has-outline.wide {
             max-width: 1600px;
+        }
+
+        .layout.has-nav.has-outline {
+            max-width: 1400px;
+        }
+
+        .layout.has-nav.has-outline.wide {
+            max-width: 1800px;
         }
 
         .pumice-nav-sidebar {
@@ -205,6 +215,60 @@
         .pumice-main-column {
             flex: 1;
             min-width: 0;
+        }
+
+        /* Outline/TOC sidebar (37_실제_아키텍처_전환_TOC_재설계.md) -- redesigned from an inline
+           block above the note body into its own positioned column after live-browser
+           verification against real Obsidian Publish sites confirmed the real one sits outside
+           the note's document flow (there: position: fixed or absolute depending on the site's
+           layout mode). `position: sticky` reuses this file's own existing pattern
+           (.pumice-nav-sidebar, Phase 5) for the same "stays in view while the note scrolls"
+           effect, rather than adopting real Obsidian's fixed/absolute + separately-scrolling
+           note body, which would mean rearchitecting this page's whole scroll model for a change
+           invisible to a reader either way. */
+        .pumice-outline-sidebar {
+            flex: 0 0 240px;
+            position: sticky;
+            top: 24px;
+            max-height: calc(100vh - 48px);
+            overflow-y: auto;
+            font-size: 13px;
+        }
+
+        .pumice-outline-sidebar:empty {
+            display: none;
+        }
+
+        .pumice-outline-sidebar ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+        }
+
+        .pumice-outline-sidebar li {
+            margin: 2px 0;
+        }
+
+        .pumice-outline-sidebar a {
+            display: block;
+            padding: 3px 6px;
+            border-radius: 6px;
+            color: var(--text-muted);
+            text-decoration: none;
+        }
+
+        .pumice-outline-sidebar a:hover {
+            color: var(--text-primary);
+            background: rgba(138, 180, 248, 0.1);
+        }
+
+        /* Real Obsidian nests a child heading's own <ul> under its parent <li> and indents via
+           the children container itself (padding-left + a left guide line), not per-level
+           classes on each item -- confirmed live via DOM inspection on lab.marconoris.com/now. */
+        .pumice-outline-sidebar .pumice-outline-children {
+            padding-left: 14px;
+            border-left: 1px solid var(--border-color);
+            margin-left: 6px;
         }
 
         .pumice-sliding-track {
@@ -446,12 +510,6 @@
             margin: 4px 0;
         }
 
-        .pumice-sidebar .outline-level-2 { padding-left: 14px; }
-        .pumice-sidebar .outline-level-3 { padding-left: 28px; }
-        .pumice-sidebar .outline-level-4 { padding-left: 42px; }
-        .pumice-sidebar .outline-level-5 { padding-left: 56px; }
-        .pumice-sidebar .outline-level-6 { padding-left: 70px; }
-
         .markdown-body h1 {
             font-family: 'Outfit', sans-serif;
             font-size: 2.2em;
@@ -623,6 +681,16 @@
         }
 
         @media (max-width: 768px) {
+            .layout.has-nav,
+            .layout.has-outline {
+                flex-direction: column;
+            }
+            .pumice-nav-sidebar,
+            .pumice-outline-sidebar {
+                position: static;
+                max-height: none;
+                width: 100%;
+            }
             .container {
                 padding: 24px;
                 border-radius: 12px;
@@ -653,7 +721,7 @@
     {% endif %}
 </head>
 <body>
-    <div class="layout{% if not readable_line_length %} wide{% endif %}{% if show_navigation and navigation_tree %} has-nav{% endif %}">
+    <div class="layout{% if not readable_line_length %} wide{% endif %}{% if show_navigation and navigation_tree %} has-nav{% endif %}{% if client_rendered %} has-outline{% endif %}">
         {% if show_navigation and navigation_tree %}
         <nav class="pumice-nav-sidebar">
             <ul>
@@ -722,7 +790,6 @@
                 <h1>{{ site_name }}</h1>{% if files %}<ul>{% for f in files %}<li><a href="{{ file_hrefs[f] }}">{{ f }}</a></li>{% endfor %}</ul>{% else %}<p>{{ t('publish_public.empty_no_files') }}</p>{% endif %}
                 {%- elif client_rendered -%}
                 {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
-                <aside id="pumice-outline" class="pumice-sidebar"></aside>
                 <div id="pumice-note-root" data-note-path="{{ path }}"></div>
                 <aside id="pumice-backlinks" class="pumice-sidebar"></aside>
                 {%- else -%}
@@ -738,6 +805,9 @@
                 <p>Powered by Antigravity Obsidian Publish Server | <a href="{{ url_prefix }}index.md">Index</a></p>
             </footer>
         </div>
+        {% if client_rendered %}
+        <aside id="pumice-outline" class="pumice-outline-sidebar"></aside>
+        {% endif %}
     </div>
 </body>
 </html>
