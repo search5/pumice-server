@@ -102,6 +102,63 @@
             content: none;
         }
 
+        .pumice-search {
+            position: relative;
+            flex: 1;
+            max-width: 320px;
+            margin: 0 20px;
+        }
+
+        .pumice-search input {
+            width: 100%;
+            box-sizing: border-box;
+            background: var(--code-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            padding: 8px 12px;
+            font-size: 14px;
+        }
+
+        .pumice-search-results {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            right: 0;
+            z-index: 10;
+            background: var(--container-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            max-height: 320px;
+            overflow-y: auto;
+        }
+
+        .pumice-search-results:empty {
+            display: none;
+            border: none;
+        }
+
+        .pumice-search-results a {
+            display: block;
+            padding: 8px 12px;
+            color: var(--text-primary);
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        .pumice-search-results a:hover {
+            background: rgba(138, 180, 248, 0.1);
+        }
+
+        .pumice-search-results .search-result-title {
+            font-weight: 600;
+        }
+
+        .pumice-search-results .search-result-snippet {
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
         .vault-badge {
             background: rgba(138, 180, 248, 0.1);
             color: var(--accent-purple);
@@ -363,6 +420,12 @@
     <div class="layout{% if not readable_line_length %} wide{% endif %}">
         <header>
             <a href="{{ url_prefix }}" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
+            {% if show_search and preload_json %}
+            <div class="pumice-search">
+                <input id="pumice-search-input" type="search" placeholder="{{ t('publish_public.search_placeholder') }}" autocomplete="off">
+                <div id="pumice-search-results" class="pumice-search-results"></div>
+            </div>
+            {% endif %}
             <span class="vault-badge">Vault: {{ vault_id }}</span>
         </header>
         <main class="container markdown-body">
@@ -373,13 +436,15 @@
             <aside id="pumice-outline" class="pumice-sidebar"></aside>
             <div id="pumice-note-root" data-note-path="{{ path }}"></div>
             <aside id="pumice-backlinks" class="pumice-sidebar"></aside>
-            <script>window.pumicePreload = {{ preload_json | safe }};</script>
-            <script defer src="/static/publish_render.js"></script>
             {%- else -%}
             {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
             {{ content | safe }}
             {%- endif %}
         </main>
+        {% if preload_json %}
+        <script>window.pumicePreload = {{ preload_json | safe }};</script>
+        <script defer src="/static/publish_render.js"></script>
+        {% endif %}
         <footer>
             <p>Powered by Antigravity Obsidian Publish Server | <a href="{{ url_prefix }}index.md">Index</a></p>
         </footer>

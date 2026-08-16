@@ -1166,6 +1166,7 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
         # publish.js) -- see 26_커스텀_도메인_지원.md.
         "google_analytics": options["googleAnalytics"] if is_custom_domain else None,
         "url_prefix": url_prefix, "username": username, "vault_id": vault_id,
+        "show_search": options["showSearch"],
     }
 
     # Root: show the list of published files, UNLESS an indexFile is configured and actually
@@ -1185,13 +1186,18 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
                         rel = os.path.relpath(os.path.join(root, fname), published_base)
                         files.append(rel.replace(os.sep, "/"))
             files = sorted(files)
+            # The file-listing page never runs plugins (it has no note content of its own), so
+            # search (see 28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 3) can always load its
+            # preload script here regardless of whether this vault has plugins enabled -- unlike
+            # the note-rendering branch below, where client_rendered is conditional on that.
             return {
                 "lang": lang, "t": lambda key, **params: t(key, lang, **params),
                 "title": "",
                 "files": files, "file_hrefs": _published_file_hrefs(url_prefix, files),
                 "content": None, "description": None, "image": None, "favicons": favicon_links,
                 "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
-                "client_rendered": False, "path": None, "preload_json": None,
+                "client_rendered": False, "path": None,
+                "preload_json": json.dumps({"url_prefix": url_prefix, "path": None}, ensure_ascii=False),
                 **common_option_fields,
             }
 
@@ -1411,6 +1417,13 @@ _SITE_OPTIONS_DEFAULTS = {
     "readableLineLength": True,
     "strictLineBreaks": False,
     "googleAnalytics": "",
+    # Gates the search box added in 28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 3 (client-
+    # side search over the metadata cache, see static/publish_render.js). True matches the one
+    # real site's live /options/{uid} payload captured in 27_실제_퍼블리시_사이트_아키텍처_조사.md
+    # -- that confirms the field name, not necessarily that True is real Obsidian's actual
+    # factory default (only one real site was sampled), so treat this default the same way as
+    # googleAnalytics's gtag snippet: a reasonable own choice, not a confirmed match.
+    "showSearch": True,
 }
 
 def _load_site_options(data_dir: str, owner: str, vault_id: str) -> dict:

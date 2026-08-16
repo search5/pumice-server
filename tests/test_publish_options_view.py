@@ -43,6 +43,7 @@ class FakeRequest:
 DEFAULTS = {
     "siteName": "", "indexFile": "", "logo": "", "noindex": False, "hideTitle": False,
     "readableLineLength": True, "strictLineBreaks": False, "googleAnalytics": "",
+    "showSearch": True,
 }
 
 

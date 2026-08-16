@@ -766,3 +766,38 @@ def test_note_with_an_enabled_plugin_stays_server_rendered(repo, tmp_path):
     assert result["client_rendered"] is False
     assert result["preload_json"] is None
     assert "Hello" in result["content"]
+
+
+# ─── search (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 3 follow-up) ───────────────────────
+
+def test_upload_records_search_text_in_the_metadata_cache(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n\nFind this phrase here.\n")
+
+    cache = web.load_publish_meta(str(tmp_path), "alice", "vault1", "metadata_cache.json")
+    assert "Find this phrase here." in cache["note.md"]["searchText"]
+
+
+def test_show_search_defaults_to_true(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["show_search"] is True
+
+
+def test_show_search_reflects_a_saved_false_value(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "options.json", {"showSearch": False})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["show_search"] is False
+
+
+def test_root_file_listing_page_still_gets_a_preload_script_for_search(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "")
+
+    assert result["files"] is not None
+    assert json.loads(result["preload_json"]) == {"url_prefix": "/publish/alice/vault1/", "path": None}

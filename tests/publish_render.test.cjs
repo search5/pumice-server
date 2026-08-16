@@ -149,3 +149,56 @@ test("buildBacklinks resolves the backlinking note's own permalink when it has o
   const backlinks = renderer.buildBacklinks(cache, "Note.md", "/publish/alice/vault1/");
   assert.deepEqual(backlinks, [{ path: "Home.md", href: "/publish/alice/vault1/welcome/" }]);
 });
+
+// ─── Phase 3: search (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 3 follow-up) ──────────────
+
+test("buildSearchIndex includes only markdown entries, deriving a filename-based title", () => {
+  const cache = {
+    "Notes/Deep Dive.md": { searchText: "some body text" },
+    "publish.js": null,
+    "image.png": null,
+  };
+  const index = renderer.buildSearchIndex(cache, "/publish/alice/vault1/");
+  assert.deepEqual(index, [
+    { path: "Notes/Deep Dive.md", title: "Deep Dive", href: "/publish/alice/vault1/Notes/Deep%20Dive", searchText: "some body text" },
+  ]);
+});
+
+test("buildSearchIndex resolves a permalink into the entry's href when present", () => {
+  const cache = { "Note.md": { searchText: "", permalink: "/nice/" } };
+  const index = renderer.buildSearchIndex(cache, "/publish/alice/vault1/");
+  assert.equal(index[0].href, "/publish/alice/vault1/nice/");
+});
+
+test("searchNotes returns nothing for an empty or whitespace-only query", () => {
+  const index = [{ path: "Note.md", title: "Note", href: "/x", searchText: "hello" }];
+  assert.deepEqual(renderer.searchNotes(index, ""), []);
+  assert.deepEqual(renderer.searchNotes(index, "   "), []);
+});
+
+test("searchNotes matches case-insensitively against the title", () => {
+  const index = [{ path: "Note.md", title: "Cooking Tips", href: "/x", searchText: "" }];
+  assert.equal(renderer.searchNotes(index, "cooking").length, 1);
+});
+
+test("searchNotes matches against searchText and includes a snippet around the match", () => {
+  const index = [{ path: "Note.md", title: "Note", href: "/x", searchText: "the quick brown fox jumps" }];
+  const results = renderer.searchNotes(index, "brown");
+  assert.equal(results.length, 1);
+  assert.match(results[0].snippet, /brown/);
+});
+
+test("searchNotes excludes non-matching entries", () => {
+  const index = [
+    { path: "A.md", title: "Apples", href: "/a", searchText: "fruit" },
+    { path: "B.md", title: "Bicycles", href: "/b", searchText: "wheels" },
+  ];
+  const results = renderer.searchNotes(index, "fruit");
+  assert.deepEqual(results.map((r) => r.path), ["A.md"]);
+});
+
+test("searchNotes caps the number of results", () => {
+  const index = Array.from({ length: 30 }, (_, i) => ({ path: `N${i}.md`, title: `Note ${i}`, href: `/${i}`, searchText: "match" }));
+  const results = renderer.searchNotes(index, "match");
+  assert.ok(results.length <= 20);
+});

@@ -108,3 +108,42 @@ def test_list_items_two_separate_top_level_groups():
     md = "- a\n\n- b\n"
     entry = extract_metadata_cache_entry(md)
     assert [item["parent"] for item in entry["listItems"]] == [0, -2]
+
+
+# ─── searchText (Phase 3: search, 28_실제_아키텍처_전환_Phase1_노트본문.md's follow-up) ──────────
+
+def test_search_text_strips_heading_marks_and_emphasis():
+    md = "# Title\n\nSome **bold** and *italic* and `code` text.\n"
+    entry = extract_metadata_cache_entry(md)
+    assert entry["searchText"] == "Title Some bold and italic and code text."
+
+
+def test_search_text_strips_frontmatter():
+    md = "---\ntitle: Hidden\n---\nVisible body.\n"
+    entry = extract_metadata_cache_entry(md)
+    assert "Hidden" not in entry["searchText"]
+    assert entry["searchText"] == "Visible body."
+
+
+def test_search_text_replaces_wikilinks_and_markdown_links_with_their_label():
+    md = "See [[Target|Custom Label]] and [regular link](https://example.com/x).\n"
+    entry = extract_metadata_cache_entry(md)
+    assert entry["searchText"] == "See Custom Label and regular link."
+
+
+def test_search_text_drops_image_embed_syntax_but_keeps_the_alt_text():
+    md = "![[photo.png]] and ![a cat](cat.png) here.\n"
+    entry = extract_metadata_cache_entry(md)
+    assert entry["searchText"] == "photo.png and a cat here."
+
+
+def test_search_text_collapses_blank_lines_and_whitespace():
+    md = "Line one.\n\n\nLine   two.\n"
+    entry = extract_metadata_cache_entry(md)
+    assert entry["searchText"] == "Line one. Line two."
+
+
+def test_search_text_is_capped_at_a_maximum_length():
+    md = "word " * 2000
+    entry = extract_metadata_cache_entry(md)
+    assert len(entry["searchText"]) <= 4000

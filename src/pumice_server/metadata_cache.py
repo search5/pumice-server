@@ -30,6 +30,31 @@ _HEADING_TRAILING_HASHES_RE = re.compile(r"\s+#+\s*$")
 _LINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
 _LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|\d+[.)])\s+")
 
+_SEARCH_TEXT_MAX_LENGTH = 4000
+_SEARCH_IMAGE_EMBED_RE = re.compile(r"!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
+_SEARCH_HEADING_MARK_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+_SEARCH_MD_LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+_SEARCH_EMPHASIS_RE = re.compile(r"(\*\*\*|\*\*|\*|___|__|_|`)")
+_SEARCH_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _plain_text_for_search(body: str) -> str:
+    """Search index text (Phase 3, 28_실제_아키텍처_전환_Phase1_노트본문.md's follow-up) -- a
+    lightweight own design, not reverse-engineered from real Obsidian (27_...md's curl sweep only
+    confirmed /options, /cache and /access; no dedicated search endpoint was found, so how real
+    Obsidian Publish's search actually works server-side is unconfirmed). This just needs to be
+    good enough for client-side substring search: markdown links/wikilinks/embeds are reduced to
+    their visible label, formatting markers are dropped, whitespace is collapsed, and the result
+    is capped (own reasonable default, same category of guess as _auto_generate_description's
+    200-char limit in web.py) so a very long note doesn't bloat metadata_cache.json."""
+    text = _SEARCH_IMAGE_EMBED_RE.sub(lambda m: m.group(2) or m.group(1), body)
+    text = _LINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
+    text = _SEARCH_MD_LINK_RE.sub(lambda m: m.group(1), text)
+    text = _SEARCH_HEADING_MARK_RE.sub("", text)
+    text = _SEARCH_EMPHASIS_RE.sub("", text)
+    text = _SEARCH_WHITESPACE_RE.sub(" ", text).strip()
+    return text[:_SEARCH_TEXT_MAX_LENGTH]
+
 
 def _split_lines_with_offsets(text: str):
     lines = text.split("\n")
@@ -160,6 +185,7 @@ def extract_metadata_cache_entry(raw_md: str) -> dict:
         "headings": _extract_headings(lines, offsets, body_start),
         "links": _extract_links(lines, offsets, body_start),
         "listItems": _extract_list_items(lines, offsets, body_start),
+        "searchText": _plain_text_for_search("\n".join(lines[body_start:])),
     }
     if frontmatter_pos is not None:
         entry["frontmatter"] = frontmatter

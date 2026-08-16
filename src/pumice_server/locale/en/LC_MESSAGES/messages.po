@@ -487,6 +487,9 @@ msgstr "User Account Management"
 msgid "publish_public.empty_no_files"
 msgstr "No files have been published yet."
 
+msgid "publish_public.search_placeholder"
+msgstr "Search..."
+
 msgid "devices.create_heading"
 msgstr "Create a new device"
 
