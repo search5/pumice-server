@@ -42,7 +42,7 @@ class FakeRegistry:
 class FakeRequest:
     def __init__(self, repository, data_dir, owner=None, vault_id=None,
                  headers=None, body=b"", matchdict=None, scheme="https", host="example.com",
-                 json_body=None, query_string="", domain=None, params=None):
+                 json_body=None, query_string="", domain=None, params=None, identity=None):
         self.repository = repository
         self.context = FakeContext(owner, vault_id) if owner is not None else None
         self.headers = headers or {}
@@ -55,6 +55,7 @@ class FakeRequest:
         self.query_string = query_string
         self.domain = domain if domain is not None else host.split(":")[0]
         self.params = params or {}
+        self.identity = identity
         self._json_body = json_body if json_body is not None else {}
 
     @property
@@ -955,3 +956,184 @@ def test_show_theme_toggle_reflects_a_saved_true_value(repo, tmp_path):
     result = render(repo, tmp_path, "alice", "vault1", "note.md")
 
     assert result["show_theme_toggle"] is True
+
+
+# ─── Site collaboration (별도 대형 기능, 36_실제_아키텍처_전환_Site_collaboration.md) ───────────
+
+def test_extract_target_owner_from_params():
+    request = FakeRequest(None, "/tmp", params={"owner": "alice"})
+    assert web._extract_target_owner(request) == "alice"
+
+
+def test_extract_target_owner_from_header():
+    request = FakeRequest(None, "/tmp", headers={"obs-owner": "alice"})
+    assert web._extract_target_owner(request) == "alice"
+
+
+def test_extract_target_owner_from_json_body():
+    request = FakeRequest(None, "/tmp", body=b"{}", json_body={"owner": "alice"})
+    assert web._extract_target_owner(request) == "alice"
+
+
+def test_extract_target_owner_absent_returns_none():
+    request = FakeRequest(None, "/tmp")
+    assert web._extract_target_owner(request) is None
+
+
+def test_is_accepted_publish_collaborator_true_when_accepted_and_username_matches(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "shares.json", [
+        {"uid": "u1", "email": "bob@example.com", "accepted": True, "accepted_by_username": "bob"},
+    ])
+    request = FakeRequest(repo, tmp_path)
+
+    assert web._is_accepted_publish_collaborator(request, "alice", "vault1", "bob") is True
+
+
+def test_is_accepted_publish_collaborator_false_when_not_accepted(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "shares.json", [
+        {"uid": "u1", "email": "bob@example.com", "accepted": False},
+    ])
+    request = FakeRequest(repo, tmp_path)
+
+    assert web._is_accepted_publish_collaborator(request, "alice", "vault1", "bob") is False
+
+
+def test_is_accepted_publish_collaborator_false_for_a_different_username(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "shares.json", [
+        {"uid": "u1", "email": "bob@example.com", "accepted": True, "accepted_by_username": "bob"},
+    ])
+    request = FakeRequest(repo, tmp_path)
+
+    assert web._is_accepted_publish_collaborator(request, "alice", "vault1", "carol") is False
+
+
+def test_is_accepted_publish_collaborator_false_with_no_shares_at_all(repo, tmp_path):
+    request = FakeRequest(repo, tmp_path)
+    assert web._is_accepted_publish_collaborator(request, "alice", "vault1", "bob") is False
+
+
+# ─── VaultContext ACL (site collaboration) ──────────────────────────────────────────────────────
+
+def test_vault_context_self_owned_grants_both_permissions(repo, tmp_path):
+    request = FakeRequest(repo, tmp_path, matchdict={"vault_id": "vault1"}, identity={"username": "alice"})
+
+    context = web.VaultContext(request)
+
+    assert context.owner == "alice"
+    assert (web.Allow, "user:alice", "vault-access") in context.__acl__
+    assert (web.Allow, "user:alice", "publish-access") in context.__acl__
+
+
+def test_vault_context_unauthenticated_has_no_acl(repo, tmp_path):
+    request = FakeRequest(repo, tmp_path, matchdict={"vault_id": "vault1"}, identity=None)
+
+    context = web.VaultContext(request)
+
+    assert context.owner is None
+    assert context.__acl__ == []
+
+
+def test_vault_context_accepted_collaborator_gets_only_publish_access(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "shares.json", [
+        {"uid": "u1", "email": "bob@example.com", "accepted": True, "accepted_by_username": "bob"},
+    ])
+    request = FakeRequest(repo, tmp_path, matchdict={"vault_id": "vault1"},
+                           identity={"username": "bob"}, headers={"obs-owner": "alice"})
+
+    context = web.VaultContext(request)
+
+    assert context.owner == "alice"
+    assert (web.Allow, "user:bob", "publish-access") in context.__acl__
+    assert not any(entry[2] == "vault-access" for entry in context.__acl__)
+
+
+def test_vault_context_unaccepted_target_owner_gets_empty_acl(repo, tmp_path):
+    request = FakeRequest(repo, tmp_path, matchdict={"vault_id": "vault1"},
+                           identity={"username": "bob"}, headers={"obs-owner": "alice"})
+
+    context = web.VaultContext(request)
+
+    assert context.owner == "alice"
+    assert context.__acl__ == []
+
+
+def test_vault_context_target_owner_equal_to_self_behaves_as_self_owned(repo, tmp_path):
+    request = FakeRequest(repo, tmp_path, matchdict={"vault_id": "vault1"},
+                           identity={"username": "alice"}, headers={"obs-owner": "alice"})
+
+    context = web.VaultContext(request)
+
+    assert context.owner == "alice"
+    assert (web.Allow, "user:alice", "vault-access") in context.__acl__
+
+
+# ─── publish_share_accept_view (site collaboration) ─────────────────────────────────────────────
+
+def test_publish_share_accept_marks_accepted_and_records_username_on_email_match(repo, tmp_path):
+    repo.create_user("bob", "hash", email="bob@example.com")
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "shares.json", [
+        {"uid": "u1", "email": "bob@example.com", "accepted": False, "invite_code": "code123"},
+    ])
+    request = FakeRequest(repo, tmp_path, json_body={"code": "code123"}, identity={"username": "bob"})
+
+    result = web.publish_share_accept_view(request)
+
+    assert result == {"ok": True}
+    shares = web.load_publish_meta(str(tmp_path), "alice", "vault1", "shares.json", [])
+    assert shares[0]["accepted"] is True
+    assert shares[0]["accepted_by_username"] == "bob"
+
+
+def test_publish_share_accept_rejects_a_mismatched_email(repo, tmp_path):
+    repo.create_user("carol", "hash", email="carol@example.com")
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "shares.json", [
+        {"uid": "u1", "email": "bob@example.com", "accepted": False, "invite_code": "code123"},
+    ])
+    request = FakeRequest(repo, tmp_path, json_body={"code": "code123"}, identity={"username": "carol"})
+
+    response = web.publish_share_accept_view(request)
+
+    assert response.status_code == 403
+    shares = web.load_publish_meta(str(tmp_path), "alice", "vault1", "shares.json", [])
+    assert shares[0]["accepted"] is False
+
+
+def test_publish_share_accept_404s_for_an_unknown_code(repo, tmp_path):
+    repo.create_user("bob", "hash", email="bob@example.com")
+    request = FakeRequest(repo, tmp_path, json_body={"code": "nope"}, identity={"username": "bob"})
+
+    response = web.publish_share_accept_view(request)
+
+    assert response.status_code == 404
+
+
+# ─── publish_share_mine_view (site collaboration) ───────────────────────────────────────────────
+
+def test_publish_share_mine_lists_accepted_sites_across_owners(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "shares.json", [
+        {"uid": "u1", "email": "bob@example.com", "accepted": True, "accepted_by_username": "bob"},
+    ])
+    web.save_publish_meta(str(tmp_path), "carol", "vault2", "shares.json", [
+        {"uid": "u2", "email": "bob@example.com", "accepted": True, "accepted_by_username": "bob"},
+    ])
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "options.json", {"siteName": "Alice's Notes"})
+    request = FakeRequest(repo, tmp_path, identity={"username": "bob"})
+
+    result = web.publish_share_mine_view(request)
+
+    sites = {(s["owner"], s["vault_id"]) for s in result["sites"]}
+    assert sites == {("alice", "vault1"), ("carol", "vault2")}
+    alice_site = next(s for s in result["sites"] if s["owner"] == "alice")
+    assert alice_site["site_name"] == "Alice's Notes"
+
+
+def test_publish_share_mine_excludes_pending_and_other_users_shares(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "shares.json", [
+        {"uid": "u1", "email": "bob@example.com", "accepted": False},
+        {"uid": "u2", "email": "carol@example.com", "accepted": True, "accepted_by_username": "carol"},
+    ])
+    request = FakeRequest(repo, tmp_path, identity={"username": "bob"})
+
+    result = web.publish_share_mine_view(request)
+
+    assert result["sites"] == []

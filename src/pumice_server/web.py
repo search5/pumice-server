@@ -231,13 +231,63 @@ def _extract_vault_id(request) -> str:
         pass
     return ""
 
+def _extract_target_owner(request) -> Optional[str]:
+    """Site collaboration (36_실제_아키텍처_전환_Site_collaboration.md) needs the caller to
+    explicitly say whose vault they're acting on -- a plain "caller is always the owner"
+    assumption (the only mode that existed before this) can never address anyone else's vault.
+    Mirrors _extract_vault_id's own multi-source lookup precedence (params -> obs-owner header
+    -> JSON body) so every existing calling convention gets the same new field for free. Returns
+    None (not "") when absent, so VaultContext can cleanly distinguish "no override given"
+    (preserve the exact old self-owned behavior) from an empty string."""
+    owner = request.params.get("owner")
+    if owner:
+        return owner
+    owner = request.headers.get("obs-owner")
+    if owner:
+        return owner
+    try:
+        if request.body:
+            body = request.json_body
+            return body.get("owner") or None
+    except Exception:
+        pass
+    return None
+
+def _is_accepted_publish_collaborator(request, owner: str, vault_id: str, caller_username: str) -> bool:
+    """Whether caller_username has been added and has accepted a Site collaboration invite
+    (see 36_실제_아키텍처_전환_Site_collaboration.md) on (owner, vault_id)'s shares.json --
+    accepted_by_username is set once, at accept time (see publish_share_accept_view), so this
+    never needs to re-derive/re-compare email addresses on every request."""
+    data_dir = request.registry.settings.get("data_dir")
+    shares = load_publish_meta(data_dir, owner, vault_id, "shares.json", [])
+    return any(s.get("accepted") and s.get("accepted_by_username") == caller_username for s in shares)
+
 class VaultContext:
     """Route factory for every endpoint scoped to a single vault. Resolves the vault_id from
     whichever of matchdict/params/obs-id header/JSON body the calling convention uses (see
-    _extract_vault_id). A vault's true identity is (owner_username, vault_id), and
-    owner_username always comes from the caller's own authenticated identity, never from client
-    input -- so there's no cross-account vault access to check: a caller can only ever address
-    their own vaults. (An earlier version of this checked vault_id against a global
+    _extract_vault_id). A vault's true identity is (owner_username, vault_id).
+
+    Two ways to reach a vault's ACL:
+    1. Self-owned (no explicit target owner, or target owner equals the caller): owner_username
+       comes from the caller's own authenticated identity, exactly as before Site collaboration
+       existed -- the caller gets both "vault-access" (full vault-scoped access: options,
+       passwords, custom domain, managing collaborators, ...) and "publish-access" (a strict
+       subset of that, see below).
+    2. Collaborator-on-someone-else's-vault (an explicit target owner from _extract_target_owner,
+       different from the caller): owner_username is the target owner, and the caller only gets
+       "publish-access" -- and only if they're an accepted Site collaborator on that exact
+       (owner, vault_id). Real Obsidian's own collaborator permission table (confirmed via the
+       official docs, obsidianmd/obsidian-help's "Collaborate on a Publish site.md") grants
+       collaborators publish/unpublish but explicitly NOT "Configure site options" or "Manage
+       permissions" -- so only publish_list/publish_upload/publish_remove/publish_download
+       (the only views using permission='publish-access') become reachable; every other
+       VaultContext-scoped route (publish_options, publish_customurl, publish_password,
+       publish_share_*, publish_slug, ...) still requires 'vault-access', which a collaborator
+       is never granted. A caller impersonating an owner they're not an accepted collaborator
+       for still gets self.owner set to that owner (for consistency), but __acl__ stays empty --
+       no permission is ever granted, so no view body ever runs with that borrowed owner.
+
+    (An earlier version of self-owned resolution checked vault_id against a global
     vault_id -> owner registry and let the first caller "claim" an unclaimed vault_id -- removed,
     because vault_id alone isn't globally unique: "Obsidian Vault" is Obsidian's own default vault
     name, so two different accounts' same-named vaults collided and whichever synced first
@@ -246,17 +296,34 @@ class VaultContext:
     def __init__(self, request):
         self.vault_id = _extract_vault_id(request)
         identity = request.identity
-        self.owner = identity["username"] if identity else None
-        self.__acl__ = [(Allow, f"user:{self.owner}", "vault-access")] if self.owner else []
+        caller_username = identity["username"] if identity else None
+        target_owner = _extract_target_owner(request)
 
-@forbidden_view_config(path_info=r'^/api/', renderer="json")
+        self.__acl__ = []
+        if target_owner and caller_username and target_owner != caller_username:
+            self.owner = target_owner
+            if _is_accepted_publish_collaborator(request, target_owner, self.vault_id, caller_username):
+                self.__acl__.append((Allow, f"user:{caller_username}", "publish-access"))
+        else:
+            self.owner = caller_username
+            if caller_username:
+                self.__acl__.append((Allow, f"user:{caller_username}", "vault-access"))
+                self.__acl__.append((Allow, f"user:{caller_username}", "publish-access"))
+
+@forbidden_view_config(path_info=r'^/(api/|publish/share/)', renderer="json")
 def forbidden_view_api(request):
     # Same 401-vs-403 distinction the manual per-view checks used to make: no identity at all
     # is "you need to log in" (401), a real identity that just isn't allowed here is "you're
     # logged in as the wrong person" (403). Every /api/* caller (Obsidian plugin and the
     # dashboard's own fetch() calls alike) expects JSON here, never a redirect -- fetch()
     # follows redirects transparently and would hand the caller /login's HTML instead of an
-    # error it can act on.
+    # error it can act on. /publish/share/* (Site collaboration, see 36_실제_아키텍처_전환_
+    # Site_collaboration.md) is the same kind of fetch()-only JSON API despite living under
+    # /publish/ rather than /api/ -- unlike /publish/{username}/{vault_id}/{path}, which is a
+    # real browser-navigable page (and permission=NO_PERMISSION_REQUIRED there anyway, so it
+    # never reaches this view). Site collaboration is what actually made this reachable: before
+    # it, every /publish/share/* caller was always implicitly the vault's own owner, so a denied
+    # request here literally couldn't happen.
     status = 401 if request.identity is None else 403
     request.response.status = status
     return {"error": "Unauthorized" if status == 401 else "Forbidden"}
@@ -841,7 +908,7 @@ def _find_root_asset_href(files: list, filename: str, url_prefix: str) -> Option
         return None
     return f"{url_prefix}{quote(filename, safe='')}"
 
-@view_config(route_name='publish_list', renderer='json', permission='vault-access')
+@view_config(route_name='publish_list', renderer='json', permission='publish-access')
 def publish_list_view(request):
     try:
         vault_id = request.context.vault_id
@@ -876,7 +943,7 @@ def publish_list_view(request):
         logger.error(f"HTTP publish_list failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_upload', renderer='json', permission='vault-access')
+@view_config(route_name='publish_upload', renderer='json', permission='publish-access')
 def publish_upload_view(request):
     try:
         vault_id = request.context.vault_id
@@ -973,7 +1040,7 @@ def _warm_plugin_resolve_cache(request, owner: str, vault_id: str, file_path: st
     except Exception as e:
         logger.error(f"Failed to eagerly warm plugin resolve cache for vault '{vault_id}': {e}")
 
-@view_config(route_name='publish_remove', renderer='json', permission='vault-access')
+@view_config(route_name='publish_remove', renderer='json', permission='publish-access')
 def publish_remove_view(request):
     try:
         # Obsidian Publish format: JSON body {path, id, token}
@@ -1013,7 +1080,7 @@ def publish_remove_view(request):
         logger.error(f"HTTP publish_remove failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_download', permission='vault-access')
+@view_config(route_name='publish_download', permission='publish-access')
 def publish_download_view(request):
     try:
         body = request.json_body
@@ -1691,13 +1758,17 @@ def publish_share_remove_view(request):
         logger.error(f"HTTP publish_share_remove failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_share_accept', renderer='json', permission=NO_PERMISSION_REQUIRED)
+@view_config(route_name='publish_share_accept', renderer='json', permission='authenticated')
 def publish_share_accept_view(request):
     try:
         body = request.json_body
         code = body.get("code")
         if not code:
             return Response(body=json.dumps({"error": "Missing code"}).encode("utf-8"), status=400, content_type="application/json")
+
+        caller_username = request.identity["username"]
+        caller = request.repository.get_user_by_username(caller_username)
+        caller_email = (caller.get("email") or "").strip().lower() if caller else ""
 
         data_dir = request.registry.settings.get("data_dir")
         meta_root = os.path.join(data_dir, "publish_meta")
@@ -1713,12 +1784,22 @@ def publish_share_accept_view(request):
                     if not os.path.isdir(vault_meta_dir):
                         continue
                     shares = load_publish_meta(data_dir, owner, vault_id, "shares.json", [])
-                    changed = False
                     for s in shares:
-                        if s.get("invite_code") == code:
-                            s["accepted"] = True
-                            changed = True
-                    if changed:
+                        if s.get("invite_code") != code:
+                            continue
+                        # This grants real publish-access from here on (see VaultContext/
+                        # _is_accepted_publish_collaborator, 36_실제_아키텍처_전환_
+                        # Site_collaboration.md) -- unlike before, when "accepted" had no actual
+                        # consequence, the accepting account's own email must now match the
+                        # invite's, so a leaked/guessed invite_code alone can't grant access to
+                        # someone the owner didn't actually invite.
+                        invite_email = (s.get("email") or "").strip().lower()
+                        if not caller_email or invite_email != caller_email:
+                            return Response(
+                                body=json.dumps({"error": "This invite is for a different email address."}).encode("utf-8"),
+                                status=403, content_type="application/json")
+                        s["accepted"] = True
+                        s["accepted_by_username"] = caller_username
                         save_publish_meta(data_dir, owner, vault_id, "shares.json", shares)
                         return {"ok": True}
 
@@ -1727,13 +1808,52 @@ def publish_share_accept_view(request):
         logger.error(f"HTTP publish_share_accept failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
+@view_config(route_name='publish_share_mine', renderer='json', permission='authenticated')
+def publish_share_mine_view(request):
+    """The Publish sites this authenticated user has been added as an accepted Site
+    collaborator on, across every owner/vault -- see 36_실제_아키텍처_전환_Site_collaboration.md.
+    Same "no factory, permission='authenticated', walk the whole publish_meta tree" pattern as
+    vault_shared_with_me_view (the vault-sync-sharing equivalent) and
+    publish_share_accept_view above."""
+    try:
+        caller_username = request.identity["username"]
+        data_dir = request.registry.settings.get("data_dir")
+        meta_root = os.path.join(data_dir, "publish_meta")
+        sites = []
+        if os.path.isdir(meta_root):
+            for owner in os.listdir(meta_root):
+                owner_meta_dir = os.path.join(meta_root, owner)
+                if not os.path.isdir(owner_meta_dir):
+                    continue
+                for vault_id in os.listdir(owner_meta_dir):
+                    vault_meta_dir = os.path.join(owner_meta_dir, vault_id)
+                    if not os.path.isdir(vault_meta_dir):
+                        continue
+                    shares = load_publish_meta(data_dir, owner, vault_id, "shares.json", [])
+                    if not any(s.get("accepted") and s.get("accepted_by_username") == caller_username for s in shares):
+                        continue
+                    options = _load_site_options(data_dir, owner, vault_id)
+                    sites.append({
+                        "owner": owner, "vault_id": vault_id,
+                        "site_name": options["siteName"] or vault_id,
+                    })
+        return {"sites": sites}
+    except Exception as e:
+        logger.error(f"HTTP publish_share_mine failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
 
 # ─── Vault sync sharing (see pumice's 14_vault_sharing_설계.md) ────────────────────────────────
-# Distinct from the /publish/share/* views above: those grant read access to a published static
-# site; these grant full read/write sync access to the vault itself, backed by the vault_shares
-# DB table (repository.py) rather than the JSON-file-per-vault pattern publish sharing uses --
-# sync access is checked on every WS connect (SyncWsSession._handle_init), not just an occasional
-# REST call, so an indexed table is the right fit here.
+# Distinct from the /publish/share/* views above: those grant write access (publish new pages,
+# publish changes, unpublish -- confirmed via the official docs, obsidianmd/obsidian-help's
+# "Collaborate on a Publish site.md" permission table; see 36_실제_아키텍처_전환_
+# Site_collaboration.md) to a published site's own content, enforced via VaultContext's
+# "publish-access" permission -- not read access (a published site is already public, or
+# separately password-protected, so "read access" isn't even a meaningful grant here). These
+# vault-sync-sharing views below grant full read/write SYNC access to the vault itself, backed by
+# the vault_shares DB table (repository.py) rather than the JSON-file-per-vault pattern publish
+# sharing uses -- sync access is checked on every WS connect (SyncWsSession._handle_init), not
+# just an occasional REST call, so an indexed table is the right fit here.
 
 @view_config(route_name='vault_share_invite', renderer='json', permission='vault-access')
 def vault_share_invite_view(request):
@@ -2351,6 +2471,7 @@ def create_pyramid_app(repository, data_dir):
     config.add_route('publish_share_invite', '/publish/share/invite', factory=VaultContext)
     config.add_route('publish_share_remove', '/publish/share/remove', factory=VaultContext)
     config.add_route('publish_share_accept', '/publish/share/accept')
+    config.add_route('publish_share_mine', '/publish/share/mine')
     config.add_route('publish_view', '/publish/{username}/{vault_id}/{path:.*}')
 
     # Scan for decorators (@view_config, etc.)
