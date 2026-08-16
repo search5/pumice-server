@@ -484,6 +484,9 @@ msgstr "게시된 파일이 없습니다."
 msgid "publish_public.search_placeholder"
 msgstr "검색..."
 
+msgid "publish_public.graph_view"
+msgstr "그래프 보기"
+
 msgid "devices.create_heading"
 msgstr "새 디바이스 생성"
 

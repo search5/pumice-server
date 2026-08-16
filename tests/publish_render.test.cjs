@@ -202,3 +202,81 @@ test("searchNotes caps the number of results", () => {
   const results = renderer.searchNotes(index, "match");
   assert.ok(results.length <= 20);
 });
+
+// ─── Phase 4: graph view (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 4 follow-up) ──────────
+
+test("buildGraph turns cache links into deduplicated nodes/edges between known markdown files", () => {
+  const cache = {
+    "A.md": { links: [{ link: "B" }] },
+    "B.md": { links: [{ link: "C" }] },
+    "C.md": { links: [] },
+  };
+  const graph = renderer.buildGraph(cache);
+  assert.deepEqual(graph.nodes.map((n) => n.path), ["A.md", "B.md", "C.md"]);
+  assert.deepEqual(graph.edges, [
+    { source: "A.md", target: "B.md" },
+    { source: "B.md", target: "C.md" },
+  ]);
+});
+
+test("buildGraph excludes self-links, unresolved link targets, and non-markdown entries", () => {
+  const cache = {
+    "A.md": { links: [{ link: "A" }, { link: "Missing" }, { link: "image.png" }] },
+    "image.png": null,
+  };
+  const graph = renderer.buildGraph(cache);
+  assert.deepEqual(graph.nodes.map((n) => n.path), ["A.md"]);
+  assert.deepEqual(graph.edges, []);
+});
+
+test("buildGraph collapses a link that appears twice (or in both directions) into one edge", () => {
+  const cache = {
+    "A.md": { links: [{ link: "B" }, { link: "B" }] },
+    "B.md": { links: [{ link: "A" }] },
+  };
+  const graph = renderer.buildGraph(cache);
+  assert.equal(graph.edges.length, 1);
+});
+
+test("layoutGraph returns an empty position map for an empty graph", () => {
+  assert.deepEqual(renderer.layoutGraph({ nodes: [], edges: [] }, {}), {});
+});
+
+test("layoutGraph returns finite positions for every node", () => {
+  const graph = { nodes: [{ path: "A.md" }, { path: "B.md" }], edges: [{ source: "A.md", target: "B.md" }] };
+  const positions = renderer.layoutGraph(graph, { width: 300, height: 300, iterations: 50 });
+  Object.keys(positions).forEach((path) => {
+    assert.ok(Number.isFinite(positions[path].x));
+    assert.ok(Number.isFinite(positions[path].y));
+  });
+});
+
+test("layoutGraph pulls connected nodes closer together than to an unconnected node", () => {
+  const graph = {
+    nodes: [{ path: "A.md" }, { path: "B.md" }, { path: "C.md" }],
+    edges: [{ source: "A.md", target: "B.md" }],
+  };
+  const positions = renderer.layoutGraph(graph, { width: 400, height: 400, iterations: 150 });
+  const dist = (p, q) => Math.hypot(p.x - q.x, p.y - q.y);
+  const distAB = dist(positions["A.md"], positions["B.md"]);
+  const distAC = dist(positions["A.md"], positions["C.md"]);
+  assert.ok(distAB < distAC, `expected connected AB (${distAB}) closer than unconnected AC (${distAC})`);
+});
+
+test("renderGraphSvg emits a line per edge and a linked circle per node, highlighting the current node", () => {
+  const graph = { nodes: [{ path: "A.md", title: "A" }, { path: "B.md", title: "B" }], edges: [{ source: "A.md", target: "B.md" }] };
+  const positions = { "A.md": { x: 10, y: 20 }, "B.md": { x: 30, y: 40 } };
+  const svg = renderer.renderGraphSvg(graph, positions, {}, "/publish/alice/vault1/", "A.md", 100, 100);
+  assert.match(svg, /<line x1="10" y1="20" x2="30" y2="40"/);
+  assert.match(svg, /class="graph-node graph-node-current"/);
+  assert.match(svg, /href="\/publish\/alice\/vault1\/A"/);
+  assert.match(svg, /href="\/publish\/alice\/vault1\/B"/);
+});
+
+test("renderGraphSvg resolves node hrefs through the cache's permalinks", () => {
+  const graph = { nodes: [{ path: "A.md", title: "A" }], edges: [] };
+  const positions = { "A.md": { x: 0, y: 0 } };
+  const cache = { "A.md": { permalink: "/nice/" } };
+  const svg = renderer.renderGraphSvg(graph, positions, cache, "/publish/alice/vault1/", null, 50, 50);
+  assert.match(svg, /href="\/publish\/alice\/vault1\/nice\/"/);
+});

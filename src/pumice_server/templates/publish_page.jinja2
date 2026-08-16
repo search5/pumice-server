@@ -159,6 +159,81 @@
             font-size: 12px;
         }
 
+        .pumice-graph-toggle {
+            background: var(--code-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            width: 36px;
+            height: 36px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-right: 12px;
+        }
+
+        .pumice-graph-toggle:hover {
+            background: rgba(138, 180, 248, 0.1);
+        }
+
+        .pumice-graph-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 100;
+            background: rgba(13, 17, 23, 0.85);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .pumice-graph-overlay[hidden] {
+            display: none;
+        }
+
+        .pumice-graph-panel {
+            position: relative;
+            background: var(--container-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 20px;
+            width: min(90vw, 700px);
+            height: min(90vh, 700px);
+        }
+
+        .pumice-graph-close {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            background: none;
+            border: none;
+            color: var(--text-primary);
+            font-size: 22px;
+            cursor: pointer;
+            line-height: 1;
+        }
+
+        #pumice-graph-container {
+            width: 100%;
+            height: 100%;
+        }
+
+        #pumice-graph-container svg {
+            width: 100%;
+            height: 100%;
+        }
+
+        .graph-edge {
+            stroke: var(--border-color);
+            stroke-width: 1;
+        }
+
+        .graph-node {
+            fill: var(--wiki-link);
+        }
+
+        .graph-node-current {
+            fill: var(--accent-blue);
+        }
+
         .vault-badge {
             background: rgba(138, 180, 248, 0.1);
             color: var(--accent-purple);
@@ -426,8 +501,19 @@
                 <div id="pumice-search-results" class="pumice-search-results"></div>
             </div>
             {% endif %}
+            {% if preload_json %}
+            <button id="pumice-graph-toggle" class="pumice-graph-toggle" type="button" aria-label="{{ t('publish_public.graph_view') }}" title="{{ t('publish_public.graph_view') }}">🕸</button>
+            {% endif %}
             <span class="vault-badge">Vault: {{ vault_id }}</span>
         </header>
+        {% if preload_json %}
+        <div id="pumice-graph-overlay" class="pumice-graph-overlay" hidden>
+            <div class="pumice-graph-panel">
+                <button id="pumice-graph-close" class="pumice-graph-close" type="button" aria-label="{{ t('common.button_close') }}">×</button>
+                <div id="pumice-graph-container"></div>
+            </div>
+        </div>
+        {% endif %}
         <main class="container markdown-body">
             {% if files is not none -%}
             <h1>{{ site_name }}</h1>{% if files %}<ul>{% for f in files %}<li><a href="{{ file_hrefs[f] }}">{{ f }}</a></li>{% endfor %}</ul>{% else %}<p>{{ t('publish_public.empty_no_files') }}</p>{% endif %}

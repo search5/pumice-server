@@ -180,6 +180,136 @@
     return results;
   }
 
+  /** Graph view (Phase 4, 28_실제_아키텍처_전환_Phase1_노트본문.md's follow-up) -- like search
+   * (Phase 3), real Obsidian's own graph wire format is unconfirmed (27_...md's curl sweep only
+   * found /options, /cache, /access), so this is pumice's own design built from the same
+   * whole-vault `_cache.json` already fetched. Scope: only markdown files that are actual nodes
+   * in this vault's cache, only links that resolve to another such file (an unresolved/external
+   * link target doesn't get a node) -- matches buildBacklinks' own resolved-links-only scope. A
+   * link that appears more than once, or in both directions between the same two files, collapses
+   * into a single undirected edge (the graph is for showing connectivity, not link direction/
+   * count). */
+  function buildGraph(cache) {
+    var nodes = [];
+    var nodePaths = {};
+    Object.keys(cache).forEach(function (path) {
+      var entry = cache[path];
+      if (!entry || !/\.md$/i.test(path)) return;
+      nodePaths[path] = true;
+      nodes.push({ path: path, title: titleFromPath(path) });
+    });
+
+    var seenEdgeKeys = {};
+    var edges = [];
+    nodes.forEach(function (node) {
+      var entry = cache[node.path];
+      (entry.links || []).forEach(function (link) {
+        var targetPath = null;
+        for (var i = 0; i < nodes.length; i++) {
+          if (linkTargetMatchesPath(link.link, nodes[i].path)) { targetPath = nodes[i].path; break; }
+        }
+        if (!targetPath || targetPath === node.path) return;
+        var key = [node.path, targetPath].sort().join("|");
+        if (seenEdgeKeys[key]) return;
+        seenEdgeKeys[key] = true;
+        edges.push({ source: node.path, target: targetPath });
+      });
+    });
+
+    return { nodes: nodes, edges: edges };
+  }
+
+  var GRAPH_DEFAULT_ITERATIONS = 200;
+
+  /** Deterministic force-directed layout (Fruchterman-Reingold) -- no Math.random(), so results
+   * are reproducible and testable: nodes start on a circle (ordered by index) and every
+   * iteration pushes every node pair apart while pulling edge-connected pairs together, with a
+   * cooling "temperature" that shrinks the max per-iteration move so the layout settles instead
+   * of oscillating forever. Returns {[path]: {x, y}}. */
+  function layoutGraph(graph, opts) {
+    opts = opts || {};
+    var width = opts.width || 600;
+    var height = opts.height || 600;
+    var iterations = opts.iterations || GRAPH_DEFAULT_ITERATIONS;
+    var nodes = graph.nodes;
+    var n = nodes.length;
+    var positions = {};
+    if (n === 0) return positions;
+
+    var cx = width / 2, cy = height / 2;
+    var radius = Math.min(width, height) / 3;
+    nodes.forEach(function (node, i) {
+      var angle = (2 * Math.PI * i) / n;
+      positions[node.path] = { x: cx + radius * Math.cos(angle), y: cy + radius * Math.sin(angle) };
+    });
+    if (n === 1) return positions;
+
+    var k = Math.sqrt((width * height) / n);
+
+    for (var iter = 0; iter < iterations; iter++) {
+      var disp = {};
+      nodes.forEach(function (node) { disp[node.path] = { x: 0, y: 0 }; });
+
+      for (var i = 0; i < n; i++) {
+        for (var j = i + 1; j < n; j++) {
+          var a = nodes[i].path, b = nodes[j].path;
+          var dx = positions[a].x - positions[b].x;
+          var dy = positions[a].y - positions[b].y;
+          var dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+          var force = (k * k) / dist;
+          var fx = (dx / dist) * force, fy = (dy / dist) * force;
+          disp[a].x += fx; disp[a].y += fy;
+          disp[b].x -= fx; disp[b].y -= fy;
+        }
+      }
+
+      graph.edges.forEach(function (edge) {
+        var dx = positions[edge.source].x - positions[edge.target].x;
+        var dy = positions[edge.source].y - positions[edge.target].y;
+        var dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+        var force = (dist * dist) / k;
+        var fx = (dx / dist) * force, fy = (dy / dist) * force;
+        disp[edge.source].x -= fx; disp[edge.source].y -= fy;
+        disp[edge.target].x += fx; disp[edge.target].y += fy;
+      });
+
+      var temperature = (width / 10) * (1 - iter / iterations);
+      nodes.forEach(function (node) {
+        var d = disp[node.path];
+        var dlen = Math.sqrt(d.x * d.x + d.y * d.y) || 0.01;
+        var limited = Math.min(dlen, temperature);
+        var pos = positions[node.path];
+        pos.x = Math.min(width, Math.max(0, pos.x + (d.x / dlen) * limited));
+        pos.y = Math.min(height, Math.max(0, pos.y + (d.y / dlen) * limited));
+      });
+    }
+
+    return positions;
+  }
+
+  /** Renders a laid-out graph as an inline SVG string -- each node is a clickable, permalink-
+   * resolved <a><circle></a> (reusing resolveWikilinkHref, same as every other cross-note link
+   * this renderer produces), the current note's node gets a distinguishing class. */
+  function renderGraphSvg(graph, positions, cache, urlPrefix, currentPath, width, height) {
+    width = width || 600;
+    height = height || 600;
+    var edgesSvg = graph.edges.map(function (edge) {
+      var s = positions[edge.source], t = positions[edge.target];
+      if (!s || !t) return "";
+      return '<line x1="' + s.x + '" y1="' + s.y + '" x2="' + t.x + '" y2="' + t.y + '" class="graph-edge"></line>';
+    }).join("");
+    var nodesSvg = graph.nodes.map(function (node) {
+      var p = positions[node.path];
+      if (!p) return "";
+      var href = resolveWikilinkHref(node.path, cache, urlPrefix);
+      var isCurrent = node.path === currentPath;
+      var cls = "graph-node" + (isCurrent ? " graph-node-current" : "");
+      var r = isCurrent ? 7 : 5;
+      return '<a href="' + escapeAttr(href) + '"><circle cx="' + p.x + '" cy="' + p.y + '" r="' + r + '" class="' + cls + '"><title>' + escapeHtml(node.title) + "</title></circle></a>";
+    }).join("");
+    return '<svg viewBox="0 0 ' + width + " " + height + '" xmlns="http://www.w3.org/2000/svg">' + edgesSvg + nodesSvg + "</svg>";
+  }
+
   function renderInline(text, cache, urlPrefix) {
     var escaped = escapeHtml(text);
 
@@ -383,6 +513,30 @@
     });
   }
 
+  /** Wires the graph-view toggle button/overlay -- the layout is computed lazily on first open
+   * (force-directed layout over a whole vault isn't free, no reason to pay for it on every page
+   * load if the visitor never opens the graph) and cached for subsequent opens. */
+  function wireGraph(toggleEl, closeEl, overlayEl, containerEl, cache, urlPrefix, currentPath) {
+    var rendered = false;
+    toggleEl.addEventListener("click", function () {
+      if (!rendered) {
+        var graph = buildGraph(cache);
+        var rect = containerEl.getBoundingClientRect();
+        var size = Math.max(200, Math.min(rect.width || 600, rect.height || 600));
+        var positions = layoutGraph(graph, { width: size, height: size });
+        containerEl.innerHTML = renderGraphSvg(graph, positions, cache, urlPrefix, currentPath, size, size);
+        rendered = true;
+      }
+      overlayEl.hidden = false;
+    });
+    closeEl.addEventListener("click", function () {
+      overlayEl.hidden = true;
+    });
+    overlayEl.addEventListener("click", function (e) {
+      if (e.target === overlayEl) overlayEl.hidden = true;
+    });
+  }
+
   async function main() {
     var preload = window.pumicePreload;
     if (!preload) return;
@@ -435,6 +589,18 @@
         // succeeded (or where there's no note body at all, on the file-listing page).
       }
     }
+
+    var graphToggleEl = document.getElementById("pumice-graph-toggle");
+    var graphOverlayEl = document.getElementById("pumice-graph-overlay");
+    var graphCloseEl = document.getElementById("pumice-graph-close");
+    var graphContainerEl = document.getElementById("pumice-graph-container");
+    if (graphToggleEl && graphOverlayEl && graphCloseEl && graphContainerEl) {
+      try {
+        wireGraph(graphToggleEl, graphCloseEl, graphOverlayEl, graphContainerEl, await cachePromise, preload.url_prefix, preload.path);
+      } catch (e) {
+        // Same progressive-enhancement reasoning as search above.
+      }
+    }
   }
 
   var api = {
@@ -449,6 +615,9 @@
     buildBacklinks: buildBacklinks,
     buildSearchIndex: buildSearchIndex,
     searchNotes: searchNotes,
+    buildGraph: buildGraph,
+    layoutGraph: layoutGraph,
+    renderGraphSvg: renderGraphSvg,
   };
 
   if (typeof module !== "undefined" && module.exports) {
