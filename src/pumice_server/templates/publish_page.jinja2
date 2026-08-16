@@ -63,6 +63,83 @@
             max-width: 1400px;
         }
 
+        .layout.has-nav {
+            max-width: 1200px;
+            display: flex;
+            align-items: flex-start;
+            gap: 24px;
+        }
+
+        .layout.has-nav.wide {
+            max-width: 1600px;
+        }
+
+        .pumice-nav-sidebar {
+            flex: 0 0 220px;
+            position: sticky;
+            top: 24px;
+            max-height: calc(100vh - 48px);
+            overflow-y: auto;
+            padding-top: 4px;
+        }
+
+        .pumice-nav-sidebar ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+        }
+
+        .pumice-nav-sidebar li {
+            margin: 2px 0;
+        }
+
+        .pumice-nav-sidebar a {
+            display: block;
+            padding: 4px 8px;
+            border-radius: 6px;
+            color: var(--text-primary);
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        .pumice-nav-sidebar a:hover {
+            background: rgba(138, 180, 248, 0.1);
+        }
+
+        .pumice-nav-folder-title {
+            display: block;
+            padding: 4px 8px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+
+        .pumice-nav-sidebar .nav-folder ul {
+            padding-left: 12px;
+        }
+
+        .pumice-main-column {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .pumice-sliding-track {
+            display: flex;
+            overflow-x: auto;
+            gap: 24px;
+            scroll-snap-type: x proximity;
+        }
+
+        .pumice-sliding-pane {
+            flex: 0 0 min(600px, 100%);
+            scroll-snap-align: start;
+        }
+
+        .pumice-sliding-pane + .pumice-sliding-pane {
+            border-left: 1px solid var(--border-color);
+            padding-left: 24px;
+        }
+
         .site-logo {
             height: 24px;
             width: 24px;
@@ -492,48 +569,70 @@
     {% endif %}
 </head>
 <body>
-    <div class="layout{% if not readable_line_length %} wide{% endif %}">
-        <header>
-            <a href="{{ url_prefix }}" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
-            {% if show_search and preload_json %}
-            <div class="pumice-search">
-                <input id="pumice-search-input" type="search" placeholder="{{ t('publish_public.search_placeholder') }}" autocomplete="off">
-                <div id="pumice-search-results" class="pumice-search-results"></div>
-            </div>
-            {% endif %}
+    <div class="layout{% if not readable_line_length %} wide{% endif %}{% if show_navigation and navigation_tree %} has-nav{% endif %}">
+        {% if show_navigation and navigation_tree %}
+        <nav class="pumice-nav-sidebar">
+            <ul>
+                {% for entry in navigation_tree %}
+                {% if entry.type == "folder" -%}
+                <li class="nav-folder">
+                    <span class="pumice-nav-folder-title">{{ entry.display }}</span>
+                    <ul>
+                        {% for child in entry.children %}
+                        <li><a href="{{ child.href }}">{{ child.display }}</a></li>
+                        {% endfor %}
+                    </ul>
+                </li>
+                {%- else -%}
+                <li><a href="{{ entry.href }}">{{ entry.display }}</a></li>
+                {%- endif %}
+                {% endfor %}
+            </ul>
+        </nav>
+        {% endif %}
+        <div class="pumice-main-column">
+            <header>
+                <a href="{{ url_prefix }}" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
+                {% if show_search and preload_json %}
+                <div class="pumice-search">
+                    <input id="pumice-search-input" type="search" placeholder="{{ t('publish_public.search_placeholder') }}" autocomplete="off">
+                    <div id="pumice-search-results" class="pumice-search-results"></div>
+                </div>
+                {% endif %}
+                {% if preload_json %}
+                <button id="pumice-graph-toggle" class="pumice-graph-toggle" type="button" aria-label="{{ t('publish_public.graph_view') }}" title="{{ t('publish_public.graph_view') }}">🕸</button>
+                {% endif %}
+                <span class="vault-badge">Vault: {{ vault_id }}</span>
+            </header>
             {% if preload_json %}
-            <button id="pumice-graph-toggle" class="pumice-graph-toggle" type="button" aria-label="{{ t('publish_public.graph_view') }}" title="{{ t('publish_public.graph_view') }}">🕸</button>
-            {% endif %}
-            <span class="vault-badge">Vault: {{ vault_id }}</span>
-        </header>
-        {% if preload_json %}
-        <div id="pumice-graph-overlay" class="pumice-graph-overlay" hidden>
-            <div class="pumice-graph-panel">
-                <button id="pumice-graph-close" class="pumice-graph-close" type="button" aria-label="{{ t('common.button_close') }}">×</button>
-                <div id="pumice-graph-container"></div>
+            <div id="pumice-graph-overlay" class="pumice-graph-overlay" hidden>
+                <div class="pumice-graph-panel">
+                    <button id="pumice-graph-close" class="pumice-graph-close" type="button" aria-label="{{ t('common.button_close') }}">×</button>
+                    <div id="pumice-graph-container"></div>
+                </div>
             </div>
+            {% endif %}
+            <main class="container markdown-body">
+                {% if files is not none -%}
+                <h1>{{ site_name }}</h1>{% if files %}<ul>{% for f in files %}<li><a href="{{ file_hrefs[f] }}">{{ f }}</a></li>{% endfor %}</ul>{% else %}<p>{{ t('publish_public.empty_no_files') }}</p>{% endif %}
+                {%- elif client_rendered -%}
+                {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
+                <aside id="pumice-outline" class="pumice-sidebar"></aside>
+                <div id="pumice-note-root" data-note-path="{{ path }}"></div>
+                <aside id="pumice-backlinks" class="pumice-sidebar"></aside>
+                {%- else -%}
+                {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
+                {{ content | safe }}
+                {%- endif %}
+            </main>
+            {% if preload_json %}
+            <script>window.pumicePreload = {{ preload_json | safe }};</script>
+            <script defer src="/static/publish_render.js"></script>
+            {% endif %}
+            <footer>
+                <p>Powered by Antigravity Obsidian Publish Server | <a href="{{ url_prefix }}index.md">Index</a></p>
+            </footer>
         </div>
-        {% endif %}
-        <main class="container markdown-body">
-            {% if files is not none -%}
-            <h1>{{ site_name }}</h1>{% if files %}<ul>{% for f in files %}<li><a href="{{ file_hrefs[f] }}">{{ f }}</a></li>{% endfor %}</ul>{% else %}<p>{{ t('publish_public.empty_no_files') }}</p>{% endif %}
-            {%- elif client_rendered -%}
-            {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
-            <aside id="pumice-outline" class="pumice-sidebar"></aside>
-            <div id="pumice-note-root" data-note-path="{{ path }}"></div>
-            <aside id="pumice-backlinks" class="pumice-sidebar"></aside>
-            {%- else -%}
-            {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
-            {{ content | safe }}
-            {%- endif %}
-        </main>
-        {% if preload_json %}
-        <script>window.pumicePreload = {{ preload_json | safe }};</script>
-        <script defer src="/static/publish_render.js"></script>
-        {% endif %}
-        <footer>
-            <p>Powered by Antigravity Obsidian Publish Server | <a href="{{ url_prefix }}index.md">Index</a></p>
-        </footer>
     </div>
 </body>
 </html>

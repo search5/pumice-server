@@ -752,7 +752,9 @@ def test_note_without_enabled_plugins_is_client_rendered(repo, tmp_path):
 
     assert result["client_rendered"] is True
     assert result["path"] == "note.md"
-    assert json.loads(result["preload_json"]) == {"url_prefix": "/publish/alice/vault1/", "path": "note.md"}
+    assert json.loads(result["preload_json"]) == {
+        "url_prefix": "/publish/alice/vault1/", "path": "note.md", "sliding_window_mode": False,
+    }
     # description auto-generation still relies on server-side html_content -- unaffected.
     assert result["description"] == "Title Hello."
 
@@ -801,3 +803,50 @@ def test_root_file_listing_page_still_gets_a_preload_script_for_search(repo, tmp
 
     assert result["files"] is not None
     assert json.loads(result["preload_json"]) == {"url_prefix": "/publish/alice/vault1/", "path": None}
+
+
+# ─── navigation sidebar + sliding window (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 5) ────
+
+def test_navigation_tree_groups_nested_files_under_their_top_level_folder(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "Home.md", b"# Home\n")
+    upload(repo, tmp_path, "alice", "vault1", "Notes/A.md", b"# A\n")
+    upload(repo, tmp_path, "alice", "vault1", "Notes/B.md", b"# B\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "Home.md")
+
+    tree = {entry["display"]: entry for entry in result["navigation_tree"]}
+    assert tree["Home"]["type"] == "file"
+    assert tree["Home"]["href"] == "/publish/alice/vault1/Home.md"
+    assert tree["Notes"]["type"] == "folder"
+    assert sorted(c["display"] for c in tree["Notes"]["children"]) == ["A", "B"]
+
+
+def test_navigation_tree_respects_ordering_and_hidden_items(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "A.md", b"# A\n")
+    upload(repo, tmp_path, "alice", "vault1", "B.md", b"# B\n")
+    upload(repo, tmp_path, "alice", "vault1", "C.md", b"# C\n")
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "options.json", {
+        "navigationOrdering": ["C.md", "A.md"], "navigationHiddenItems": ["B.md"],
+    })
+
+    result = render(repo, tmp_path, "alice", "vault1", "A.md")
+
+    assert [e["display"] for e in result["navigation_tree"]] == ["C", "A"]
+
+
+def test_show_navigation_and_show_search_default_to_expected_values(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert result["show_navigation"] is False
+    assert result["show_search"] is True
+
+
+def test_note_preload_json_carries_sliding_window_mode(repo, tmp_path):
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "options.json", {"slidingWindowMode": True})
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n")
+
+    result = render(repo, tmp_path, "alice", "vault1", "note.md")
+
+    assert json.loads(result["preload_json"])["sliding_window_mode"] is True

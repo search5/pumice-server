@@ -1167,6 +1167,10 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
         "google_analytics": options["googleAnalytics"] if is_custom_domain else None,
         "url_prefix": url_prefix, "username": username, "vault_id": vault_id,
         "show_search": options["showSearch"],
+        "show_navigation": options["showNavigation"],
+        "navigation_tree": _build_navigation_tree(
+            published_files, options["navigationOrdering"], options["navigationHiddenItems"], url_prefix,
+        ),
     }
 
     # Root: show the list of published files, UNLESS an indexFile is configured and actually
@@ -1285,7 +1289,9 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
     # og:description must stay server-rendered regardless, since crawlers read <meta> tags
     # without executing JS.
     client_rendered = not enabled_plugin_ids
-    preload_json = json.dumps({"url_prefix": url_prefix, "path": path}, ensure_ascii=False) if client_rendered else None
+    preload_json = json.dumps({
+        "url_prefix": url_prefix, "path": path, "sliding_window_mode": options["slidingWindowMode"],
+    }, ensure_ascii=False) if client_rendered else None
 
     return {
         "lang": lang, "t": lambda key, **params: t(key, lang, **params),
@@ -1424,11 +1430,79 @@ _SITE_OPTIONS_DEFAULTS = {
     # factory default (only one real site was sampled), so treat this default the same way as
     # googleAnalytics's gtag snippet: a reasonable own choice, not a confirmed match.
     "showSearch": True,
+    # Navigation sidebar + sliding-window note navigation (28_실제_아키텍처_전환_Phase1_
+    # 노트본문.md's Phase 5). Field names confirmed via the same real /options/{uid} payload as
+    # showSearch (27_...md) -- that capture had showNavigation=false and slidingWindowMode=true,
+    # but that's one site's own customization, not necessarily Obsidian's factory defaults, so
+    # both default to False here (the more conservative "off unless the owner turns it on"
+    # choice -- same "reasonable own choice, not confirmed" category as showSearch's default).
+    "showNavigation": False,
+    "slidingWindowMode": False,
+    # Real Obsidian's own navigationOrdering/navigationHiddenItems only ever order/hide
+    # *top-level* vault entries (folder names and top-level filenames mixed in one flat list --
+    # confirmed via the real captured sample in 27_...md), not a full recursive tree -- see
+    # _build_navigation_tree.
+    "navigationOrdering": [],
+    "navigationHiddenItems": [],
 }
 
 def _load_site_options(data_dir: str, owner: str, vault_id: str) -> dict:
     stored = load_publish_meta(data_dir, owner, vault_id, "options.json", {})
     return {**_SITE_OPTIONS_DEFAULTS, **{k: v for k, v in stored.items() if k in _SITE_OPTIONS_DEFAULTS}}
+
+def _strip_md_suffix(name: str) -> str:
+    return name[:-3] if name.lower().endswith(".md") else name
+
+def _build_navigation_tree(published_files: list, ordering: list, hidden: list, url_prefix: str) -> list:
+    """Navigation sidebar tree (see 28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 5). Real
+    Obsidian's own navigationOrdering/navigationHiddenItems only ever contain *top-level* vault
+    entries -- folder names and top-level filenames mixed into one flat list (confirmed via the
+    real captured sample in 27_실제_퍼블리시_사이트_아키텍처_조사.md) -- so that's the only level
+    this reorders/hides too; a folder's own contents are just listed underneath it in path order,
+    since real Obsidian's confirmed data doesn't cover recursive subfolder ordering and inventing
+    one here would be guessing past the evidence.
+
+    Returns a list of {"type": "file", "display", "href"} or {"type": "folder", "display",
+    "children": [{"display", "href"}, ...]} entries, in final display order.
+    """
+    top_level = {}
+    order_seen = []
+    for f in published_files:
+        path = f["path"]
+        if "/" in path:
+            name = path.split("/", 1)[0]
+            if name not in top_level:
+                top_level[name] = {"type": "folder", "children": []}
+                order_seen.append(name)
+            top_level[name]["children"].append(path)
+        else:
+            top_level[path] = {"type": "file"}
+            order_seen.append(path)
+
+    hidden_set = set(hidden)
+    visible_names = [n for n in order_seen if n not in hidden_set]
+    ordered_names = [n for n in ordering if n in top_level and n not in hidden_set]
+    remaining_names = sorted(n for n in visible_names if n not in ordered_names)
+    final_order = ordered_names + remaining_names
+
+    entries = []
+    for name in final_order:
+        item = top_level[name]
+        if item["type"] == "file":
+            entries.append({
+                "type": "file", "display": _strip_md_suffix(name),
+                "href": f"{url_prefix}{quote(name, safe='/')}",
+            })
+        else:
+            children = [
+                {
+                    "display": _strip_md_suffix(child_path[len(name) + 1:]),
+                    "href": f"{url_prefix}{quote(child_path, safe='/')}",
+                }
+                for child_path in sorted(item["children"])
+            ]
+            entries.append({"type": "folder", "display": name, "children": children})
+    return entries
 
 @view_config(route_name='publish_options', renderer='json', permission='vault-access')
 def publish_options_view(request):

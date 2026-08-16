@@ -48,10 +48,18 @@ test("renderMarkdown renders bold, italic and inline code without cross-contamin
   assert.equal(html, "<p><strong>bold</strong> and <em>italic</em> and <code>code</code></p>");
 });
 
-test("renderMarkdown resolves a wikilink to a permalink from the cache", () => {
+test("renderMarkdown resolves a wikilink to a permalink from the cache, tagging its resolved note path", () => {
   const cache = { "Target": { permalink: "/nice-url/" } };
   const html = renderer.renderMarkdown("See [[Target|Custom Label]].\n", cache, "/publish/alice/vault1/");
-  assert.equal(html, '<p>See <a href="/publish/alice/vault1/nice-url/" class="wiki-link">Custom Label</a>.</p>');
+  assert.equal(
+    html,
+    '<p>See <a href="/publish/alice/vault1/nice-url/" class="wiki-link" data-note-path="Target">Custom Label</a>.</p>'
+  );
+});
+
+test("renderMarkdown omits data-note-path for a wikilink that doesn't resolve to a known cache entry", () => {
+  const html = renderer.renderMarkdown("See [[Nowhere]].\n", {}, "/publish/alice/vault1/");
+  assert.doesNotMatch(html, /data-note-path/);
 });
 
 test("renderMarkdown renders a fenced code block verbatim, without inline formatting applied", () => {
@@ -279,4 +287,32 @@ test("renderGraphSvg resolves node hrefs through the cache's permalinks", () => 
   const cache = { "A.md": { permalink: "/nice/" } };
   const svg = renderer.renderGraphSvg(graph, positions, cache, "/publish/alice/vault1/", null, 50, 50);
   assert.match(svg, /href="\/publish\/alice\/vault1\/nice\/"/);
+});
+
+// ─── Phase 5: navigation sidebar + sliding window (28_실제_아키텍처_전환_Phase1_노트본문.md's follow-up) ──
+
+test("resolveNoteTargetPath finds a cache entry matching the literal or .md-suffixed target", () => {
+  const cache = { "Note.md": { searchText: "" } };
+  assert.equal(renderer.resolveNoteTargetPath("Note", cache), "Note.md");
+  assert.equal(renderer.resolveNoteTargetPath("Note.md", cache), "Note.md");
+});
+
+test("resolveNoteTargetPath returns null for an unresolved target or a null cache entry", () => {
+  const cache = { "Note.md": { searchText: "" }, "publish.js": null };
+  assert.equal(renderer.resolveNoteTargetPath("Missing", cache), null);
+  assert.equal(renderer.resolveNoteTargetPath("publish.js", cache), null);
+});
+
+test("renderNotePaneHtml renders a pane's title and body from raw markdown", () => {
+  const cache = { "Note.md": {} };
+  const html = renderer.renderNotePaneHtml("Note.md", cache, "# Note\n\nHello.\n", "/publish/alice/vault1/");
+  assert.equal(html, '<h1 class="note-title">Note</h1><h1 id="note">Note</h1>\n<p>Hello.</p>');
+});
+
+test("renderNotePaneHtml strips frontmatter using the cache entry's frontmatterPos", () => {
+  const raw = "---\ntitle: x\n---\nBody.\n";
+  const cache = { "Note.md": { frontmatterPos: [0, 0, 0, 2, 3, 16] } };
+  const html = renderer.renderNotePaneHtml("Note.md", cache, raw, "/publish/alice/vault1/");
+  assert.doesNotMatch(html, /title: x/);
+  assert.match(html, /Body\./);
 });

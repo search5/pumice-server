@@ -43,7 +43,8 @@ class FakeRequest:
 DEFAULTS = {
     "siteName": "", "indexFile": "", "logo": "", "noindex": False, "hideTitle": False,
     "readableLineLength": True, "strictLineBreaks": False, "googleAnalytics": "",
-    "showSearch": True,
+    "showSearch": True, "showNavigation": False, "slidingWindowMode": False,
+    "navigationOrdering": [], "navigationHiddenItems": [],
 }
 
 
@@ -99,3 +100,19 @@ def test_options_are_scoped_by_owner_and_vault(repo, tmp_path):
 
     assert bob_result["options"]["siteName"] == ""
     assert other_vault_result["options"]["siteName"] == ""
+
+
+# ─── navigation sidebar + sliding window (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 5) ────
+
+def test_saving_navigation_ordering_and_hidden_items_round_trips_as_lists(repo, tmp_path):
+    web.publish_options_view(FakeRequest(repo, tmp_path, "alice", "vault1", json_body={"options": {
+        "showNavigation": True, "slidingWindowMode": True,
+        "navigationOrdering": ["Notes", "Home.md"], "navigationHiddenItems": ["Archive"],
+    }}))
+
+    result = web.publish_options_view(FakeRequest(repo, tmp_path, "alice", "vault1", json_body={}))
+
+    assert result["options"]["showNavigation"] is True
+    assert result["options"]["slidingWindowMode"] is True
+    assert result["options"]["navigationOrdering"] == ["Notes", "Home.md"]
+    assert result["options"]["navigationHiddenItems"] == ["Archive"]

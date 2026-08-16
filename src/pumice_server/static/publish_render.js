@@ -60,6 +60,22 @@
     return urlPrefix + encodePath(urlTarget);
   }
 
+  /** Finds the actual cache key a wikilink `target` resolves to (if any) -- unlike
+   * resolveWikilinkHref, which always returns *some* href even for an unresolved target (falling
+   * back to a best-guess literal path), this returns null when there's no real cache entry to
+   * point at. Used to tag rendered wikilinks with the note's real vault path (see
+   * renderInline's `data-note-path`) for sliding-window mode (Phase 5,
+   * 28_실제_아키텍처_전환_Phase1_노트본문.md's follow-up) to fetch/render without having to
+   * reverse-engineer a path back out of a pretty permalink URL. */
+  function resolveNoteTargetPath(target, cache) {
+    if (!cache) return null;
+    var keys = Object.keys(cache);
+    for (var i = 0; i < keys.length; i++) {
+      if (cache[keys[i]] && linkTargetMatchesPath(target, keys[i])) return keys[i];
+    }
+    return null;
+  }
+
   /** Turns heading text into an anchor-safe id, deduplicated the same way python-markdown's
    * `toc` extension (used server-side for plugin-enabled vaults) already does: a repeated
    * heading text gets `-1`, `-2`, ... appended. `renderMarkdown` and `buildOutline` each create
@@ -340,7 +356,9 @@
       target = target.trim();
       var label = alias ? alias.trim() : target;
       var href = resolveWikilinkHref(target, cache, urlPrefix);
-      return '<a href="' + escapeAttr(href) + '" class="wiki-link">' + escapeHtml(label) + "</a>";
+      var notePath = resolveNoteTargetPath(target, cache);
+      var pathAttr = notePath ? ' data-note-path="' + escapeAttr(notePath) + '"' : "";
+      return '<a href="' + escapeAttr(href) + '" class="wiki-link"' + pathAttr + '>' + escapeHtml(label) + "</a>";
     });
 
     // 4. Standard markdown links: [text](url).
@@ -537,6 +555,48 @@
     });
   }
 
+  /** A sliding-window pane's inner HTML (Phase 5, 28_실제_아키텍처_전환_Phase1_노트본문.md's
+   * follow-up) -- title + rendered body, the same shape the initial note page itself uses. A
+   * deliberate scope cut from real Obsidian's own sliding panes: only the note body is
+   * duplicated per pane, not outline/backlinks/graph (those stay scoped to the original page's
+   * note, not to whichever pane happens to be scrolled into view). */
+  function renderNotePaneHtml(path, cache, rawMd, urlPrefix) {
+    var entry = cache[path];
+    var body = stripFrontmatter(rawMd, entry);
+    var title = titleFromPath(path);
+    return '<h1 class="note-title">' + escapeHtml(title) + "</h1>" + renderMarkdown(body, cache, urlPrefix);
+  }
+
+  /** Wires sliding-window navigation (real Obsidian's slidingWindowMode: clicking a note link
+   * opens the target as a new pane sliding in from the right instead of a full page navigation,
+   * building up a horizontally-scrollable trail). Only intercepts clicks on wikilinks the
+   * renderer itself already tagged with a resolved `data-note-path` (see renderInline) -- plain
+   * markdown-style links to arbitrary/external URLs are left to navigate normally.
+   *
+   * Known scope cut vs real Obsidian: browser back/forward doesn't reconstruct the pane trail --
+   * each pane open does `history.pushState` so the URL bar/reload/share-link always reflects the
+   * most recently opened note, but going back just lands on a normal full page load of whatever
+   * was pushed before it, not a live removal of the last pane. Full history reconciliation would
+   * need meaningfully more state tracking for a UX difference that's easy to live without. */
+  function wireSlidingWindow(trackEl, cache, urlPrefix) {
+    trackEl.addEventListener("click", function (e) {
+      var a = e.target.closest ? e.target.closest("a.wiki-link[data-note-path]") : null;
+      if (!a || !trackEl.contains(a)) return;
+      e.preventDefault();
+      var path = a.getAttribute("data-note-path");
+      var href = a.getAttribute("href");
+
+      fetch(urlPrefix + "_raw/" + encodePath(path)).then(function (r) { return r.text(); }).then(function (rawMd) {
+        var pane = document.createElement("div");
+        pane.className = "pumice-sliding-pane";
+        pane.innerHTML = renderNotePaneHtml(path, cache, rawMd, urlPrefix);
+        trackEl.appendChild(pane);
+        pane.scrollIntoView({ behavior: "smooth", inline: "start" });
+        history.pushState({}, "", href);
+      });
+    });
+  }
+
   async function main() {
     var preload = window.pumicePreload;
     if (!preload) return;
@@ -552,7 +612,20 @@
 
         var entry = cache[preload.path];
         var body = stripFrontmatter(rawMd, entry);
-        root.innerHTML = renderMarkdown(body, cache, preload.url_prefix);
+
+        if (preload.sliding_window_mode) {
+          var trackEl = document.createElement("div");
+          trackEl.className = "pumice-sliding-track";
+          var firstPane = document.createElement("div");
+          firstPane.className = "pumice-sliding-pane";
+          firstPane.innerHTML = renderMarkdown(body, cache, preload.url_prefix);
+          trackEl.appendChild(firstPane);
+          root.innerHTML = "";
+          root.appendChild(trackEl);
+          wireSlidingWindow(trackEl, cache, preload.url_prefix);
+        } else {
+          root.innerHTML = renderMarkdown(body, cache, preload.url_prefix);
+        }
 
         var outlineEl = document.getElementById("pumice-outline");
         if (outlineEl) {
@@ -618,6 +691,8 @@
     buildGraph: buildGraph,
     layoutGraph: layoutGraph,
     renderGraphSvg: renderGraphSvg,
+    resolveNoteTargetPath: resolveNoteTargetPath,
+    renderNotePaneHtml: renderNotePaneHtml,
   };
 
   if (typeof module !== "undefined" && module.exports) {
