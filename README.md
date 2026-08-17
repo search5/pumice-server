@@ -172,7 +172,9 @@ renders accordingly rather than hardcoding a language.
   email, accept via invite code), version history REST mirrors, user accounts, device management,
   and the admin dashboard.
 - `/publish/{username}/{vault}/...` — the actual published site, rendering markdown on the fly
-  (wikilinks resolved, YAML frontmatter stripped).
+  (wikilinks resolved, YAML frontmatter stripped). A `publish.css` at the vault root is
+  auto-loaded on every page, same as real Obsidian Publish — see
+  [`docs/PUBLISH_CSS.md`](docs/PUBLISH_CSS.md) for the overridable variables/classes.
 - `/mcp` — an MCP (Model Context Protocol) server over Streamable HTTP, giving AI clients
   read/write access to a synced vault (see "MCP" below).
 
