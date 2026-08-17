@@ -35,6 +35,40 @@ URL에서 `publish.js`가 로드됩니다. 커스텀 호스트네임으로 직�
 `defer`는 다운로드는 나머지 페이지와 병렬로 하되, 실행은 문서 순서대로, 파싱이 끝난 후
 `DOMContentLoaded`가 발생하기 전에 한다는 뜻입니다.
 
+## 할 수 있는 것
+
+그냥 평범한 `<script>`고(콘텐츠 준비를 기다려야 하는 건 아래 참고), 페이지 전체 DOM에
+아무 제약 없이 접근합니다 — 샌드박스 같은 거 없습니다. 구체적으로:
+
+- **DOM 전체, 제약 없음.** `PUBLISH_CSS.md`의 클래스/ID 레퍼런스에 나온 것들 전부 스타일만
+  바꾸는 게 아니라 읽고 고쳐 쓸 수 있습니다 — 배너나 푸터 문구 삽입(예시 파일이 이걸 함),
+  모든 `<pre>`에 "복사" 버튼 추가, `.wiki-link` href 재작성, `.note-title` 옆에 예상 읽기
+  시간 표시, `.container` 뒤에 댓글 위젯(giscus, utterances 등) 임베드 등.
+- **`window.pumicePreload`** — `{ url_prefix, path, sliding_window_mode }`, pumice 자체
+  렌더러가 쓰는 것과 같은 preload 데이터(`publish_render.ts`의 `interface PumicePreload`).
+  스크립트가 어느 노트에서 실행 중인지에 따라 분기하거나, 사이트 자체 url_prefix와 일치하는
+  절대경로 href를 만들 때 씁니다(커스텀 도메인에서는 이게 상대경로가 아니라 전체
+  origin이라 중요).
+- **`window.PumicePublishRenderer`** — pumice 내부 함수들을 클로저에 숨기지 않고 일부러
+  노출해둔 것(`publish_render.ts` 맨 아래 `api` 객체 참고): `renderMarkdown`,
+  `buildGraph`/`buildLocalGraph`, `searchNotes`/`mergeSearchResults`, `buildOutline`,
+  `buildBacklinks`, `resolveWikilinkHref`, `cssColorToPixiHex` 등. 위키링크 해석이나 검색
+  매칭 로직을 직접 다시 구현하지 말고 이걸 재사용하세요 — 예를 들어 다르게 필터링된 두
+  번째 검색창이나, `buildGraph`의 엣지 목록으로 만든 "관련 노트" 위젯 같은 것.
+- **표준 브라우저 API 전부** — `fetch`로 자기 백엔드나 제3자 임베드 호출, 읽기 진행률
+  바용 `IntersectionObserver`, 그래프 캔버스용 `ResizeObserver`, 추가 웹폰트 로딩, 서비스
+  워커 등록 등. 다른 평범한 페이지와 동일합니다.
+
+**설계상 한계**: 클라이언트 사이드에서만 동작하고 서버가 이미 렌더링해서 보낸 페이지 위에서
+실행되는 거라, 마크다운이 어떻게 파싱되는지나 어떤 파일이 퍼블리시되는지는 바꿀 수 없습니다.
+DOM과 위 두 전역 객체 말고는 별도 플러그인 훅/이벤트 시스템이 없어서, pumice 자체의
+비동기 작업(노트 콘텐츠, 검색 결과, 그래프 렌더링)에 반응해야 하는 건 전용 이벤트를
+기다리는 대신 DOM을 직접 관찰(폴링, `MutationObserver`)해야 합니다. 그리고 페이지 전체에
+접근 가능한 임의 스크립트라, 어떤 볼트의 `publish.css`/`publish.js`를 설정할 수 있는 사람은
+그 볼트의 퍼블리시된 페이지에 XSS를 건 것과 실질적으로 같은 힘을 갖습니다 — 이건 이
+구현만의 허점이 아니라 실제 옵시디언 퍼블리시 자체가 쓰는 신뢰 모델 그대로입니다(볼트
+소유자만, 위의 커스텀 도메인 체크로 게이트).
+
 ## 타이밍: "노트 콘텐츠 준비 완료" 이벤트는 없습니다
 
 pumice 자체 노트 렌더링(`publish_render.js`)도 `DOMContentLoaded`에서 시작하고, 그 다음

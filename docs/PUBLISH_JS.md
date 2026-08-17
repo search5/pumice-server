@@ -35,6 +35,43 @@ always `None` and nothing loads it.
 `defer` means it downloads in parallel with the rest of the page but executes in document order,
 after parsing finishes and before `DOMContentLoaded` fires.
 
+## What you get access to
+
+It's a plain `<script>` with the full page already in the DOM (once you've waited for it, see
+below) — nothing is sandboxed. Concretely:
+
+- **The whole DOM, unrestricted.** Everything documented in `PUBLISH_CSS.md`'s class/ID
+  reference is fair game to read or rewrite, not just restyle: inject a banner or footer note
+  (the example does this), add a "copy" button to every `<pre>`, rewrite `.wiki-link` hrefs,
+  add a reading-time estimate next to `.note-title`, embed a comment widget (giscus, utterances,
+  ...) after `.container`, ...
+- **`window.pumicePreload`** — `{ url_prefix, path, sliding_window_mode }`, the same preload
+  data pumice's own renderer uses (`interface PumicePreload` in `publish_render.ts`). Lets your
+  script branch on which note it's running on, or build absolute hrefs consistent with the
+  site's own url_prefix (matters on a custom domain, where it's a full origin, not a relative
+  path).
+- **`window.PumicePublishRenderer`** — pumice's own internal functions, exported deliberately
+  (see the `api` object at the bottom of `publish_render.ts`) rather than hidden in a closure:
+  `renderMarkdown`, `buildGraph`/`buildLocalGraph`, `searchNotes`/`mergeSearchResults`,
+  `buildOutline`, `buildBacklinks`, `resolveWikilinkHref`, `cssColorToPixiHex`, and more. Reuse
+  these instead of reimplementing wikilink resolution or search matching yourself — e.g. a
+  second, differently-filtered search box, or a small "related notes" widget built from
+  `buildGraph`'s own edge list.
+- **Any standard browser API** — `fetch` to call your own backend or a third-party embed,
+  `IntersectionObserver` for a reading-progress bar, a `ResizeObserver` on the graph canvas,
+  loading additional web fonts, registering a service worker, etc. Same as any other page.
+
+**Scope limits, by design**: it's client-side only, runs after the server has already rendered
+and shipped the page — it can't change how markdown gets parsed or which files get published.
+There's no plugin-hook/event system beyond the DOM and the two globals above, so anything that
+needs to react to pumice's own async work (note content, search results, graph render) has to
+observe the DOM directly (poll, `MutationObserver`) rather than listen for a dedicated event.
+And since it's arbitrary script with full page access, whoever can set `publish.css`/
+`publish.js` for a vault has the same practical power as someone doing an XSS on that vault's
+published pages — which is exactly the trust model real Obsidian Publish itself uses (only the
+vault owner, gated the same way via the custom-domain check above), not a gap specific to this
+implementation.
+
 ## Timing: there's no "note content ready" event
 
 pumice's own note rendering (`publish_render.js`) also runs on `DOMContentLoaded`, then does
