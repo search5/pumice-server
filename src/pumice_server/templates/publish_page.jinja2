@@ -217,21 +217,125 @@
             min-width: 0;
         }
 
-        /* Outline/TOC sidebar (37_실제_아키텍처_전환_TOC_재설계.md) -- redesigned from an inline
-           block above the note body into its own positioned column after live-browser
-           verification against real Obsidian Publish sites confirmed the real one sits outside
-           the note's document flow (there: position: fixed or absolute depending on the site's
-           layout mode). `position: sticky` reuses this file's own existing pattern
-           (.pumice-nav-sidebar, Phase 5) for the same "stays in view while the note scrolls"
-           effect, rather than adopting real Obsidian's fixed/absolute + separately-scrolling
-           note body, which would mean rearchitecting this page's whole scroll model for a change
-           invisible to a reader either way. */
-        .pumice-outline-sidebar {
+        /* Right-hand column wrapper (40_그래프_뷰_실제_UI_형태.md) -- holds the graph mini-view and
+           the outline sidebar stacked vertically, graph above outline, exactly like real
+           Obsidian's own `.site-body-right-column-inner` (confirmed live: "INTERACTIVE GRAPH"
+           sits directly above "ON THIS PAGE" in the same column on lab.marconoris.com/now). The
+           sticky/flex-basis/scroll properties that used to live directly on
+           .pumice-outline-sidebar (37_...md) moved here, since now there can be two stacked
+           children instead of one. */
+        .pumice-right-column {
             flex: 0 0 240px;
             position: sticky;
             top: 24px;
             max-height: calc(100vh - 48px);
             overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        /* Graph mini-view -- real Obsidian Publish's own graph is NOT hidden behind a toggle
+           button; it's a small, always-visible box in the sidebar (confirmed live: 290x250px on
+           lab.marconoris.com/now, reading window.app.graph directly) with an expand icon and a
+           local/global scope icon. Replaces the earlier click-to-open dark-modal design
+           (38_실제_아키텍처_전환_검색_그래프_실제화.md) entirely -- see 40_그래프_뷰_실제_UI_형태.md. */
+        .pumice-graph-mini {
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            background: rgba(22, 27, 34, 0.4);
+            overflow: hidden;
+            flex: 0 0 auto;
+        }
+
+        .pumice-graph-mini-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+        }
+
+        .pumice-graph-mini-icons {
+            display: flex;
+            gap: 4px;
+        }
+
+        .pumice-graph-icon-button {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 13px;
+            line-height: 1;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+
+        .pumice-graph-icon-button:hover {
+            color: var(--text-primary);
+            background: rgba(138, 180, 248, 0.1);
+        }
+
+        #pumice-graph-mini-canvas {
+            width: 100%;
+            height: 220px;
+        }
+
+        #pumice-graph-mini-canvas canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        /* Expanded state -- takes over the whole viewport outright, no dimmed backdrop over
+           existing content (confirmed live: real Obsidian's `.mod-expanded` state replaces the
+           page, it isn't a modal on top of it). Own simplification vs real Obsidian: covers the
+           entire viewport rather than leaving a persistent app-chrome sidebar visible, since this
+           page doesn't have an equivalent persistent chrome region to preserve. */
+        .pumice-graph-fullpage {
+            position: fixed;
+            inset: 0;
+            z-index: 100;
+            background: var(--bg-color);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .pumice-graph-fullpage[hidden] {
+            display: none;
+        }
+
+        .pumice-graph-fullpage-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 24px;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            flex: 0 0 auto;
+        }
+
+        #pumice-graph-fullpage-canvas {
+            flex: 1;
+            min-height: 0;
+        }
+
+        #pumice-graph-fullpage-canvas canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        .pumice-outline-sidebar {
             font-size: 13px;
         }
 
@@ -420,56 +524,12 @@
             background: rgba(138, 180, 248, 0.1);
         }
 
-        .pumice-graph-overlay {
-            position: fixed;
-            inset: 0;
-            z-index: 100;
-            background: rgba(13, 17, 23, 0.85);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .pumice-graph-overlay[hidden] {
-            display: none;
-        }
-
-        .pumice-graph-panel {
-            position: relative;
-            background: var(--container-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 20px;
-            width: min(90vw, 700px);
-            height: min(90vh, 700px);
-        }
-
-        .pumice-graph-close {
-            position: absolute;
-            top: 12px;
-            right: 12px;
-            background: none;
-            border: none;
-            color: var(--text-primary);
-            font-size: 22px;
-            cursor: pointer;
-            line-height: 1;
-        }
-
-        /* Graph rendering moved from inline SVG to PixiJS/WebGL canvas (38_실제_아키텍처_전환_
-           검색_그래프_실제화.md) -- real Obsidian's own graph is WebGL-rendered too (confirmed by
-           reading app.js). static/publish_render.js's renderGraphPixi reads --border-color/
-           --wiki-link/--accent-blue/--text-muted directly (via cssColorToPixiHex) to stay theme-
-           aware, so no CSS color rules are needed here for the graph itself -- just canvas sizing. */
-        #pumice-graph-container {
-            width: 100%;
-            height: 100%;
-        }
-
-        #pumice-graph-container canvas {
-            width: 100%;
-            height: 100%;
-        }
+        /* Graph rendering itself: PixiJS/WebGL canvas (38_실제_아키텍처_전환_검색_그래프_실제화.md)
+           -- real Obsidian's own graph is WebGL-rendered too (confirmed by reading app.js).
+           static/publish_render.js's renderGraphPixi reads --border-color/--wiki-link/
+           --accent-blue/--text-muted directly (via cssColorToPixiHex) to stay theme-aware, so no
+           CSS color rules are needed here -- just canvas sizing (see .pumice-graph-mini/
+           .pumice-graph-fullpage above, near .pumice-right-column). */
 
         .vault-badge {
             background: rgba(138, 180, 248, 0.1);
@@ -698,7 +758,7 @@
                 flex-direction: column;
             }
             .pumice-nav-sidebar,
-            .pumice-outline-sidebar {
+            .pumice-right-column {
                 position: static;
                 max-height: none;
                 width: 100%;
@@ -763,9 +823,6 @@
                     <div id="pumice-search-results" class="pumice-search-results"></div>
                 </div>
                 {% endif %}
-                {% if preload_json %}
-                <button id="pumice-graph-toggle" class="pumice-icon-button" type="button" aria-label="{{ t('publish_public.graph_view') }}" title="{{ t('publish_public.graph_view') }}">🕸</button>
-                {% endif %}
                 {% if show_theme_toggle %}
                 <button id="pumice-theme-toggle" class="pumice-icon-button" type="button" aria-label="{{ t('publish_public.theme_toggle') }}" title="{{ t('publish_public.theme_toggle') }}">🌓</button>
                 <script>
@@ -790,11 +847,12 @@
                 <span class="vault-badge">Vault: {{ vault_id }}</span>
             </header>
             {% if preload_json %}
-            <div id="pumice-graph-overlay" class="pumice-graph-overlay" hidden>
-                <div class="pumice-graph-panel">
-                    <button id="pumice-graph-close" class="pumice-graph-close" type="button" aria-label="{{ t('common.button_close') }}">×</button>
-                    <div id="pumice-graph-container"></div>
+            <div id="pumice-graph-fullpage" class="pumice-graph-fullpage" hidden>
+                <div class="pumice-graph-fullpage-header">
+                    <span>{{ t('publish_public.graph_view') }}</span>
+                    <button id="pumice-graph-collapse" class="pumice-graph-icon-button" type="button" aria-label="{{ t('common.button_close') }}" title="{{ t('common.button_close') }}">✕</button>
                 </div>
+                <div id="pumice-graph-fullpage-canvas"></div>
             </div>
             {% endif %}
             <main class="container markdown-body">
@@ -825,7 +883,21 @@
             </footer>
         </div>
         {% if client_rendered %}
-        <aside id="pumice-outline" class="pumice-outline-sidebar"></aside>
+        <div class="pumice-right-column">
+            {% if preload_json %}
+            <div class="pumice-graph-mini">
+                <div class="pumice-graph-mini-header">
+                    <span>{{ t('publish_public.graph_view') }}</span>
+                    <span class="pumice-graph-mini-icons">
+                        <button id="pumice-graph-scope-toggle" class="pumice-graph-icon-button" type="button" aria-label="{{ t('publish_public.graph_toggle_scope') }}" title="{{ t('publish_public.graph_toggle_scope') }}">⑂</button>
+                        <button id="pumice-graph-expand" class="pumice-graph-icon-button" type="button" aria-label="{{ t('publish_public.graph_expand') }}" title="{{ t('publish_public.graph_expand') }}">⤢</button>
+                    </span>
+                </div>
+                <div id="pumice-graph-mini-canvas"></div>
+            </div>
+            {% endif %}
+            <aside id="pumice-outline" class="pumice-outline-sidebar"></aside>
+        </div>
         {% endif %}
     </div>
 </body>

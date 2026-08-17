@@ -493,6 +493,12 @@ msgstr "Search..."
 msgid "publish_public.graph_view"
 msgstr "Graph view"
 
+msgid "publish_public.graph_toggle_scope"
+msgstr "Toggle local/global graph"
+
+msgid "publish_public.graph_expand"
+msgstr "Expand graph"
+
 msgid "publish_public.theme_toggle"
 msgstr "Toggle theme"
 

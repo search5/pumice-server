@@ -487,6 +487,12 @@ msgstr "검색..."
 msgid "publish_public.graph_view"
 msgstr "그래프 보기"
 
+msgid "publish_public.graph_toggle_scope"
+msgstr "로컬/전체 그래프 전환"
+
+msgid "publish_public.graph_expand"
+msgstr "그래프 확대"
+
 msgid "publish_public.theme_toggle"
 msgstr "테마 전환"
 

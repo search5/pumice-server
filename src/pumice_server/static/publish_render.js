@@ -369,6 +369,30 @@
         });
         return { nodes: nodes, edges: edges };
     }
+    /** Local graph (40_그래프_뷰_실제_UI_형태.md, pumice repo's follow-up to 38_...md) -- real
+     * Obsidian Publish's own graph defaults to a "local graph" (just the current note and its
+     * direct neighbors), with a separate toggle to switch to the full vault ("global") graph --
+     * confirmed live by reading `window.app.graph.global` (a boolean) on lab.marconoris.com/now and
+     * watching the rendered node count change when toggling it. The exact neighbor depth real
+     * Obsidian's Publish local graph uses wasn't confirmable (no `depth` property was exposed on
+     * the live `graph` object to read) -- depth 1 (the current note plus anything directly linked
+     * to or from it, including edges between those neighbors themselves) is this project's own
+     * reasonable default for "local", not a confirmed exact match. */
+    function buildLocalGraph(graph, currentPath) {
+        if (!currentPath)
+            return graph;
+        var included = {};
+        included[currentPath] = true;
+        graph.edges.forEach(function (edge) {
+            if (edge.source === currentPath)
+                included[edge.target] = true;
+            if (edge.target === currentPath)
+                included[edge.source] = true;
+        });
+        var nodes = graph.nodes.filter(function (n) { return included[n.path]; });
+        var edges = graph.edges.filter(function (e) { return included[e.source] && included[e.target]; });
+        return { nodes: nodes, edges: edges };
+    }
     var GRAPH_DEFAULT_ITERATIONS = 200;
     /** WASM-accelerated many-body repulsion (39_그래프_뷰_WASM_Barnes-Hut.md, pumice repo's
      * follow-up to 38_...md) -- compiled from wasm/graph_forces.rs (own from-scratch Barnes-Hut
@@ -810,36 +834,48 @@
             }, SEARCH_DEBOUNCE_MS);
         });
     }
-    /** Wires the graph-view toggle button/overlay -- the layout is computed lazily on first open
-     * (force-directed layout over a whole vault isn't free, no reason to pay for it on every page
-     * load if the visitor never opens the graph) and cached for subsequent opens.
+    /** Wires the graph view -- matches real Obsidian Publish's own UI shape exactly (confirmed live
+     * on lab.marconoris.com/now, `window.app.graph`), not the earlier click-to-open dark-modal
+     * design: a small graph is *always visible* in the sidebar (not hidden behind a toggle button),
+     * with two icons -- one expands it to take over the page, the other switches between the
+     * default "local" graph (buildLocalGraph -- current note + direct neighbors) and the full-vault
+     * "global" graph (confirmed live: `window.app.graph.global` toggles exactly this, node count
+     * visibly changes). Expanding replaces the whole viewport outright, not a dimmed overlay over
+     * dimmed content -- also confirmed live (`.graph-view-container.mod-expanded` takes over, no
+     * backdrop).
      *
      * Physics runs in static/graph_worker.js (a real Web Worker, see layoutGraph's own doc comment)
-     * rather than on this thread, so opening the graph doesn't freeze the page while it settles --
-     * the overlay opens immediately and the canvas fills in once the worker posts back positions. */
-    function wireGraph(toggleEl, closeEl, overlayEl, containerEl, cache, urlPrefix, currentPath) {
-        var rendered = false;
-        toggleEl.addEventListener("click", function () {
-            if (!rendered) {
-                rendered = true;
-                var graph = buildGraph(cache);
-                var rect = containerEl.getBoundingClientRect();
-                var size = Math.max(200, Math.min(rect.width || 600, rect.height || 600));
-                var worker = new Worker("/static/graph_worker.js");
-                worker.onmessage = function (e) {
-                    renderGraphPixi(containerEl, graph, e.data, cache, urlPrefix, currentPath, size, size);
-                    worker.terminate();
-                };
-                worker.postMessage({ graph: graph, opts: { width: size, height: size } });
-            }
-            overlayEl.hidden = false;
+     * rather than on this thread, so re-rendering after a scope/size change doesn't freeze the
+     * page. */
+    function wireGraph(miniCanvasEl, fullpageEl, fullpageCanvasEl, scopeToggleEl, expandEl, collapseEl, cache, urlPrefix, currentPath) {
+        var fullGraph = buildGraph(cache);
+        var isGlobal = false;
+        var isExpanded = false;
+        function renderInto(containerEl) {
+            var graph = isGlobal ? fullGraph : buildLocalGraph(fullGraph, currentPath);
+            var rect = containerEl.getBoundingClientRect();
+            var width = Math.max(120, rect.width || 240);
+            var height = Math.max(120, rect.height || 240);
+            var worker = new Worker("/static/graph_worker.js");
+            worker.onmessage = function (e) {
+                renderGraphPixi(containerEl, graph, e.data, cache, urlPrefix, currentPath, width, height);
+                worker.terminate();
+            };
+            worker.postMessage({ graph: graph, opts: { width: width, height: height } });
+        }
+        renderInto(miniCanvasEl);
+        scopeToggleEl.addEventListener("click", function () {
+            isGlobal = !isGlobal;
+            renderInto(isExpanded ? fullpageCanvasEl : miniCanvasEl);
         });
-        closeEl.addEventListener("click", function () {
-            overlayEl.hidden = true;
+        expandEl.addEventListener("click", function () {
+            isExpanded = true;
+            fullpageEl.hidden = false;
+            renderInto(fullpageCanvasEl);
         });
-        overlayEl.addEventListener("click", function (e) {
-            if (e.target === overlayEl)
-                overlayEl.hidden = true;
+        collapseEl.addEventListener("click", function () {
+            isExpanded = false;
+            fullpageEl.hidden = true;
         });
     }
     /** A sliding-window pane's inner HTML (Phase 5, 28_실제_아키텍처_전환_Phase1_노트본문.md's
@@ -941,13 +977,15 @@
                 // succeeded (or where there's no note body at all, on the file-listing page).
             }
         }
-        var graphToggleEl = document.getElementById("pumice-graph-toggle");
-        var graphOverlayEl = document.getElementById("pumice-graph-overlay");
-        var graphCloseEl = document.getElementById("pumice-graph-close");
-        var graphContainerEl = document.getElementById("pumice-graph-container");
-        if (graphToggleEl && graphOverlayEl && graphCloseEl && graphContainerEl) {
+        var graphMiniCanvasEl = document.getElementById("pumice-graph-mini-canvas");
+        var graphFullpageEl = document.getElementById("pumice-graph-fullpage");
+        var graphFullpageCanvasEl = document.getElementById("pumice-graph-fullpage-canvas");
+        var graphScopeToggleEl = document.getElementById("pumice-graph-scope-toggle");
+        var graphExpandEl = document.getElementById("pumice-graph-expand");
+        var graphCollapseEl = document.getElementById("pumice-graph-collapse");
+        if (graphMiniCanvasEl && graphFullpageEl && graphFullpageCanvasEl && graphScopeToggleEl && graphExpandEl && graphCollapseEl) {
             try {
-                wireGraph(graphToggleEl, graphCloseEl, graphOverlayEl, graphContainerEl, await cachePromise, preload.url_prefix, preload.path);
+                wireGraph(graphMiniCanvasEl, graphFullpageEl, graphFullpageCanvasEl, graphScopeToggleEl, graphExpandEl, graphCollapseEl, await cachePromise, preload.url_prefix, preload.path);
             }
             catch (e) {
                 // Same progressive-enhancement reasoning as search above.
@@ -970,6 +1008,7 @@
         searchNotes: searchNotes,
         mergeSearchResults: mergeSearchResults,
         buildGraph: buildGraph,
+        buildLocalGraph: buildLocalGraph,
         layoutGraph: layoutGraph,
         manyBodyForcesWasm: manyBodyForcesWasm,
         isGraphForcesWasmLoaded: function () { return !!graphForcesWasm; },

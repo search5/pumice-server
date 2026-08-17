@@ -355,6 +355,44 @@ test("buildGraph collapses a link that appears twice (or in both directions) int
   assert.equal(graph.edges.length, 1);
 });
 
+// ─── local graph (40_그래프_뷰_실제_UI_형태.md) -- real Obsidian Publish's own graph defaults to
+// showing just the current note + its direct neighbors, confirmed live via
+// window.app.graph.global on lab.marconoris.com/now ─────────────────────────────────────────────
+
+test("buildLocalGraph keeps only the current note and its direct neighbors", () => {
+  const graph = {
+    nodes: [{ path: "A.md" }, { path: "B.md" }, { path: "C.md" }, { path: "D.md" }],
+    edges: [{ source: "A.md", target: "B.md" }, { source: "C.md", target: "D.md" }],
+  };
+  const local = renderer.buildLocalGraph(graph, "A.md");
+  assert.deepEqual(local.nodes.map((n) => n.path).sort(), ["A.md", "B.md"]);
+  assert.deepEqual(local.edges, [{ source: "A.md", target: "B.md" }]);
+});
+
+test("buildLocalGraph includes neighbors reached via an incoming link too, not just outgoing", () => {
+  const graph = {
+    nodes: [{ path: "A.md" }, { path: "B.md" }],
+    edges: [{ source: "B.md", target: "A.md" }],
+  };
+  const local = renderer.buildLocalGraph(graph, "A.md");
+  assert.deepEqual(local.nodes.map((n) => n.path).sort(), ["A.md", "B.md"]);
+});
+
+test("buildLocalGraph keeps an edge directly between two neighbors of the current note", () => {
+  const graph = {
+    nodes: [{ path: "A.md" }, { path: "B.md" }, { path: "C.md" }],
+    edges: [{ source: "A.md", target: "B.md" }, { source: "A.md", target: "C.md" }, { source: "B.md", target: "C.md" }],
+  };
+  const local = renderer.buildLocalGraph(graph, "A.md");
+  assert.equal(local.nodes.length, 3);
+  assert.equal(local.edges.length, 3);
+});
+
+test("buildLocalGraph returns the full graph unchanged when there's no current note", () => {
+  const graph = { nodes: [{ path: "A.md" }], edges: [] };
+  assert.deepEqual(renderer.buildLocalGraph(graph, null), graph);
+});
+
 test("layoutGraph returns an empty position map for an empty graph", () => {
   assert.deepEqual(renderer.layoutGraph({ nodes: [], edges: [] }, {}), {});
 });
