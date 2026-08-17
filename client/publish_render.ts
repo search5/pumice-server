@@ -1061,16 +1061,25 @@ interface PumicePreload {
     var index = buildSearchIndex(cache, urlPrefix);
     var debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-    /** Opens .pumice-search-clearance only while there's something in the dropdown to protect
-     * the outline from, instead of reserving that space permanently -- a permanent gap looked
-     * broken when idle (46_검색_드롭다운_공간_확보_및_TOC_메뉴바_순서.md's first attempt,
-     * corrected in the follow-up doc). */
+    /** Sizes .pumice-search-clearance to the dropdown's *actual* rendered height (offsetHeight
+     * already reflects its own max-height:320px/overflow-y:auto cap when content is longer, and
+     * whatever's shorter when it isn't), not a flat 324px whenever anything's showing -- a fixed
+     * 324px regardless of content looked like a second, redundant gap stacked below a dropdown
+     * that only had one or two results in it (47_...md's fix still wasn't quite right; this is
+     * the follow-up correction). +4 accounts for .pumice-search-results' own `top: calc(100% +
+     * 4px)` offset from the search box, so the outline starts right after where the dropdown
+     * visually ends, not further down. */
+    function syncClearance(): void {
+      if (!clearanceEl) return;
+      clearanceEl.style.flexBasis = resultsEl.childElementCount > 0 ? (resultsEl.offsetHeight + 4) + "px" : "0";
+    }
+
     function renderResults(results: SearchResult[]): void {
       resultsEl.innerHTML = results.map(function (r) {
         var snippetHtml = r.snippet ? '<div class="search-result-snippet">' + escapeHtml(r.snippet) + "</div>" : "";
         return '<a href="' + escapeAttr(r.href) + '"><div class="search-result-title">' + escapeHtml(r.title) + "</div>" + snippetHtml + "</a>";
       }).join("");
-      if (clearanceEl) clearanceEl.classList.toggle("is-open", results.length > 0);
+      syncClearance();
     }
 
     inputEl.addEventListener("input", function () {
@@ -1084,7 +1093,7 @@ interface PumicePreload {
       statusEl.className = "search-status";
       statusEl.textContent = "Searching...";
       resultsEl.appendChild(statusEl);
-      if (clearanceEl) clearanceEl.classList.add("is-open");
+      syncClearance();
       debounceTimer = setTimeout(function () {
         runServerSearch(query, urlPrefix).then(function (serverResults) {
           if (inputEl.value !== query) return;

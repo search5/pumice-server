@@ -482,22 +482,18 @@
             border: none;
         }
 
-        /* Opens up only while the results dropdown actually has something in it (.is-open
-           toggled by wireSearch in publish_render.js based on result count), reserving just
-           enough room (top: calc(100% + 4px) + max-height: 320px = 324px measured from the
-           bottom of the search box) that the dropdown never floats on top of the outline below
-           it. A permanent 324px gap looked broken when idle (46_...md's first attempt, corrected
-           here) -- collapsed to 0 by default is the fix. Own layout choice either way, not
-           matched against real Obsidian (its own left-column search sits above the folder tree
-           only, no outline in that column to worry about, see 43_사이트_제목_왼쪽_사이드바_
-           이동.md). */
+        /* Sized in JS (wireSearch's syncClearance, publish_render.js) to match the results
+           dropdown's *actual* rendered height, not a flat constant -- a fixed 324px whenever
+           anything was showing looked like a second, redundant gap stacked below a dropdown
+           that only had one or two results in it (46_...md's first attempt reserved a permanent
+           324px regardless of state; 47_...md tried toggling that same flat 324px on/off, which
+           was still wrong for short result lists; this is the second follow-up correction).
+           Collapsed to 0 by default -- own layout choice, not matched against real Obsidian (its
+           own left-column search sits above the folder tree only, no outline in that column to
+           worry about, see 43_사이트_제목_왼쪽_사이드바_이동.md). */
         .pumice-search-clearance {
             flex: 0 0 0;
             transition: flex-basis 0.15s ease;
-        }
-
-        .pumice-search-clearance.is-open {
-            flex: 0 0 324px;
         }
 
         .pumice-search-results a {
