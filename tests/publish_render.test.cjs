@@ -187,6 +187,28 @@ test("renderOutlineHtml returns an empty string for an empty outline", () => {
   assert.equal(renderer.renderOutlineHtml([]), "");
 });
 
+test("findActiveHeadingSlug picks the last heading already scrolled past (top <= 0)", () => {
+  const tops = [
+    { slug: "a", top: -500 },
+    { slug: "b", top: -100 },
+    { slug: "c", top: 200 },
+  ];
+  assert.equal(renderer.findActiveHeadingSlug(tops), "b");
+});
+
+test("findActiveHeadingSlug returns null when no heading has been scrolled past yet", () => {
+  const tops = [{ slug: "a", top: 50 }, { slug: "b", top: 300 }];
+  assert.equal(renderer.findActiveHeadingSlug(tops), null);
+});
+
+test("findActiveHeadingSlug returns the very first heading when it's exactly at the top", () => {
+  assert.equal(renderer.findActiveHeadingSlug([{ slug: "a", top: 0 }]), "a");
+});
+
+test("findActiveHeadingSlug returns null for an empty heading list", () => {
+  assert.equal(renderer.findActiveHeadingSlug([]), null);
+});
+
 test("linkTargetMatchesPath matches a wikilink target against the .md-suffixed stored path", () => {
   assert.equal(renderer.linkTargetMatchesPath("Note", "Note.md"), true);
   assert.equal(renderer.linkTargetMatchesPath("Note.md", "Note.md"), true);

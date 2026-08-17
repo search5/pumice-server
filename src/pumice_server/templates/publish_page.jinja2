@@ -262,6 +262,18 @@
             background: rgba(138, 180, 248, 0.1);
         }
 
+        /* Scroll-spy (37_실제_아키텍처_전환_TOC_재설계.md's follow-up correction) -- real
+           Obsidian's outline highlights whichever section is currently in view as the visitor
+           scrolls (confirmed live by reading app.js's onScroll->highlightLine handler; an earlier
+           check in this same investigation wrongly found no such behavior because it inspected
+           the wrong DOM node). `.is-active` is toggled by static/publish_render.js's
+           wireOutlineScrollSpy. */
+        .pumice-outline-sidebar a.is-active {
+            color: var(--accent-blue);
+            font-weight: 600;
+            background: rgba(88, 166, 255, 0.08);
+        }
+
         /* Real Obsidian nests a child heading's own <ul> under its parent <li> and indents via
            the children container itself (padding-left + a left guide line), not per-level
            classes on each item -- confirmed live via DOM inspection on lab.marconoris.com/now. */

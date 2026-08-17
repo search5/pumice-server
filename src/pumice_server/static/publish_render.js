@@ -135,6 +135,61 @@
     return '<li><a href="#' + escapeAttr(node.slug) + '">' + escapeHtml(node.heading) + "</a>" + childrenHtml + "</li>";
   }
 
+  /** Outline scroll-spy (37_실제_아키텍처_전환_TOC_재설계.md's follow-up correction) -- real
+   * Obsidian Publish's own `onScroll` handler calls `outline.highlightLine(currentLine)`, which
+   * walks the note's headings in document order and picks the *last* one whose source position
+   * has already been scrolled past (confirmed live by reading app.js: this DOES exist and DOES
+   * update a `mod-active` class on scroll -- an earlier check in this same investigation wrongly
+   * concluded it didn't, because it inspected the wrong DOM node). Real Obsidian's version keys
+   * off a line number (its renderer has a CodeMirror-style line coordinate system); pumice's
+   * renderer doesn't render into lines, so this keys off each heading's actual viewport position
+   * instead -- same "last one already passed" rule, adapted to pixels rather than lines.
+   * `headingTops` is `[{slug, top}]` in document order, `top` being that heading's
+   * getBoundingClientRect().top (viewport-relative) at the moment of the scroll event. */
+  function findActiveHeadingSlug(headingTops) {
+    var active = null;
+    for (var i = 0; i < headingTops.length; i++) {
+      if (headingTops[i].top <= 0) active = headingTops[i].slug;
+    }
+    return active;
+  }
+
+  /** Wires the outline sidebar's scroll-spy: on every scroll (rAF-throttled, matching the
+   * pattern real Obsidian's own debounced onScroll uses for the same purpose), recomputes which
+   * heading is active from `contentEl`'s actual rendered `<hN id>` elements and toggles
+   * `.is-active` on the matching outline link. Also runs once immediately so the correct item is
+   * already highlighted before any scrolling happens. */
+  function wireOutlineScrollSpy(contentEl, outlineEl) {
+    var headingEls = Array.prototype.slice.call(contentEl.querySelectorAll("h1[id],h2[id],h3[id],h4[id],h5[id],h6[id]"));
+    if (!headingEls.length) return;
+
+    var current = null;
+    var ticking = false;
+
+    function update() {
+      ticking = false;
+      var headingTops = headingEls.map(function (h) { return { slug: h.id, top: h.getBoundingClientRect().top }; });
+      var active = findActiveHeadingSlug(headingTops);
+      if (active === current) return;
+      if (current) {
+        var prevLink = outlineEl.querySelector('a[href="#' + CSS.escape(current) + '"]');
+        if (prevLink) prevLink.classList.remove("is-active");
+      }
+      current = active;
+      if (current) {
+        var nextLink = outlineEl.querySelector('a[href="#' + CSS.escape(current) + '"]');
+        if (nextLink) nextLink.classList.add("is-active");
+      }
+    }
+
+    window.addEventListener("scroll", function () {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(update);
+    });
+    update();
+  }
+
   /** Mirrors the target-matching parse_wikilinks()/_build_path_to_permalink do server-side (see
    * web.py, 19_permalink_지원.md): a wikilink target matches a stored path either literally, or
    * with/without a trailing .md. */
@@ -657,6 +712,7 @@
         var outlineEl = document.getElementById("pumice-outline");
         if (outlineEl) {
           outlineEl.innerHTML = renderOutlineHtml(buildOutline(entry));
+          wireOutlineScrollSpy(root, outlineEl);
         }
 
         var backlinksEl = document.getElementById("pumice-backlinks");
@@ -707,6 +763,7 @@
     renderMarkdown: renderMarkdown,
     buildOutline: buildOutline,
     renderOutlineHtml: renderOutlineHtml,
+    findActiveHeadingSlug: findActiveHeadingSlug,
     linkTargetMatchesPath: linkTargetMatchesPath,
     buildBacklinks: buildBacklinks,
     buildSearchIndex: buildSearchIndex,
