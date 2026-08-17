@@ -25,3 +25,9 @@ htmlcov/
 # repo's feedback_never_git_add_dash_a memory: llm-wiki was previously committed by mistake
 # and had to be purged from pushed history).
 llm-wiki/
+
+# TypeScript build tooling for client/ (40_publish_render_TypeScript_전환.md) -- the compiled
+# output (src/pumice_server/static/publish_render.js) IS committed (it's the actual served
+# static asset, same as the previous hand-written JS always was), and so is package-lock.json
+# (reproducible tsc version); only the installed packages themselves are ignored.
+node_modules/

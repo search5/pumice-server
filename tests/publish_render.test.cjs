@@ -1,10 +1,12 @@
 // TDD for static/publish_render.js's pure functions -- see
-// 28_실제_아키텍처_전환_Phase1_노트본문.md (pumice repo). No build tooling/npm deps in this repo
-// (same as static/dashboard.js and static/login.js), so this uses Node's built-in test runner
-// directly against the same file the browser loads, run as CommonJS (see the module.exports
-// guard at the bottom of publish_render.js).
+// 28_실제_아키텍처_전환_Phase1_노트본문.md / 40_publish_render_TypeScript_전환.md (pumice repo).
+// The source is now client/publish_render.ts (compiled by tsc into static/publish_render.js,
+// same path it's always been served from), so this uses Node's built-in test runner directly
+// against the compiled output the browser also loads, run as CommonJS (see the module.exports
+// guard at the bottom of publish_render.ts).
 //
-// Run with: node --test tests/publish_render.test.cjs
+// Run with: npm test (builds then tests) or, if already built, node --test
+// tests/publish_render.test.cjs directly.
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
