@@ -177,11 +177,19 @@
             position: sticky;
             top: 24px;
             max-height: calc(100vh - 48px);
-            overflow-y: auto;
             padding-top: 4px;
             display: flex;
             flex-direction: column;
             gap: 12px;
+        }
+
+        /* Only the folder tree itself scrolls independently (matches real Obsidian: confirmed
+           live that overflow-y:auto lives on .nav-view-outer, not the whole left column) --
+           putting overflow on the whole sidebar would clip .pumice-search-results, which needs
+           to overflow below the search box. */
+        .pumice-nav-sidebar > ul {
+            overflow-y: auto;
+            min-height: 0;
         }
 
         .pumice-nav-sidebar ul {
