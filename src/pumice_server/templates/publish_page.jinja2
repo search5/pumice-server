@@ -147,49 +147,35 @@
             max-width: 1400px;
         }
 
-        .layout.has-nav,
-        .layout.has-outline {
+        .layout.has-nav {
             max-width: 1200px;
             display: flex;
             align-items: flex-start;
             gap: 24px;
         }
 
-        .layout.has-nav.wide,
-        .layout.has-outline.wide {
+        .layout.has-nav.wide {
             max-width: 1600px;
         }
 
-        .layout.has-nav.has-outline {
-            max-width: 1400px;
-        }
-
-        .layout.has-nav.has-outline.wide {
-            max-width: 1800px;
-        }
-
-        /* Left sidebar now holds the theme toggle and search box alongside the folder tree, not
-           just navigation -- confirmed live that real Obsidian Publish's own
-           .site-body-left-column contains the theme toggle and search box too, both above the
-           nav tree, not in a top header (see 42_사이드바_배치_실제_확인.md). */
+        /* Left sidebar holds everything real Obsidian Publish splits across both its left and
+           right columns -- title/theme/search/nav (site-body-left-column) plus graph/outline
+           (site-body-right-column, confirmed live via window.app.graph.containerEl's ancestor
+           chain, see 43_사이트_제목_왼쪽_사이드바_이동.md) -- per explicit user direction to
+           keep everything in one left sidebar rather than matching the real 3-column split.
+           No max-height/overflow cap on the sidebar itself: with graph+outline+nav all
+           potentially present, a fixed viewport-height cap would force scroll clipping that'd
+           either cut off content or (per the .pumice-search-results bug fixed in
+           32-sidebar-and-graph-bg-fix.md) clip an absolutely-positioned child -- letting it grow
+           past the viewport and scroll with the page is simpler and avoids both. */
         .pumice-nav-sidebar {
-            flex: 0 0 220px;
+            flex: 0 0 260px;
             position: sticky;
             top: 24px;
-            max-height: calc(100vh - 48px);
             padding-top: 4px;
             display: flex;
             flex-direction: column;
             gap: 12px;
-        }
-
-        /* Only the folder tree itself scrolls independently (matches real Obsidian: confirmed
-           live that overflow-y:auto lives on .nav-view-outer, not the whole left column) --
-           putting overflow on the whole sidebar would clip .pumice-search-results, which needs
-           to overflow below the search box. */
-        .pumice-nav-sidebar > ul {
-            overflow-y: auto;
-            min-height: 0;
         }
 
         .pumice-nav-sidebar ul {
@@ -230,24 +216,6 @@
         .pumice-main-column {
             flex: 1;
             min-width: 0;
-        }
-
-        /* Right-hand column wrapper (40_그래프_뷰_실제_UI_형태.md) -- holds the graph mini-view and
-           the outline sidebar stacked vertically, graph above outline, exactly like real
-           Obsidian's own `.site-body-right-column-inner` (confirmed live: "INTERACTIVE GRAPH"
-           sits directly above "ON THIS PAGE" in the same column on lab.marconoris.com/now). The
-           sticky/flex-basis/scroll properties that used to live directly on
-           .pumice-outline-sidebar (37_...md) moved here, since now there can be two stacked
-           children instead of one. */
-        .pumice-right-column {
-            flex: 0 0 240px;
-            position: sticky;
-            top: 24px;
-            max-height: calc(100vh - 48px);
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
         }
 
         /* Graph mini-view -- real Obsidian Publish's own graph is NOT hidden behind a toggle
@@ -544,7 +512,7 @@
            static/publish_render.js's renderGraphPixi reads --border-color/--wiki-link/
            --accent-blue/--text-muted directly (via cssColorToPixiHex) to stay theme-aware, so no
            CSS color rules are needed here -- just canvas sizing (see .pumice-graph-mini/
-           .pumice-graph-fullpage above, near .pumice-right-column). */
+           .pumice-graph-fullpage above, inside .pumice-nav-sidebar). */
 
         .vault-badge {
             background: rgba(138, 180, 248, 0.1);
@@ -768,14 +736,11 @@
         }
 
         @media (max-width: 768px) {
-            .layout.has-nav,
-            .layout.has-outline {
+            .layout.has-nav {
                 flex-direction: column;
             }
-            .pumice-nav-sidebar,
-            .pumice-right-column {
+            .pumice-nav-sidebar {
                 position: static;
-                max-height: none;
                 width: 100%;
             }
             .container {
@@ -812,7 +777,7 @@
        that .site-body-left-column-inner's own first two children are the logo and site name,
        above the theme toggle and search box -- see 43_사이트_제목_왼쪽_사이드바_이동.md), so
        the sidebar itself is unconditional -- it always has at least the title to show. #}
-    <div class="layout{% if not readable_line_length %} wide{% endif %} has-nav{% if client_rendered %} has-outline{% endif %}">
+    <div class="layout{% if not readable_line_length %} wide{% endif %} has-nav">
         <nav class="pumice-nav-sidebar">
             <a href="{{ url_prefix }}" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
             {% if show_theme_toggle %}
@@ -860,6 +825,21 @@
                 {% endfor %}
             </ul>
             {% endif %}
+            {% if client_rendered and preload_json %}
+            <div class="pumice-graph-mini">
+                <div class="pumice-graph-mini-header">
+                    <span>{{ t('publish_public.graph_view') }}</span>
+                    <span class="pumice-graph-mini-icons">
+                        <button id="pumice-graph-scope-toggle" class="pumice-graph-icon-button" type="button" aria-label="{{ t('publish_public.graph_toggle_scope') }}" title="{{ t('publish_public.graph_toggle_scope') }}">⑂</button>
+                        <button id="pumice-graph-expand" class="pumice-graph-icon-button" type="button" aria-label="{{ t('publish_public.graph_expand') }}" title="{{ t('publish_public.graph_expand') }}">⤢</button>
+                    </span>
+                </div>
+                <div id="pumice-graph-mini-canvas"></div>
+            </div>
+            {% endif %}
+            {% if client_rendered %}
+            <aside id="pumice-outline" class="pumice-outline-sidebar"></aside>
+            {% endif %}
         </nav>
         <div class="pumice-main-column">
             <header>
@@ -901,23 +881,6 @@
                 <p>Powered by Antigravity Obsidian Publish Server | <a href="{{ url_prefix }}index.md">Index</a></p>
             </footer>
         </div>
-        {% if client_rendered %}
-        <div class="pumice-right-column">
-            {% if preload_json %}
-            <div class="pumice-graph-mini">
-                <div class="pumice-graph-mini-header">
-                    <span>{{ t('publish_public.graph_view') }}</span>
-                    <span class="pumice-graph-mini-icons">
-                        <button id="pumice-graph-scope-toggle" class="pumice-graph-icon-button" type="button" aria-label="{{ t('publish_public.graph_toggle_scope') }}" title="{{ t('publish_public.graph_toggle_scope') }}">⑂</button>
-                        <button id="pumice-graph-expand" class="pumice-graph-icon-button" type="button" aria-label="{{ t('publish_public.graph_expand') }}" title="{{ t('publish_public.graph_expand') }}">⤢</button>
-                    </span>
-                </div>
-                <div id="pumice-graph-mini-canvas"></div>
-            </div>
-            {% endif %}
-            <aside id="pumice-outline" class="pumice-outline-sidebar"></aside>
-        </div>
-        {% endif %}
     </div>
 </body>
 </html>
