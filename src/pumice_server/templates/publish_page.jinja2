@@ -168,6 +168,10 @@
             max-width: 1800px;
         }
 
+        /* Left sidebar now holds the theme toggle and search box alongside the folder tree, not
+           just navigation -- confirmed live that real Obsidian Publish's own
+           .site-body-left-column contains the theme toggle and search box too, both above the
+           nav tree, not in a top header (see 42_사이드바_배치_실제_확인.md). */
         .pumice-nav-sidebar {
             flex: 0 0 220px;
             position: sticky;
@@ -175,6 +179,9 @@
             max-height: calc(100vh - 48px);
             overflow-y: auto;
             padding-top: 4px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
         }
 
         .pumice-nav-sidebar ul {
@@ -243,7 +250,7 @@
         .pumice-graph-mini {
             border: 1px solid var(--border-color);
             border-radius: 10px;
-            background: rgba(22, 27, 34, 0.4);
+            background: var(--container-bg);
             overflow: hidden;
             flex: 0 0 auto;
         }
@@ -445,9 +452,8 @@
 
         .pumice-search {
             position: relative;
-            flex: 1;
-            max-width: 320px;
-            margin: 0 20px;
+            width: 100%;
+            flex: 0 0 auto;
         }
 
         .pumice-search input {
@@ -517,7 +523,8 @@
             height: 36px;
             font-size: 16px;
             cursor: pointer;
-            margin-right: 12px;
+            flex: 0 0 auto;
+            align-self: flex-start;
         }
 
         .pumice-icon-button:hover {
@@ -560,7 +567,7 @@
             padding: 16px 20px;
             border: 1px solid var(--border-color);
             border-radius: 12px;
-            background: rgba(22, 27, 34, 0.4);
+            background: var(--container-bg);
             font-size: 14px;
         }
 
@@ -793,9 +800,38 @@
     {% endif %}
 </head>
 <body>
-    <div class="layout{% if not readable_line_length %} wide{% endif %}{% if show_navigation and navigation_tree %} has-nav{% endif %}{% if client_rendered %} has-outline{% endif %}">
-        {% if show_navigation and navigation_tree %}
+    {% set show_left_sidebar = (show_navigation and navigation_tree) or (show_search and preload_json) or show_theme_toggle %}
+    <div class="layout{% if not readable_line_length %} wide{% endif %}{% if show_left_sidebar %} has-nav{% endif %}{% if client_rendered %} has-outline{% endif %}">
+        {% if show_left_sidebar %}
         <nav class="pumice-nav-sidebar">
+            {% if show_theme_toggle %}
+            <button id="pumice-theme-toggle" class="pumice-icon-button" type="button" aria-label="{{ t('publish_public.theme_toggle') }}" title="{{ t('publish_public.theme_toggle') }}">🌓</button>
+            <script>
+            (function () {
+              var btn = document.getElementById("pumice-theme-toggle");
+              if (!btn) return;
+              btn.addEventListener("click", function () {
+                // No explicit data-theme yet means this page is following the OS preference
+                // -- this CSS is dark-first (see the <style> block), so "no preference for
+                // light" effectively means dark.
+                var current = document.documentElement.getAttribute("data-theme");
+                if (!current) {
+                  current = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+                }
+                var next = current === "dark" ? "light" : "dark";
+                document.documentElement.setAttribute("data-theme", next);
+                try { localStorage.setItem("pumiceTheme", next); } catch (e) {}
+              });
+            })();
+            </script>
+            {% endif %}
+            {% if show_search and preload_json %}
+            <div class="pumice-search">
+                <input id="pumice-search-input" type="search" placeholder="{{ t('publish_public.search_placeholder') }}" autocomplete="off">
+                <div id="pumice-search-results" class="pumice-search-results"></div>
+            </div>
+            {% endif %}
+            {% if show_navigation and navigation_tree %}
             <ul>
                 {% for entry in navigation_tree %}
                 {% if entry.type == "folder" -%}
@@ -812,38 +848,12 @@
                 {%- endif %}
                 {% endfor %}
             </ul>
+            {% endif %}
         </nav>
         {% endif %}
         <div class="pumice-main-column">
             <header>
                 <a href="{{ url_prefix }}" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
-                {% if show_search and preload_json %}
-                <div class="pumice-search">
-                    <input id="pumice-search-input" type="search" placeholder="{{ t('publish_public.search_placeholder') }}" autocomplete="off">
-                    <div id="pumice-search-results" class="pumice-search-results"></div>
-                </div>
-                {% endif %}
-                {% if show_theme_toggle %}
-                <button id="pumice-theme-toggle" class="pumice-icon-button" type="button" aria-label="{{ t('publish_public.theme_toggle') }}" title="{{ t('publish_public.theme_toggle') }}">🌓</button>
-                <script>
-                (function () {
-                  var btn = document.getElementById("pumice-theme-toggle");
-                  if (!btn) return;
-                  btn.addEventListener("click", function () {
-                    // No explicit data-theme yet means this page is following the OS preference
-                    // -- this CSS is dark-first (see the <style> block), so "no preference for
-                    // light" effectively means dark.
-                    var current = document.documentElement.getAttribute("data-theme");
-                    if (!current) {
-                      current = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
-                    }
-                    var next = current === "dark" ? "light" : "dark";
-                    document.documentElement.setAttribute("data-theme", next);
-                    try { localStorage.setItem("pumiceTheme", next); } catch (e) {}
-                  });
-                })();
-                </script>
-                {% endif %}
                 <span class="vault-badge">Vault: {{ vault_id }}</span>
             </header>
             {% if preload_json %}
