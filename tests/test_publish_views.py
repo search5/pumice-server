@@ -42,7 +42,8 @@ class FakeRegistry:
 class FakeRequest:
     def __init__(self, repository, data_dir, owner=None, vault_id=None,
                  headers=None, body=b"", matchdict=None, scheme="https", host="example.com",
-                 json_body=None, query_string="", domain=None, params=None, identity=None):
+                 json_body=None, query_string="", domain=None, params=None, identity=None,
+                 method="GET"):
         self.repository = repository
         self.context = FakeContext(owner, vault_id) if owner is not None else None
         self.headers = headers or {}
@@ -56,6 +57,7 @@ class FakeRequest:
         self.domain = domain if domain is not None else host.split(":")[0]
         self.params = params or {}
         self.identity = identity
+        self.method = method
         self._json_body = json_body if json_body is not None else {}
 
     @property
@@ -838,13 +840,106 @@ def test_note_with_an_enabled_plugin_stays_server_rendered(repo, tmp_path):
     assert "Hello" in result["content"]
 
 
-# ─── search (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 3 follow-up) ───────────────────────
+# ─── search (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 3 follow-up; moved server-side in
+# 38_실제_아키텍처_전환_검색_그래프_실제화.md after reading real Obsidian's app.js) ───────────────
 
 def test_upload_records_search_text_in_the_metadata_cache(repo, tmp_path):
     upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n\nFind this phrase here.\n")
 
     cache = web.load_publish_meta(str(tmp_path), "alice", "vault1", "metadata_cache.json")
     assert "Find this phrase here." in cache["note.md"]["searchText"]
+
+
+def test_render_cache_json_no_longer_includes_search_text(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n\nFind this phrase here.\n")
+
+    response = render(repo, tmp_path, "alice", "vault1", "_cache.json")
+
+    assert "searchText" not in json.loads(response.body)["note.md"]
+
+
+def test_extract_snippet_windows_around_the_first_match():
+    text = "a" * 60 + "needle" + "b" * 60
+    snippet = web._extract_snippet(text, "needle", context_chars=10)
+
+    assert snippet == "..." + "a" * 10 + "needle" + "b" * 10 + "..."
+
+
+def test_extract_snippet_omits_ellipsis_when_the_window_reaches_the_edges():
+    snippet = web._extract_snippet("short text with needle here", "needle", context_chars=40)
+
+    assert snippet == "short text with needle here"
+
+
+def test_extract_snippet_falls_back_to_the_start_when_the_query_is_not_found():
+    snippet = web._extract_snippet("no match in here at all", "xyz", context_chars=5)
+
+    assert snippet == "no match i"
+
+
+def test_search_note_bodies_matches_case_insensitively_and_ranks_by_occurrence_count():
+    cache = {
+        "one.md": {"searchText": "the quick fox"},
+        "two.md": {"searchText": "FOX fox fox everywhere"},
+        "three.md": {"searchText": "no match here"},
+    }
+
+    results = web._search_note_bodies(cache, "fox")
+
+    assert [r["path"] for r in results] == ["two.md", "one.md"]
+    assert results[0]["snippet"]
+
+
+def test_search_note_bodies_skips_non_markdown_and_null_entries():
+    cache = {"image.png": {"searchText": "fox"}, "gone.md": None, "note.md": {"searchText": "fox"}}
+
+    results = web._search_note_bodies(cache, "fox")
+
+    assert [r["path"] for r in results] == ["note.md"]
+
+
+def test_search_note_bodies_returns_nothing_for_an_empty_query():
+    assert web._search_note_bodies({"note.md": {"searchText": "fox"}}, "   ") == []
+
+
+def test_search_note_bodies_caps_results_at_the_limit():
+    cache = {f"note{i}.md": {"searchText": "fox"} for i in range(5)}
+
+    results = web._search_note_bodies(cache, "fox", limit=3)
+
+    assert len(results) == 3
+
+
+def render_search(repo, tmp_path, username, vault_id, query, method="POST"):
+    request = FakeRequest(
+        repo, tmp_path, matchdict={"username": username, "vault_id": vault_id, "path": "_search"},
+        json_body={"query": query}, method=method,
+    )
+    return web.publish_view(request)
+
+
+def test_render_search_reserved_path_matches_note_bodies(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n\nFind this phrase here.\n")
+
+    response = render_search(repo, tmp_path, "alice", "vault1", "phrase")
+
+    results = json.loads(response.body)["results"]
+    assert results[0]["path"] == "note.md"
+    assert "phrase" in results[0]["snippet"]
+
+
+def test_render_search_reserved_path_requires_post(repo, tmp_path):
+    response = render_search(repo, tmp_path, "alice", "vault1", "phrase", method="GET")
+
+    assert response.status_code == 405
+
+
+def test_render_search_reserved_path_empty_query_returns_empty_results(repo, tmp_path):
+    upload(repo, tmp_path, "alice", "vault1", "note.md", b"# Title\n\nHello.\n")
+
+    response = render_search(repo, tmp_path, "alice", "vault1", "")
+
+    assert json.loads(response.body)["results"] == []
 
 
 def test_show_search_defaults_to_true(repo, tmp_path):

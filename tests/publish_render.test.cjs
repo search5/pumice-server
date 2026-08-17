@@ -242,57 +242,80 @@ test("buildBacklinks resolves the backlinking note's own permalink when it has o
   assert.deepEqual(backlinks, [{ path: "Home.md", href: "/publish/alice/vault1/welcome/" }]);
 });
 
-// ─── Phase 3: search (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 3 follow-up) ──────────────
+// ─── Phase 3: search (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 3 follow-up; redesigned in
+// 38_실제_아키텍처_전환_검색_그래프_실제화.md to split instant title matching (client) from
+// body-text matching (server, see web.py's _search_note_bodies) after reading real Obsidian's
+// app.js confirmed that's the real split) ────────────────────────────────────────────────────
 
-test("buildSearchIndex includes only markdown entries, deriving a filename-based title", () => {
+test("buildSearchIndex includes only markdown entries, deriving a filename-based title (no searchText -- real Obsidian's client never gets note bodies)", () => {
   const cache = {
-    "Notes/Deep Dive.md": { searchText: "some body text" },
+    "Notes/Deep Dive.md": { headings: [] },
     "publish.js": null,
     "image.png": null,
   };
   const index = renderer.buildSearchIndex(cache, "/publish/alice/vault1/");
   assert.deepEqual(index, [
-    { path: "Notes/Deep Dive.md", title: "Deep Dive", href: "/publish/alice/vault1/Notes/Deep%20Dive", searchText: "some body text" },
+    { path: "Notes/Deep Dive.md", title: "Deep Dive", href: "/publish/alice/vault1/Notes/Deep%20Dive" },
   ]);
 });
 
 test("buildSearchIndex resolves a permalink into the entry's href when present", () => {
-  const cache = { "Note.md": { searchText: "", permalink: "/nice/" } };
+  const cache = { "Note.md": { headings: [], permalink: "/nice/" } };
   const index = renderer.buildSearchIndex(cache, "/publish/alice/vault1/");
   assert.equal(index[0].href, "/publish/alice/vault1/nice/");
 });
 
 test("searchNotes returns nothing for an empty or whitespace-only query", () => {
-  const index = [{ path: "Note.md", title: "Note", href: "/x", searchText: "hello" }];
+  const index = [{ path: "Note.md", title: "Note", href: "/x" }];
   assert.deepEqual(renderer.searchNotes(index, ""), []);
   assert.deepEqual(renderer.searchNotes(index, "   "), []);
 });
 
-test("searchNotes matches case-insensitively against the title", () => {
-  const index = [{ path: "Note.md", title: "Cooking Tips", href: "/x", searchText: "" }];
+test("searchNotes matches case-insensitively against the title only (no body text available client-side anymore)", () => {
+  const index = [{ path: "Note.md", title: "Cooking Tips", href: "/x" }];
   assert.equal(renderer.searchNotes(index, "cooking").length, 1);
-});
-
-test("searchNotes matches against searchText and includes a snippet around the match", () => {
-  const index = [{ path: "Note.md", title: "Note", href: "/x", searchText: "the quick brown fox jumps" }];
-  const results = renderer.searchNotes(index, "brown");
-  assert.equal(results.length, 1);
-  assert.match(results[0].snippet, /brown/);
+  assert.deepEqual(renderer.searchNotes(index, "nonexistent-body-word"), []);
 });
 
 test("searchNotes excludes non-matching entries", () => {
   const index = [
-    { path: "A.md", title: "Apples", href: "/a", searchText: "fruit" },
-    { path: "B.md", title: "Bicycles", href: "/b", searchText: "wheels" },
+    { path: "A.md", title: "Apples", href: "/a" },
+    { path: "B.md", title: "Bicycles", href: "/b" },
   ];
-  const results = renderer.searchNotes(index, "fruit");
+  const results = renderer.searchNotes(index, "apples");
   assert.deepEqual(results.map((r) => r.path), ["A.md"]);
 });
 
 test("searchNotes caps the number of results", () => {
-  const index = Array.from({ length: 30 }, (_, i) => ({ path: `N${i}.md`, title: `Note ${i}`, href: `/${i}`, searchText: "match" }));
+  const index = Array.from({ length: 30 }, (_, i) => ({ path: `N${i}.md`, title: `Match ${i}`, href: `/${i}` }));
   const results = renderer.searchNotes(index, "match");
   assert.ok(results.length <= 20);
+});
+
+test("mergeSearchResults keeps title results and appends new server (body-text) results with their snippet", () => {
+  const titleResults = [{ path: "A.md", title: "A", href: "/a", snippet: "" }];
+  const serverResults = [{ path: "B.md", snippet: "...found it here..." }];
+  const cache = { "B.md": {} };
+  const merged = renderer.mergeSearchResults(titleResults, serverResults, cache, "/publish/alice/vault1/");
+  assert.deepEqual(merged, [
+    { path: "A.md", title: "A", href: "/a", snippet: "" },
+    { path: "B.md", title: "B", href: "/publish/alice/vault1/B", snippet: "...found it here..." },
+  ]);
+});
+
+test("mergeSearchResults deduplicates a path that's already in the title results", () => {
+  const titleResults = [{ path: "A.md", title: "A", href: "/a", snippet: "" }];
+  const serverResults = [{ path: "A.md", snippet: "shouldn't appear twice" }];
+  const merged = renderer.mergeSearchResults(titleResults, serverResults, {}, "/publish/alice/vault1/");
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].snippet, "");
+});
+
+test("mergeSearchResults caps the combined total at the result limit", () => {
+  const titleResults = Array.from({ length: 15 }, (_, i) => ({ path: `T${i}.md`, title: `T${i}`, href: `/${i}`, snippet: "" }));
+  const serverResults = Array.from({ length: 15 }, (_, i) => ({ path: `S${i}.md`, snippet: "x" }));
+  const merged = renderer.mergeSearchResults(titleResults, serverResults, {}, "/");
+  assert.equal(merged.length, 20);
 });
 
 // ─── Phase 4: graph view (28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 4 follow-up) ──────────
@@ -355,22 +378,23 @@ test("layoutGraph pulls connected nodes closer together than to an unconnected n
   assert.ok(distAB < distAC, `expected connected AB (${distAB}) closer than unconnected AC (${distAC})`);
 });
 
-test("renderGraphSvg emits a line per edge and a linked circle per node, highlighting the current node", () => {
-  const graph = { nodes: [{ path: "A.md", title: "A" }, { path: "B.md", title: "B" }], edges: [{ source: "A.md", target: "B.md" }] };
-  const positions = { "A.md": { x: 10, y: 20 }, "B.md": { x: 30, y: 40 } };
-  const svg = renderer.renderGraphSvg(graph, positions, {}, "/publish/alice/vault1/", "A.md", 100, 100);
-  assert.match(svg, /<line x1="10" y1="20" x2="30" y2="40"/);
-  assert.match(svg, /class="graph-node graph-node-current"/);
-  assert.match(svg, /href="\/publish\/alice\/vault1\/A"/);
-  assert.match(svg, /href="\/publish\/alice\/vault1\/B"/);
+// Graph *rendering* moved from renderGraphSvg (pure, string-returning, testable) to
+// renderGraphPixi (imperative PixiJS/WebGL canvas drawing -- needs a real browser canvas context,
+// so it's untested here just like wireGraph/wireSearch/wireSlidingWindow already are). Only the
+// pure color-conversion helper it depends on is unit-tested.
+
+test("cssColorToPixiHex converts a #rrggbb hex color to a 0xRRGGBB integer", () => {
+  assert.equal(renderer.cssColorToPixiHex("#8ab4f8"), 0x8ab4f8);
 });
 
-test("renderGraphSvg resolves node hrefs through the cache's permalinks", () => {
-  const graph = { nodes: [{ path: "A.md", title: "A" }], edges: [] };
-  const positions = { "A.md": { x: 0, y: 0 } };
-  const cache = { "A.md": { permalink: "/nice/" } };
-  const svg = renderer.renderGraphSvg(graph, positions, cache, "/publish/alice/vault1/", null, 50, 50);
-  assert.match(svg, /href="\/publish\/alice\/vault1\/nice\/"/);
+test("cssColorToPixiHex converts an rgb()/rgba() color to a 0xRRGGBB integer, ignoring alpha", () => {
+  assert.equal(renderer.cssColorToPixiHex("rgba(48, 54, 61, 0.8)"), 0x30363d);
+  assert.equal(renderer.cssColorToPixiHex("rgb(255, 0, 128)"), 0xff0080);
+});
+
+test("cssColorToPixiHex falls back to a neutral gray for an unparsed value", () => {
+  assert.equal(renderer.cssColorToPixiHex(""), 0x888888);
+  assert.equal(renderer.cssColorToPixiHex("not-a-color"), 0x888888);
 });
 
 // ─── Phase 5: navigation sidebar + sliding window (28_실제_아키텍처_전환_Phase1_노트본문.md's follow-up) ──

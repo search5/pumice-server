@@ -396,6 +396,14 @@
             font-size: 12px;
         }
 
+        /* Shown while the debounced POST _search body-text lookup is in flight (38_실제_아키텍처_
+           전환_검색_그래프_실제화.md) -- matches real Obsidian's own "Searching..." copy. */
+        .pumice-search-results .search-status {
+            padding: 8px 12px;
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+
         .pumice-icon-button {
             background: var(--code-bg);
             border: 1px solid var(--border-color);
@@ -448,27 +456,19 @@
             line-height: 1;
         }
 
+        /* Graph rendering moved from inline SVG to PixiJS/WebGL canvas (38_실제_아키텍처_전환_
+           검색_그래프_실제화.md) -- real Obsidian's own graph is WebGL-rendered too (confirmed by
+           reading app.js). static/publish_render.js's renderGraphPixi reads --border-color/
+           --wiki-link/--accent-blue/--text-muted directly (via cssColorToPixiHex) to stay theme-
+           aware, so no CSS color rules are needed here for the graph itself -- just canvas sizing. */
         #pumice-graph-container {
             width: 100%;
             height: 100%;
         }
 
-        #pumice-graph-container svg {
+        #pumice-graph-container canvas {
             width: 100%;
             height: 100%;
-        }
-
-        .graph-edge {
-            stroke: var(--border-color);
-            stroke-width: 1;
-        }
-
-        .graph-node {
-            fill: var(--wiki-link);
-        }
-
-        .graph-node-current {
-            fill: var(--accent-blue);
         }
 
         .vault-badge {
@@ -811,6 +811,13 @@
             </main>
             {% if preload_json %}
             <script>window.pumicePreload = {{ preload_json | safe }};</script>
+            <!-- Graph view rendering (38_실제_아키텍처_전환_검색_그래프_실제화.md) -- vendored,
+                 unmodified pixi.min.js (MIT), loaded as its own plain global `PIXI` before
+                 publish_render.js, the same way real Obsidian Publish's own page loads it. This
+                 is the "pixi.js-legacy" build specifically (WebGL with an automatic Canvas 2D
+                 fallback), not plain pixi.js (WebGL-only) -- own choice beyond what was confirmed
+                 live, so a visitor without WebGL still sees the graph instead of nothing. -->
+            <script defer src="/static/pixi.min.js"></script>
             <script defer src="/static/publish_render.js"></script>
             {% endif %}
             <footer>

@@ -1152,6 +1152,57 @@ def _resolve_publish_url_prefix(repository, owner_username: str, vault_id: str):
         return f"https://{domain['hostname']}/", True, domain
     return f"/publish/{quote(owner_username, safe='')}/{quote(vault_id, safe='')}/", False, None
 
+_SEARCH_RESULT_LIMIT = 20
+_SEARCH_SNIPPET_CONTEXT_CHARS = 40
+
+
+def _extract_snippet(text: str, query: str, context_chars: int = _SEARCH_SNIPPET_CONTEXT_CHARS) -> str:
+    """Ports publish_render.js's own (now-removed) client-side extractSnippet -- moved server-side
+    once search itself moved server-side (see 38_실제_아키텍처_전환_검색_그래프_실제화.md, pumice
+    repo). Same behavior, just in Python: a window of `context_chars` on each side of the first
+    match, with an ellipsis where the window doesn't reach the start/end of the text."""
+    lower_text = text.lower()
+    idx = lower_text.find(query.lower())
+    if idx == -1:
+        return text[: context_chars * 2]
+    start = max(0, idx - context_chars)
+    end = min(len(text), idx + len(query) + context_chars)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(text) else ""
+    return prefix + text[start:end] + suffix
+
+
+def _search_note_bodies(cache: dict, query: str, limit: int = _SEARCH_RESULT_LIMIT) -> list:
+    """Full-text search over a vault's already-cached `searchText` (metadata_cache.py's
+    _plain_text_for_search, computed once at upload time) -- moved server-side after reading real
+    Obsidian's own app.js (client-only reversing, same methodology as this project's obsidian.asar
+    reversing) confirmed it does the same split: instant client-side title/filename matching (see
+    publish_render.js's buildSearchIndex/searchNotes) plus a debounced `POST {host}/search` call
+    for actual body-text matches -- real Obsidian's own client never receives full note bodies at
+    all; pumice previously baked `searchText` into every `_cache.json` entry for client-side
+    matching, which this endpoint now replaces (see the `_cache.json` handler below, which no
+    longer includes `searchText`). Case-insensitive substring match, ranked by how many times the
+    query occurs (most first, ties broken by path for determinism), capped at `limit`."""
+    trimmed = query.strip()
+    if not trimmed:
+        return []
+    lower_query = trimmed.lower()
+    scored = []
+    for entry_path, entry in cache.items():
+        if not entry or not entry_path.lower().endswith(".md"):
+            continue
+        text = entry.get("searchText") or ""
+        count = text.lower().count(lower_query)
+        if count == 0:
+            continue
+        scored.append((count, entry_path, text))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [
+        {"path": entry_path, "snippet": _extract_snippet(text, trimmed)}
+        for _, entry_path, text in scored[:limit]
+    ]
+
+
 def _render_publish_page(request, username: str, vault_id: str, path: str, via_custom_domain_route: bool):
     lang = detect_lang(request)
     url_prefix, is_custom_domain, domain = _resolve_publish_url_prefix(request.repository, username, vault_id)
@@ -1174,12 +1225,13 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
 
     # Real Obsidian Publish's client-side renderer (see 27_실제_퍼블리시_사이트_아키텍처_조사.md/
     # 28_실제_아키텍처_전환_Phase1_노트본문.md, pumice repo) fetches a whole-vault metadata cache
-    # and each note's raw markdown separately, then renders client-side -- these two reserved
-    # sub-paths mirror that (adapted to this server's username/vault_id URL scheme instead of
-    # real Obsidian's opaque site uid). Handled here, before the normal path-lookup/permalink/
-    # alias logic below, so a real published file can never collide with them -- an actual vault
-    # file literally named "_cache.json" (or under a "_raw/" folder) is assumed not to occur in
-    # practice; if it ever does, the reserved path wins.
+    # and each note's raw markdown separately, then renders client-side -- these three reserved
+    # sub-paths (_cache.json/_raw/_search) mirror that (adapted to this server's username/
+    # vault_id URL scheme instead of real Obsidian's opaque site uid). Handled here, before the
+    # normal path-lookup/permalink/alias logic below, so a real published file can never collide
+    # with them -- an actual vault file literally named "_cache.json"/"_search" (or under a
+    # "_raw/" folder) is assumed not to occur in practice; if it ever does, the reserved path
+    # wins.
     if path == "_cache.json":
         cache = load_publish_meta(data_dir, username, vault_id, "metadata_cache.json", {})
         # Permalinks live in the DB (get_published_files), not the markdown-derived cache file,
@@ -1197,6 +1249,11 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
                 enriched[file_path_key] = None
                 continue
             enriched_entry = dict(entry)
+            # Real Obsidian's own client never receives full note bodies (confirmed via app.js)
+            # -- searchText only exists so this server's own _search handler (below) can do
+            # full-text matching; the client's job is now just the instant title/filename
+            # prefilter.
+            enriched_entry.pop("searchText", None)
             permalink = permalink_by_path.get(file_path_key)
             if permalink:
                 enriched_entry["permalink"] = permalink
@@ -1210,6 +1267,23 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
         with open(raw_file_path, "rb") as f:
             raw_bytes = f.read()
         return Response(body=raw_bytes, content_type="text/markdown; charset=utf-8")
+
+    # Full-text search (see 38_실제_아키텍처_전환_검색_그래프_실제화.md, pumice repo) -- a third
+    # reserved sub-path alongside _cache.json/_raw/ above. Real Obsidian Publish's own client
+    # calls `POST {host}/search` with `{id, query}`; this server's route scheme is already
+    # per-vault (`/publish/{username}/{vault_id}/...`), so `{query}` alone is enough. The three
+    # publish routes (publish_view/custom_domain_view/publish_serve_proxy) don't restrict
+    # request_method, so POST already reaches this same view -- no new route needed.
+    if path == "_search":
+        if request.method != "POST":
+            return Response(body=json.dumps({"error": "POST required"}).encode("utf-8"), status=405, content_type="application/json")
+        try:
+            query = (request.json_body or {}).get("query", "")
+        except Exception:
+            query = ""
+        cache = load_publish_meta(data_dir, username, vault_id, _METADATA_CACHE_FILENAME, {})
+        results = _search_note_bodies(cache, query)
+        return Response(body=json.dumps({"results": results}, ensure_ascii=False).encode("utf-8"), content_type="application/json")
 
     # Fetched once and shared by both branches below -- used for permalink/description/image
     # lookups on a note page, and for favicon/static-asset detection (both site-wide concerns)

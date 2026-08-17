@@ -1,18 +1,28 @@
 /*
  * Client-side note renderer for pumice-server's Publish pages -- see
- * 27_실제_퍼블리시_사이트_아키텍처_조사.md / 28_실제_아키텍처_전환_Phase1_노트본문.md (pumice repo).
+ * 27_실제_퍼블리시_사이트_아키텍처_조사.md / 28_실제_아키텍처_전환_Phase1_노트본문.md /
+ * 37_실제_아키텍처_전환_TOC_재설계.md / 38_실제_아키텍처_전환_검색_그래프_실제화.md (pumice repo).
  *
  * Real Obsidian Publish serves raw markdown + a whole-vault metadata cache and renders client-
- * side (confirmed live via curl against publish-01.obsidian.md). This file is pumice-server's own
- * from-scratch reimplementation of that idea -- not a copy of Obsidian's app.js, which was never
- * read, only observed from the outside (network payloads/content-types). It targets the same
- * markdown subset python-markdown's `extra`/`codehilite`/`toc` extensions already produce
- * server-side (see web.py's _render_publish_page), not full CommonMark compliance.
+ * side. This file is pumice-server's own from-scratch reimplementation of that idea -- verified
+ * two ways as this project evolved: live behavioral observation (curl, then later Claude in
+ * Chrome browser automation against real published sites), and, for the pieces observation alone
+ * couldn't settle (outline scroll-spy, search, graph), reading the actual
+ * publish.obsidian.md/app.js bundle directly -- same client-only-reversing methodology this
+ * project already used against the desktop app's obsidian.asar (reference behavior, never copy
+ * code, reimplement fresh). It targets the same markdown subset python-markdown's
+ * `extra`/`codehilite`/`toc` extensions already produce server-side (see web.py's
+ * _render_publish_page), not full CommonMark compliance.
  *
- * Plain vanilla JS, no build step, no dependencies -- same convention as the existing
- * static/dashboard.js and static/login.js. Loaded directly via <script defer src="/static/
+ * Plain vanilla JS, no build step, no own dependencies -- same convention as the existing
+ * static/dashboard.js and static/login.js. static/pixi.min.js (graph rendering) is the one
+ * exception: a vendored, unmodified, MIT-licensed build (the "pixi.js-legacy" variant
+ * specifically, which auto-falls-back to Canvas 2D when WebGL isn't available -- own choice
+ * beyond what was confirmed live), loaded via its own <script> tag exactly the way real Obsidian
+ * Publish's own page loads it too (a separate script before app.js, no bundler on their side
+ * either). Loaded directly via <script defer src="/static/
  * publish_render.js"> and also loadable under Node's `node:test` (see
- * tests/publish_render.test.mjs) via the CommonJS export guard at the bottom.
+ * tests/publish_render.test.cjs) via the CommonJS export guard at the bottom.
  */
 (function () {
   "use strict";
@@ -222,18 +232,21 @@
   }
 
   var SEARCH_RESULT_LIMIT = 20;
-  var SEARCH_SNIPPET_CONTEXT_CHARS = 40;
+  var SEARCH_DEBOUNCE_MS = 300;
 
   function titleFromPath(path) {
     var base = path.indexOf("/") === -1 ? path : path.slice(path.lastIndexOf("/") + 1);
     return /\.md$/i.test(base) ? base.slice(0, -3) : base;
   }
 
-  /** Search index (Phase 3, 28_실제_아키텍처_전환_Phase1_노트본문.md's follow-up) -- one entry
-   * per markdown file in the already-fetched `_cache.json`, using the `searchText` field the
-   * server computed at upload time (see metadata_cache.py's _plain_text_for_search -- this is
-   * pumice's own design, not a confirmed real-Obsidian search wire format: 27_...md's curl sweep
-   * only found /options, /cache and /access, no dedicated search endpoint). */
+  /** Search index (Phase 3, 28_실제_아키텍처_전환_Phase1_노트본문.md's follow-up; redesigned in
+   * 38_실제_아키텍처_전환_검색_그래프_실제화.md after reading real Obsidian's app.js) -- one entry
+   * per markdown file in the already-fetched `_cache.json`, title/filename only. Real Obsidian's
+   * own client never receives note bodies at all (confirmed live: `_cache.json`-equivalent
+   * entries carry only structural metadata -- headings/links/listItems/blocks -- no text; a
+   * `POST {host}/search` call is what actually finds body-text matches, per app.js's
+   * `getCachedResults()`/`runFullSearch()`). `searchNotes` below mirrors `getCachedResults()`:
+   * instant, synchronous, title-only. */
   function buildSearchIndex(cache, urlPrefix) {
     var index = [];
     Object.keys(cache).forEach(function (path) {
@@ -243,23 +256,15 @@
         path: path,
         title: titleFromPath(path),
         href: resolveWikilinkHref(path, cache, urlPrefix),
-        searchText: entry.searchText || "",
       });
     });
     return index;
   }
 
-  function extractSnippet(text, query, contextChars) {
-    var idx = text.toLowerCase().indexOf(query.toLowerCase());
-    if (idx === -1) return text.slice(0, contextChars * 2);
-    var start = Math.max(0, idx - contextChars);
-    var end = Math.min(text.length, idx + query.length + contextChars);
-    return (start > 0 ? "..." : "") + text.slice(start, end) + (end < text.length ? "..." : "");
-  }
-
-  /** Case-insensitive substring match against title or searchText, capped at
+  /** Case-insensitive substring match against title/filename only, capped at
    * SEARCH_RESULT_LIMIT results (own reasonable default -- a dropdown, not a full results
-   * page) in index order. */
+   * page) in index order. Mirrors real Obsidian's own instant `getCachedResults()` -- see
+   * buildSearchIndex's doc comment. */
   function searchNotes(index, query) {
     var trimmed = (query || "").trim();
     if (!trimmed) return [];
@@ -267,26 +272,68 @@
     var results = [];
     for (var i = 0; i < index.length && results.length < SEARCH_RESULT_LIMIT; i++) {
       var item = index[i];
-      var titleMatch = item.title.toLowerCase().indexOf(lower) !== -1;
-      var textMatch = item.searchText.toLowerCase().indexOf(lower) !== -1;
-      if (!titleMatch && !textMatch) continue;
-      results.push({
-        path: item.path, title: item.title, href: item.href,
-        snippet: textMatch ? extractSnippet(item.searchText, trimmed, SEARCH_SNIPPET_CONTEXT_CHARS) : "",
-      });
+      if (item.title.toLowerCase().indexOf(lower) === -1) continue;
+      results.push({ path: item.path, title: item.title, href: item.href, snippet: "" });
     }
     return results;
   }
 
-  /** Graph view (Phase 4, 28_실제_아키텍처_전환_Phase1_노트본문.md's follow-up) -- like search
-   * (Phase 3), real Obsidian's own graph wire format is unconfirmed (27_...md's curl sweep only
-   * found /options, /cache, /access), so this is pumice's own design built from the same
-   * whole-vault `_cache.json` already fetched. Scope: only markdown files that are actual nodes
-   * in this vault's cache, only links that resolve to another such file (an unresolved/external
-   * link target doesn't get a node) -- matches buildBacklinks' own resolved-links-only scope. A
-   * link that appears more than once, or in both directions between the same two files, collapses
-   * into a single undirected edge (the graph is for showing connectivity, not link direction/
-   * count). */
+  /** Merges the instant title-only results with the (slower, debounced) server-side body-text
+   * results, mirroring real Obsidian's own merge in `updateSearch()`: title matches keep their
+   * place, then any NEW path from the body-search results (deduplicated) is appended with its
+   * server-built snippet, capped at SEARCH_RESULT_LIMIT overall. */
+  function mergeSearchResults(titleResults, serverResults, cache, urlPrefix) {
+    var seen = {};
+    titleResults.forEach(function (r) { seen[r.path] = true; });
+    var merged = titleResults.slice();
+    serverResults.forEach(function (r) {
+      if (seen[r.path]) return;
+      seen[r.path] = true;
+      merged.push({
+        path: r.path,
+        title: titleFromPath(r.path),
+        href: resolveWikilinkHref(r.path, cache, urlPrefix),
+        snippet: r.snippet || "",
+      });
+    });
+    return merged.slice(0, SEARCH_RESULT_LIMIT);
+  }
+
+  /** POSTs to this vault's own `_search` reserved path (web.py's `_search_note_bodies`) --
+   * pumice's own server-side counterpart to real Obsidian's `POST {host}/search`. Unlike real
+   * Obsidian (which fetches each shown result's raw content separately just to build a snippet,
+   * confirmed live via network capture), pumice's server already has the matched text in hand
+   * while searching, so it returns `{path, snippet}` directly in one round trip -- an intentional
+   * improvement, not a missed detail (same category of deliberate deviation as keeping slug
+   * anchors over real Obsidian's raw-heading-text URL hash: same visitor-visible behavior, fewer
+   * requests). No retry-with-backoff (real Obsidian's client does up to 3, confirmed via app.js)
+   * -- this is a single self-hosted server, not a globally-distributed CDN-backed service, so
+   * that resilience isn't worth the complexity here; a failed search just resolves to []. */
+  function runServerSearch(query, urlPrefix) {
+    return fetch(urlPrefix + "_search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: query }),
+    }).then(function (r) {
+      if (!r.ok) return [];
+      return r.json();
+    }).then(function (res) {
+      return (res && res.results) || [];
+    }).catch(function () {
+      return [];
+    });
+  }
+
+  /** Graph view (Phase 4, 28_실제_아키텍처_전환_Phase1_노트본문.md's follow-up; graph *rendering*
+   * redesigned in 38_실제_아키텍처_전환_검색_그래프_실제화.md after reading real Obsidian's app.js)
+   * -- built from the same whole-vault `_cache.json` already fetched (this part was never
+   * confirmed to be real Obsidian's own wire format either, but it doesn't need to be: the graph
+   * is derived from data the page already has, real Obsidian's own client does the same). Scope:
+   * only markdown files that are actual nodes in this vault's cache, only links that resolve to
+   * another such file (an unresolved/external link target doesn't get a node) -- matches
+   * buildBacklinks' own resolved-links-only scope. A link that appears more than once, or in both
+   * directions between the same two files, collapses into a single undirected edge (the graph is
+   * for showing connectivity, not link direction/count). */
   function buildGraph(cache) {
     var nodes = [];
     var nodePaths = {};
@@ -323,7 +370,13 @@
    * are reproducible and testable: nodes start on a circle (ordered by index) and every
    * iteration pushes every node pair apart while pulling edge-connected pairs together, with a
    * cooling "temperature" that shrinks the max per-iteration move so the layout settles instead
-   * of oscillating forever. Returns {[path]: {x, y}}. */
+   * of oscillating forever. Returns {[path]: {x, y}}.
+   *
+   * Run inside static/graph_worker.js (a real Web Worker), not on the main thread -- confirmed
+   * live by reading real Obsidian's app.js: it runs its own equivalent physics in a dedicated
+   * `new Worker("/sim.js", {name: "Graph Worker"})` rather than blocking the UI thread. This
+   * function itself is unchanged/still synchronous -- wireGraph (below) is what moved the call
+   * into a worker; layoutGraph stays plain, pure, and directly unit-testable either way. */
   function layoutGraph(graph, opts) {
     opts = opts || {};
     var width = opts.width || 600;
@@ -385,27 +438,87 @@
     return positions;
   }
 
-  /** Renders a laid-out graph as an inline SVG string -- each node is a clickable, permalink-
-   * resolved <a><circle></a> (reusing resolveWikilinkHref, same as every other cross-note link
-   * this renderer produces), the current note's node gets a distinguishing class. */
-  function renderGraphSvg(graph, positions, cache, urlPrefix, currentPath, width, height) {
+  /** Converts a CSS color value (hex `#rrggbb` or `rgb(a)(...)`, the only two forms this page's
+   * own theme variables ever use -- see publish_page.jinja2's `:root` custom properties) into the
+   * 0xRRGGBB integer PixiJS' Graphics fill/line color wants. Falls back to a neutral gray for
+   * anything else (an unparsed/empty computed style value) rather than throwing, since a slightly
+   * wrong graph color is harmless. Pure and unit-testable, unlike the PixiJS drawing calls that
+   * consume it (renderGraphPixi below), which need a real canvas/WebGL context. */
+  function cssColorToPixiHex(cssColor) {
+    var value = (cssColor || "").trim();
+    var hexMatch = /^#([0-9a-f]{6})$/i.exec(value);
+    if (hexMatch) return parseInt(hexMatch[1], 16);
+    var rgbMatch = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(value);
+    if (rgbMatch) {
+      return (parseInt(rgbMatch[1], 10) << 16) + (parseInt(rgbMatch[2], 10) << 8) + parseInt(rgbMatch[3], 10);
+    }
+    return 0x888888;
+  }
+
+  /** Renders a laid-out graph via PixiJS/WebGL (static/pixi.min.js, loaded as a plain global
+   * `PIXI` the same way real Obsidian Publish itself loads it -- confirmed live: its own page
+   * loads a separate `<script src=".../lib/pixi.min.js">` before app.js, no bundler on their side
+   * either, matching this project's own "vanilla JS, no build step" convention already). Replaces
+   * the earlier plain-SVG renderer -- real Obsidian's graph is WebGL-rendered, confirmed by
+   * reading app.js's PIXI.* usage. Theme-aware: colors are read from this page's own CSS custom
+   * properties (via cssColorToPixiHex) rather than hardcoded, so the graph matches whichever
+   * light/dark theme is active (33_실제_아키텍처_전환_테마_전환.md). Known scope cut vs real
+   * Obsidian: no pan/zoom -- the static laid-out positions from the worker are rendered as-is,
+   * matching this project's existing (pre-Pixi) graph's own already-static behavior. */
+  function renderGraphPixi(containerEl, graph, positions, cache, urlPrefix, currentPath, width, height) {
     width = width || 600;
     height = height || 600;
-    var edgesSvg = graph.edges.map(function (edge) {
+    containerEl.innerHTML = "";
+
+    var styles = getComputedStyle(document.documentElement);
+    var edgeColor = cssColorToPixiHex(styles.getPropertyValue("--border-color"));
+    var nodeColor = cssColorToPixiHex(styles.getPropertyValue("--wiki-link"));
+    var currentColor = cssColorToPixiHex(styles.getPropertyValue("--accent-blue"));
+    var textColor = cssColorToPixiHex(styles.getPropertyValue("--text-muted"));
+
+    // PIXI.Application's own auto-detection doesn't reliably fall back to CanvasRenderer when
+    // WebGL is unavailable even on the pixi.js-legacy build that bundles it (observed directly:
+    // it throws "Unable to auto-detect a suitable renderer" instead of falling through) --
+    // checking PIXI.utils.isWebGLSupported() up front and passing forceCanvas explicitly avoids
+    // relying on that auto-detection at all.
+    var app = new PIXI.Application({
+      width: width, height: height, backgroundAlpha: 0, antialias: true,
+      resolution: window.devicePixelRatio || 1, autoDensity: true,
+      forceCanvas: !PIXI.utils.isWebGLSupported(),
+    });
+    containerEl.appendChild(app.view);
+
+    var edgesGraphics = new PIXI.Graphics();
+    graph.edges.forEach(function (edge) {
       var s = positions[edge.source], t = positions[edge.target];
-      if (!s || !t) return "";
-      return '<line x1="' + s.x + '" y1="' + s.y + '" x2="' + t.x + '" y2="' + t.y + '" class="graph-edge"></line>';
-    }).join("");
-    var nodesSvg = graph.nodes.map(function (node) {
+      if (!s || !t) return;
+      edgesGraphics.lineStyle(1, edgeColor, 1).moveTo(s.x, s.y).lineTo(t.x, t.y);
+    });
+    app.stage.addChild(edgesGraphics);
+
+    graph.nodes.forEach(function (node) {
       var p = positions[node.path];
-      if (!p) return "";
-      var href = resolveWikilinkHref(node.path, cache, urlPrefix);
+      if (!p) return;
       var isCurrent = node.path === currentPath;
-      var cls = "graph-node" + (isCurrent ? " graph-node-current" : "");
       var r = isCurrent ? 7 : 5;
-      return '<a href="' + escapeAttr(href) + '"><circle cx="' + p.x + '" cy="' + p.y + '" r="' + r + '" class="' + cls + '"><title>' + escapeHtml(node.title) + "</title></circle></a>";
-    }).join("");
-    return '<svg viewBox="0 0 ' + width + " " + height + '" xmlns="http://www.w3.org/2000/svg">' + edgesSvg + nodesSvg + "</svg>";
+
+      var circle = new PIXI.Graphics();
+      circle.beginFill(isCurrent ? currentColor : nodeColor).drawCircle(0, 0, r).endFill();
+      circle.x = p.x;
+      circle.y = p.y;
+      circle.eventMode = "static";
+      circle.cursor = "pointer";
+      var href = resolveWikilinkHref(node.path, cache, urlPrefix);
+      circle.on("pointertap", function () { window.location.href = href; });
+      app.stage.addChild(circle);
+
+      var label = new PIXI.Text(node.title, { fontFamily: "Inter, sans-serif", fontSize: 11, fill: textColor });
+      label.x = p.x + r + 4;
+      label.y = p.y - 6;
+      app.stage.addChild(label);
+    });
+
+    return app;
   }
 
   function renderInline(text, cache, urlPrefix) {
@@ -602,30 +715,63 @@
     return out.join("\n");
   }
 
+  /** Wires the search box: instant title-only results on every keystroke (searchNotes, no
+   * network), then a debounced `POST _search` for body-text matches merged in once it resolves
+   * -- mirrors real Obsidian's own updateSearch()/runFullSearch() two-step flow. A response for
+   * a query that's no longer in the input (the visitor kept typing) is discarded, matching real
+   * Obsidian's own `t.value !== e` staleness check. */
   function wireSearch(inputEl, resultsEl, cache, urlPrefix) {
     var index = buildSearchIndex(cache, urlPrefix);
-    inputEl.addEventListener("input", function () {
-      var results = searchNotes(index, inputEl.value);
+    var debounceTimer = null;
+
+    function renderResults(results) {
       resultsEl.innerHTML = results.map(function (r) {
         var snippetHtml = r.snippet ? '<div class="search-result-snippet">' + escapeHtml(r.snippet) + "</div>" : "";
         return '<a href="' + escapeAttr(r.href) + '"><div class="search-result-title">' + escapeHtml(r.title) + "</div>" + snippetHtml + "</a>";
       }).join("");
+    }
+
+    inputEl.addEventListener("input", function () {
+      var query = inputEl.value;
+      var titleResults = searchNotes(index, query);
+      renderResults(titleResults);
+
+      if (debounceTimer) clearTimeout(debounceTimer);
+      if (!query.trim()) return;
+      var statusEl = document.createElement("div");
+      statusEl.className = "search-status";
+      statusEl.textContent = "Searching...";
+      resultsEl.appendChild(statusEl);
+      debounceTimer = setTimeout(function () {
+        runServerSearch(query, urlPrefix).then(function (serverResults) {
+          if (inputEl.value !== query) return;
+          renderResults(mergeSearchResults(titleResults, serverResults, cache, urlPrefix));
+        });
+      }, SEARCH_DEBOUNCE_MS);
     });
   }
 
   /** Wires the graph-view toggle button/overlay -- the layout is computed lazily on first open
    * (force-directed layout over a whole vault isn't free, no reason to pay for it on every page
-   * load if the visitor never opens the graph) and cached for subsequent opens. */
+   * load if the visitor never opens the graph) and cached for subsequent opens.
+   *
+   * Physics runs in static/graph_worker.js (a real Web Worker, see layoutGraph's own doc comment)
+   * rather than on this thread, so opening the graph doesn't freeze the page while it settles --
+   * the overlay opens immediately and the canvas fills in once the worker posts back positions. */
   function wireGraph(toggleEl, closeEl, overlayEl, containerEl, cache, urlPrefix, currentPath) {
     var rendered = false;
     toggleEl.addEventListener("click", function () {
       if (!rendered) {
+        rendered = true;
         var graph = buildGraph(cache);
         var rect = containerEl.getBoundingClientRect();
         var size = Math.max(200, Math.min(rect.width || 600, rect.height || 600));
-        var positions = layoutGraph(graph, { width: size, height: size });
-        containerEl.innerHTML = renderGraphSvg(graph, positions, cache, urlPrefix, currentPath, size, size);
-        rendered = true;
+        var worker = new Worker("/static/graph_worker.js");
+        worker.onmessage = function (e) {
+          renderGraphPixi(containerEl, graph, e.data, cache, urlPrefix, currentPath, size, size);
+          worker.terminate();
+        };
+        worker.postMessage({ graph: graph, opts: { width: size, height: size } });
       }
       overlayEl.hidden = false;
     });
@@ -768,15 +914,20 @@
     buildBacklinks: buildBacklinks,
     buildSearchIndex: buildSearchIndex,
     searchNotes: searchNotes,
+    mergeSearchResults: mergeSearchResults,
     buildGraph: buildGraph,
     layoutGraph: layoutGraph,
-    renderGraphSvg: renderGraphSvg,
+    cssColorToPixiHex: cssColorToPixiHex,
     resolveNoteTargetPath: resolveNoteTargetPath,
     renderNotePaneHtml: renderNotePaneHtml,
   };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;
+  } else if (typeof document === "undefined") {
+    // Web Worker context (see static/graph_worker.js, loaded via importScripts) -- no
+    // window/document here, and main() reads both, so just expose the API and stop.
+    self.PumicePublishRenderer = api;
   } else {
     window.PumicePublishRenderer = api;
     if (document.readyState === "loading") {
