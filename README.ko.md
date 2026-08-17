@@ -175,7 +175,9 @@ uv run python scripts/compile_locale.py
 - `/publish/{username}/{vault}/...` — 실제로 퍼블리시된 사이트, 마크다운을 즉석에서 렌더링
   (위키링크 해석, YAML 프런트매터 제거). 볼트 루트에 `publish.css`가 있으면 모든 페이지에
   자동으로 로드됩니다(실제 옵시디언 퍼블리시와 동일) — 재정의 가능한 변수/클래스는
-  [`docs/PUBLISH_CSS.ko.md`](docs/PUBLISH_CSS.ko.md) 참고.
+  [`docs/PUBLISH_CSS.ko.md`](docs/PUBLISH_CSS.ko.md) 참고. `publish.js`도 방식은 같지만
+  커스텀 도메인이 설정돼 있어야만 활성화됩니다([`docs/PUBLISH_JS.ko.md`](docs/PUBLISH_JS.ko.md)
+  참고).
 - `/mcp` — Streamable HTTP 기반 MCP(Model Context Protocol) 서버로, AI 클라이언트에게 동기화된
   vault에 대한 읽기/쓰기 접근을 제공합니다 (아래 "MCP" 참고).
 

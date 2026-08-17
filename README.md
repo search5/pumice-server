@@ -175,6 +175,8 @@ renders accordingly rather than hardcoding a language.
   (wikilinks resolved, YAML frontmatter stripped). A `publish.css` at the vault root is
   auto-loaded on every page, same as real Obsidian Publish — see
   [`docs/PUBLISH_CSS.md`](docs/PUBLISH_CSS.md) for the overridable variables/classes.
+  `publish.js` works the same way but only activates once a custom domain is configured (see
+  [`docs/PUBLISH_JS.md`](docs/PUBLISH_JS.md)).
 - `/mcp` — an MCP (Model Context Protocol) server over Streamable HTTP, giving AI clients
   read/write access to a synced vault (see "MCP" below).
 
