@@ -378,6 +378,71 @@ test("layoutGraph pulls connected nodes closer together than to an unconnected n
   assert.ok(distAB < distAC, `expected connected AB (${distAB}) closer than unconnected AC (${distAC})`);
 });
 
+// ─── WASM-accelerated many-body force (39_그래프_뷰_WASM_Barnes-Hut.md's follow-up to
+// 38_실제_아키텍처_전환_검색_그래프_실제화.md) -- Node has native WebAssembly support, so this
+// actually exercises the real compiled module, not just a mock. ───────────────────────────────
+
+test("the WASM graph-forces module loads successfully", () => {
+  assert.equal(renderer.isGraphForcesWasmLoaded(), true);
+});
+
+test("manyBodyForcesWasm pushes two points directly apart along the line between them", () => {
+  // Two points only -- no aggregation possible, so Barnes-Hut must visit both leaves exactly
+  // (matches the brute-force k*k/dist formula exactly, not just approximately).
+  const { fx, fy } = renderer.manyBodyForcesWasm([0, 10], [0, 0], 5);
+  assert.ok(fx[0] < 0, "point 0 should be pushed in -x, away from point 1");
+  assert.ok(fx[1] > 0, "point 1 should be pushed in +x, away from point 0");
+  assert.equal(fy[0], 0);
+  assert.equal(fy[1], 0);
+  const k = 5;
+  const expectedForce = (k * k) / 10;
+  assert.ok(Math.abs(Math.abs(fx[0]) - expectedForce) < 1e-6, `expected exact k*k/dist force, got ${fx[0]}`);
+});
+
+test("manyBodyForcesWasm returns a zero-length result for an empty input", () => {
+  const { fx, fy } = renderer.manyBodyForcesWasm([], [], 5);
+  assert.deepEqual(fx, []);
+  assert.deepEqual(fy, []);
+});
+
+test("manyBodyForcesWasm approximates brute-force k*k/dist repulsion closely for a small cluster", () => {
+  const xs = [0, 50, 100, 30, 70];
+  const ys = [0, 20, 0, 60, 55];
+  const k = 8;
+  const { fx, fy } = renderer.manyBodyForcesWasm(xs, ys, k);
+
+  const bruteFx = xs.map(() => 0), bruteFy = ys.map(() => 0);
+  for (let i = 0; i < xs.length; i++) {
+    for (let j = 0; j < xs.length; j++) {
+      if (i === j) continue;
+      const dx = xs[i] - xs[j], dy = ys[i] - ys[j];
+      const dist = Math.hypot(dx, dy) || 0.01;
+      const force = (k * k) / dist;
+      bruteFx[i] += (dx / dist) * force;
+      bruteFy[i] += (dy / dist) * force;
+    }
+  }
+  for (let i = 0; i < xs.length; i++) {
+    const err = Math.hypot(fx[i] - bruteFx[i], fy[i] - bruteFy[i]);
+    const mag = Math.hypot(bruteFx[i], bruteFy[i]) || 1;
+    assert.ok(err / mag < 0.5, `point ${i}: WASM force too far from brute force (relative error ${err / mag})`);
+  }
+});
+
+test("layoutGraph stays fast (WASM Barnes-Hut, not the O(n^2) JS fallback) for a graph with hundreds of nodes", () => {
+  const n = 300;
+  const nodes = Array.from({ length: n }, (_, i) => ({ path: `n${i}.md` }));
+  const edges = Array.from({ length: n }, (_, i) => ({ source: `n${i}.md`, target: `n${(i + 1) % n}.md` }));
+  const start = Date.now();
+  const positions = renderer.layoutGraph({ nodes, edges }, { width: 600, height: 600 });
+  const elapsedMs = Date.now() - start;
+  assert.equal(Object.keys(positions).length, n);
+  // Generous ceiling (this project's own benchmark measured ~60ms here; the plain-JS fallback
+  // this replaced measured ~400ms at the same size) -- catches a regression back to O(n^2)
+  // without being flaky about exact timing.
+  assert.ok(elapsedMs < 2000, `expected WASM-accelerated layout well under 2s for ${n} nodes, took ${elapsedMs}ms`);
+});
+
 // Graph *rendering* moved from renderGraphSvg (pure, string-returning, testable) to
 // renderGraphPixi (imperative PixiJS/WebGL canvas drawing -- needs a real browser canvas context,
 // so it's untested here just like wireGraph/wireSearch/wireSlidingWindow already are). Only the
