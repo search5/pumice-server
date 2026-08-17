@@ -481,6 +481,21 @@ msgstr "사용자 계정 관리"
 msgid "publish_public.empty_no_files"
 msgstr "게시된 파일이 없습니다."
 
+msgid "publish_public.search_placeholder"
+msgstr "검색..."
+
+msgid "publish_public.graph_view"
+msgstr "그래프 보기"
+
+msgid "publish_public.graph_toggle_scope"
+msgstr "로컬/전체 그래프 전환"
+
+msgid "publish_public.graph_expand"
+msgstr "그래프 확대"
+
+msgid "publish_public.theme_toggle"
+msgstr "테마 전환"
+
 msgid "devices.create_heading"
 msgstr "새 디바이스 생성"
 

@@ -34,7 +34,7 @@ from twisted.web.server import NOT_DONE_YET, Request
 
 from .mcp_tool_registry import TOOL_DESCRIPTIONS, TOOL_SCHEMAS, dispatch_tool_call
 from .mcp_tools import ToolError, resolve_vault_file_path
-from .streaming_upload_resource import StreamingAuthError, resolve_owner_username
+from .request_auth import StreamingAuthError, resolve_owner_username
 
 logger = logging.getLogger(__name__)
 
@@ -143,9 +143,8 @@ class McpResource(Resource):
 
     async def _handle_post(self, request: Request) -> None:
         try:
-            # Deliberately asyncio.to_thread(), not streaming_upload_resource.py's own
-            # resolve_owner_via_thread() -- that helper returns a Twisted Deferred, and this
-            # whole request is already running inside a plain asyncio.Task (see render_POST),
+            # Deliberately asyncio.to_thread() rather than a Deferred-returning wrapper --
+            # this whole request is already running inside a plain asyncio.Task (see render_POST),
             # not Twisted's own Deferred-driven coroutine machinery, so a raw `await`
             # on a Deferred here fails with "Task got bad yield". asyncio.to_thread's Future
             # is natively awaitable from a plain Task, same as everything else in this method.
@@ -281,7 +280,7 @@ class McpResource(Resource):
 
     def _move_vault_file(self, owner_username: str, vault_id: str, old_path: str, new_path: str) -> dict:
         """Moves a note's live file to a new path, then backs up the result -- mirrors
-        service.py's own rename-detected write path (_finalize_uploaded_file always backs up the
+        service.py's own rename-detected write path (finalize_pushed_file always backs up the
         file at its new location, even though content is unchanged)."""
         old_full_path = resolve_vault_file_path(self._data_dir, owner_username, vault_id, old_path)
         new_full_path = resolve_vault_file_path(self._data_dir, owner_username, vault_id, new_path)

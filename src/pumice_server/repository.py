@@ -3,12 +3,14 @@ from contextlib import contextmanager
 import os
 import json
 import logging
-from typing import Dict, Any, Optional
+import time
+import uuid
+from typing import Callable, Dict, Any, Optional
 
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Index, inspect,
     BigInteger, Integer, String, Boolean, Text,
-    select, insert, update, delete,
+    select, insert, update, delete, func,
 )
 from sqlalchemy.pool import StaticPool
 
@@ -26,6 +28,20 @@ logger = logging.getLogger(__name__)
 # (global, cross-vault) history_id with no check that it belonged to the vault the caller was
 # authorized for, so owning any one vault let you enumerate history_ids and pull file content from
 # other people's vaults. It now requires the caller's owner_username to match too.
+
+
+class VaultAccessDenied(Exception):
+    """Raised by resolve_vault_owner() when the caller has no right to act as the requested
+    owner for this vault -- they're not that owner themselves, and no vault_shares row matches
+    their account's own email for (requested_owner_username, vault_id). See
+    pumice's 14_vault_sharing_설계.md for the full design."""
+
+
+class CustomDomainAlreadyClaimedError(Exception):
+    """Raised by set_custom_domain() when the requested hostname is already claimed by a
+    different (owner, vault) pair -- see pumice's 26_커스텀_도메인_지원.md. A hostname is a
+    DNS asset someone already pointed at this server; silently letting a second vault take it
+    over would break the original owner's site without warning."""
 
 
 class MetadataRepository(ABC):
@@ -57,9 +73,43 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
+    def record_change(self, owner_username: str, vault_id: str, path: str, meta: Dict[str, Any]) -> None:
+        """Appends one row to the vault-wide change journal (`vault_change_log`) -- every call
+        site that mutates file_metadata must also call this with the same 5-key meta dict
+        (path/modified_at_ms/size_bytes/content_hash/is_deleted) passed to save_one/save_all, so
+        a client with a lastKnownChangeId baseline can later ask "what changed since then"
+        without a full-vault Delta scan. See #14_옵시디언싱크_정렬_구현계획.md (pumice repo)."""
+        pass
+
+    @abstractmethod
     def batch(self):
         """Context manager yielding an object with save_one/add_history that share a
         single commit, instead of each call committing (and fsyncing) on its own."""
+        pass
+
+    @abstractmethod
+    def get_changes_since(self, owner_username: str, vault_id: str, since_change_id: int) -> list:
+        """Returns one FileMeta-shaped dict (path/modified_at_ms/size_bytes/content_hash/
+        is_deleted) per path whose vault_change_log entry has change_id > since_change_id,
+        folded to each path's latest recorded state -- PR2's `init` handshake catch-up burst
+        (see #14_옵시디언싱크_정렬_구현계획.md, pumice repo). Nothing calls this with
+        since_change_id=0 in practice (that case skips catch-up entirely client-side), but it's
+        valid and just returns every recorded change for the vault."""
+        pass
+
+    @abstractmethod
+    def get_latest_change_id(self, owner_username: str, vault_id: str) -> int:
+        """The highest change_id recorded for (owner, vault), or 0 if none yet -- sent back in
+        the `ready` op's payload so the client can set its new lastKnownChangeId baseline."""
+        pass
+
+    @abstractmethod
+    def find_live_file_by_content_hash(self, owner_username: str, vault_id: str, content_hash: str) -> Optional[Dict[str, Any]]:
+        """PR6 of #14_옵시디언싱크_정렬_구현계획.md: content-addressed upload dedup. Returns one
+        live (is_deleted=False) file_metadata row whose content_hash matches, or None -- scoped
+        to (owner, vault), never cross-vault/cross-owner (see the caller for why). Always None
+        for content_hash="" (the tombstone/placeholder sentinel elsewhere in this codebase, not
+        a real hash)."""
         pass
 
     @abstractmethod
@@ -71,7 +121,9 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
-    def add_published_file(self, owner_username: str, vault_id: str, path: str, content_hash: str) -> None:
+    def add_published_file(self, owner_username: str, vault_id: str, path: str, content_hash: str,
+                            permalink: Optional[str] = None, updated_at_ms: Optional[int] = None,
+                            description: Optional[str] = None, image: Optional[str] = None) -> None:
         pass
 
     @abstractmethod
@@ -84,6 +136,31 @@ class MetadataRepository(ABC):
 
     @abstractmethod
     def get_published_files(self, owner_username: str, vault_id: str) -> list:
+        pass
+
+    @abstractmethod
+    def get_published_file_by_permalink(self, owner_username: str, vault_id: str, permalink: str) -> Optional[dict]:
+        pass
+
+    @abstractmethod
+    def set_published_file_aliases(self, owner_username: str, vault_id: str, path: str, aliases: list) -> None:
+        pass
+
+    @abstractmethod
+    def get_published_file_by_alias(self, owner_username: str, vault_id: str, alias_path: str) -> Optional[str]:
+        pass
+
+    @abstractmethod
+    def set_custom_domain(self, owner_username: str, vault_id: str, hostname: str,
+                           redirect: bool = False) -> None:
+        pass
+
+    @abstractmethod
+    def get_vault_by_custom_domain(self, hostname: str) -> Optional[dict]:
+        pass
+
+    @abstractmethod
+    def get_custom_domain(self, owner_username: str, vault_id: str) -> Optional[dict]:
         pass
 
     @abstractmethod
@@ -151,6 +228,18 @@ class MetadataRepository(ABC):
         pass
 
     @abstractmethod
+    def get_vault_size_bytes(self, owner_username: str, vault_id: str) -> int:
+        pass
+
+    @abstractmethod
+    def get_total_size_bytes(self, owner_username: str) -> int:
+        pass
+
+    @abstractmethod
+    def purge_vault(self, owner_username: str, vault_id: str) -> list:
+        pass
+
+    @abstractmethod
     def get_all_users(self) -> list:
         pass
 
@@ -164,6 +253,35 @@ class MetadataRepository(ABC):
 
     @abstractmethod
     def update_user_profile(self, username: str, name: str, email: str) -> None:
+        pass
+
+    @abstractmethod
+    def add_vault_share(self, owner_username: str, vault_id: str, email: str) -> str:
+        pass
+
+    @abstractmethod
+    def list_vault_shares(self, owner_username: str, vault_id: str) -> list:
+        pass
+
+    @abstractmethod
+    def remove_vault_share(self, owner_username: str, vault_id: str, share_uid: str) -> bool:
+        pass
+
+    @abstractmethod
+    def remove_vault_share_by_invited_user(self, caller_username: str, owner_username: str, vault_id: str) -> bool:
+        pass
+
+    @abstractmethod
+    def list_shared_vaults_for_user(self, username: str) -> list:
+        pass
+
+    @abstractmethod
+    def get_accepted_share_usernames(self, owner_username: str, vault_id: str) -> list:
+        pass
+
+    @abstractmethod
+    def resolve_vault_owner(self, caller_username: str, requested_owner_username: str, vault_id: str,
+                             mark_accepted: bool = False) -> str:
         pass
 
 
@@ -217,12 +335,47 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         Index("idx_history_owner_vault_path", self._file_history.c.owner_username,
               self._file_history.c.vault_id, self._file_history.c.path)
 
+        # Append-only vault-wide change journal (PR1 of #14_옵시디언싱크_정렬_구현계획.md, pumice
+        # repo) -- unlike file_history above, this is never rewritten (no rename path-mutation)
+        # and never carries a physical backup, purely a metadata event log. change_id is a
+        # global (cross-vault) autoincrement, same pattern as file_history.history_id -- queries
+        # always filter by (owner_username, vault_id) so this is fine, and it's already proven
+        # safe across all 4 supported dialects (see idx_history_owner_vault_path above). Nothing
+        # reads this table yet (that's PR2, the `init` handshake catch-up) -- this PR only wires
+        # up writing to it.
+        self._vault_change_log = Table("vault_change_log", self._meta,
+            Column("change_id", Integer, primary_key=True, autoincrement=True),
+            Column("owner_username", String(100), nullable=False),
+            Column("vault_id", String(255), nullable=False),
+            Column("path", String(500), nullable=False),
+            Column("content_hash", String(64), nullable=False),
+            Column("size_bytes", BigInteger, nullable=False),
+            Column("modified_at_ms", BigInteger, nullable=False),
+            Column("is_deleted", Boolean, nullable=False, default=False),
+            Column("recorded_at_ms", BigInteger, nullable=False),
+        )
+        Index("idx_change_log_owner_vault_change_id", self._vault_change_log.c.owner_username,
+              self._vault_change_log.c.vault_id, self._vault_change_log.c.change_id)
+
         self._published_files = Table("published_files", self._meta,
             Column("owner_username", String(100), primary_key=True),
             Column("vault_id", String(255), primary_key=True),
             Column("path", String(500), primary_key=True),
             Column("content_hash", String(64), nullable=False),
+            # permalink: mirrors real Obsidian Publish's frontmatter `permalink` override (see
+            # 19_permalink_지원.md, pumice repo). Nullable -- most files don't set one.
+            # updated_at_ms: which of two files sharing the same permalink wins on lookup (real
+            # Obsidian has no defined tie-break here; we define ours as "most recently published").
+            Column("permalink", String(500), nullable=True),
+            Column("updated_at_ms", BigInteger, nullable=True),
+            # description/image: frontmatter overrides for this note's social-media preview meta
+            # tags (see 20_description_image_지원.md, pumice repo). image holds either a
+            # vault-relative path or an external absolute URL, as-is -- resolved at render time.
+            Column("description", Text, nullable=True),
+            Column("image", String(1000), nullable=True),
         )
+        Index("idx_published_files_permalink", self._published_files.c.owner_username,
+              self._published_files.c.vault_id, self._published_files.c.permalink)
 
         self._users = Table("users", self._meta,
             Column("username", String(100), primary_key=True),
@@ -298,6 +451,62 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             Column("updated_at_ms", BigInteger, nullable=False),
         )
 
+        # Vault sync sharing (see pumice's 14_vault_sharing_설계.md) -- an owner invites another
+        # account, by email, to get full read/write sync access to one of their vaults. Deliberately
+        # a real indexed table rather than the JSON-file-per-vault pattern web.py's existing
+        # /publish/share/* uses for Publish's own (unrelated) site-viewer sharing: this table is
+        # read on every WS connect (resolve_vault_owner below), not just an occasional REST call.
+        # email is stored lowercased; matching against users.email is always done case-insensitively
+        # too, so an invite survives the invited account's email being entered with different casing.
+        # No unique DB constraint on (owner_username, vault_id, email) -- add_vault_share() enforces
+        # "no duplicate pending invite" in Python instead, same style create_user() already uses for
+        # its own existence check.
+        self._vault_shares = Table("vault_shares", self._meta,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("uid", String(36), nullable=False),
+            Column("owner_username", String(100), nullable=False),
+            Column("vault_id", String(255), nullable=False),
+            Column("email", String(255), nullable=False),
+            Column("accepted", Boolean, nullable=False, default=False),
+            Column("created_at_ms", BigInteger, nullable=False),
+            Column("accepted_at_ms", BigInteger, nullable=True),
+        )
+        Index("idx_vault_shares_owner_vault", self._vault_shares.c.owner_username,
+              self._vault_shares.c.vault_id)
+        Index("idx_vault_shares_email", self._vault_shares.c.email)
+        Index("idx_vault_shares_uid", self._vault_shares.c.uid, unique=True)
+
+        # Old-URL redirects for published notes (see 22_aliases_리다이렉트_및_파비콘_자동감지.md,
+        # pumice repo): mirrors real Obsidian Publish's aliases-based redirect -- a note's
+        # `aliases` frontmatter can list the vault-relative paths it used to live at, so visitors
+        # following a stale link still land on the current file. One row per (owner, vault, alias)
+        # -- alias_path is stored lowercased since real Obsidian's own aliases lookup is
+        # case-insensitive. A brand-new table (unlike published_files' bolted-on columns), so no
+        # ALTER-TABLE backfill is needed -- create_all() below handles it.
+        self._published_file_aliases = Table("published_file_aliases", self._meta,
+            Column("owner_username", String(100), primary_key=True),
+            Column("vault_id", String(255), primary_key=True),
+            Column("alias_path", String(500), primary_key=True),
+            Column("path", String(500), nullable=False),
+        )
+
+        # Custom domains (see 26_커스텀_도메인_지원.md, pumice repo) -- hostname is the PK
+        # since the hot path (a Pyramid route predicate, evaluated on every incoming request) is
+        # exactly "which vault does this Host header belong to", a PK lookup. Stored lowercased
+        # for case-insensitive matching, same reasoning as published_file_aliases. The
+        # (owner_username, vault_id) unique index enforces "at most one custom domain per vault"
+        # at the DB level too -- set_custom_domain()'s delete-then-upsert is the primary
+        # enforcement, this is a safety net. New table, no ALTER-TABLE backfill needed.
+        self._custom_domains = Table("custom_domains", self._meta,
+            Column("hostname", String(255), primary_key=True),
+            Column("owner_username", String(100), nullable=False),
+            Column("vault_id", String(255), nullable=False),
+            Column("redirect_to_custom_domain", Boolean, nullable=False, default=False),
+            Column("updated_at_ms", BigInteger, nullable=False),
+        )
+        Index("idx_custom_domains_owner_vault", self._custom_domains.c.owner_username,
+              self._custom_domains.c.vault_id, unique=True)
+
     def init_db(self) -> None:
         # Runs before the owner-scoping migration below: file_metadata/published_files may still
         # need to be dropped and recreated (their primary key changed shape), so create_all() has
@@ -319,8 +528,61 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             except Exception:
                 pass  # the column already exists
 
+        # Same idempotent backfill for published_files' permalink support (see
+        # 19_permalink_지원.md, pumice repo).
+        for col in (
+            self._published_files.c.permalink, self._published_files.c.updated_at_ms,
+            self._published_files.c.description, self._published_files.c.image,
+        ):
+            col_type = col.type.compile(dialect=self.engine.dialect)
+            stmt = f"ALTER TABLE published_files ADD COLUMN {col.name} {col_type}"
+            try:
+                with self.engine.begin() as conn:
+                    conn.exec_driver_sql(stmt)
+            except Exception:
+                pass  # the column already exists
+
         self._migrate_to_owner_scoped_schema()
         self._migrate_plugin_enablement_to_vault_scoped_schema()
+
+    def _replace_table_safely(self, conn, name: str, new_table: Table, populate: Callable[[Any], None]) -> None:
+        """Swaps `name`'s table for `new_table` (same name, new schema) without ever risking data
+        loss or a missing table if `populate` fails: the current table is renamed aside first and
+        only dropped after `new_table` has been created and populated successfully. Must be
+        called from within an already-open transaction (`conn`); the caller's except block is
+        responsible for calling `_restore_table_backup(name)` to recover if this raises.
+
+        Fixes two real incidents found via a coverage-driven test pass (see llm-wiki/11-*.md):
+        the previous DROP-then-recreate approach permanently lost the old rows if the reinsert
+        failed after the DROP (SQLite's DDL here isn't rolled back by the enclosing transaction,
+        contrary to what the code's own comment used to claim), and left the table entirely
+        missing if table.create() itself failed after the DROP."""
+        backup_name = f"{name}__migration_backup"
+        conn.exec_driver_sql(f"DROP TABLE IF EXISTS {backup_name}")
+        conn.exec_driver_sql(f"ALTER TABLE {name} RENAME TO {backup_name}")
+        new_table.create(conn)
+        populate(conn)
+        conn.exec_driver_sql(f"DROP TABLE {backup_name}")
+
+    def _restore_table_backup(self, name: str) -> None:
+        """Recovery counterpart to _replace_table_safely: if that raised (or the process crashed
+        mid-migration, before a previous run's except block could even attempt this), this
+        restores the pre-migration table from its rename-aside backup -- dropping whatever
+        partial new table may have been left behind -- so a failed/interrupted migration never
+        leaves `name` missing or its old data unrecoverable; the migration simply retries on the
+        next startup. A no-op if there's no backup to restore from."""
+        backup_name = f"{name}__migration_backup"
+        try:
+            with self.engine.begin() as conn:
+                insp = inspect(conn)
+                if not insp.has_table(backup_name):
+                    return
+                if insp.has_table(name):
+                    conn.exec_driver_sql(f"DROP TABLE {name}")
+                conn.exec_driver_sql(f"ALTER TABLE {backup_name} RENAME TO {name}")
+                logger.info(f"Restored {name} from its pre-migration backup after a failed/interrupted migration.")
+        except Exception as restore_err:
+            logger.error(f"Failed to restore {name} from its migration backup -- manual recovery needed: {restore_err}")
 
     def _migrate_to_owner_scoped_schema(self) -> None:
         """One-time, idempotent migration from the old vault_id-only schema to the
@@ -362,15 +624,19 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
 
         # file_metadata / published_files: owner_username joined the primary key, which most
         # dialects can't add to an existing table via a plain ALTER TABLE -- so these are read out
-        # in full, the table is dropped and recreated from the current (correct) Table definition,
-        # and the transformed rows are written back in. The in-memory copy is held until the
-        # reinsert succeeds, so a failure after the DROP still logs exactly what needs restoring
-        # from a backup.
+        # in full, then _replace_table_safely swaps in a freshly-created table (current schema)
+        # populated with the transformed rows, without ever dropping the original until the
+        # replacement is fully built (see that method's docstring for the incidents this avoids).
         for table, cols in (
             (self._file_metadata, ["vault_id", "path", "modified_at_ms", "size_bytes", "content_hash", "is_deleted"]),
-            (self._published_files, ["vault_id", "path", "content_hash"]),
+            (self._published_files, ["vault_id", "path", "content_hash", "permalink", "updated_at_ms", "description", "image"]),
         ):
             name = table.name
+            # Recovers from a hard crash between a previous attempt's rename-aside and its final
+            # drop-the-backup step (the except block below can't run if the process died, not
+            # just raised) -- a no-op if there's nothing to restore.
+            self._restore_table_backup(name)
+            inspector = inspect(self.engine)
             if "owner_username" in [c["name"] for c in inspector.get_columns(name)]:
                 continue  # already migrated
             try:
@@ -381,16 +647,16 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                         {**dict(zip(cols, row)), "owner_username": owners.get(row[0], "")}
                         for row in old_rows
                     ]
-                    conn.exec_driver_sql(f"DROP TABLE {name}")
-                    table.create(conn)
-                    if transformed:
-                        conn.execute(insert(table), transformed)
+
+                    def populate(c, table=table, transformed=transformed) -> None:
+                        if transformed:
+                            c.execute(insert(table), transformed)
+
+                    self._replace_table_safely(conn, name, table, populate)
                     logger.info(f"Migrated {name} to the owner-scoped schema ({len(transformed)} row(s)).")
             except Exception as e:
-                logger.error(
-                    f"Owner-scoping migration for {name} failed -- table may be in an inconsistent "
-                    f"state, restore from backup if so: {e}"
-                )
+                logger.error(f"Owner-scoping migration for {name} failed: {e}")
+                self._restore_table_backup(name)
 
     def _migrate_plugin_enablement_to_vault_scoped_schema(self) -> None:
         """One-time, idempotent migration from the old (owner_username, plugin_id) primary key to
@@ -403,16 +669,23 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
         a plugin enabled under the old schema just needs to re-enable it, this time genuinely
         scoped to the vault(s) that actually use it.
         """
+        name = "plugin_enablement"
+        # Recovers from a hard crash mid-migration on a previous startup -- a no-op otherwise.
+        self._restore_table_backup(name)
         inspector = inspect(self.engine)
-        if "vault_id" in [c["name"] for c in inspector.get_columns("plugin_enablement")]:
+        if "vault_id" in [c["name"] for c in inspector.get_columns(name)]:
             return  # already migrated
         try:
             with self.engine.begin() as conn:
-                conn.exec_driver_sql("DROP TABLE plugin_enablement")
-                self._plugin_enablement.create(conn)
+                # Old rows are intentionally discarded on a *successful* migration (see docstring
+                # above) -- _replace_table_safely's rename-aside-then-drop only protects the
+                # failure path (table.create() itself failing used to leave plugin_enablement
+                # missing entirely; see llm-wiki/11-*.md), not the normal no-data-carried-over case.
+                self._replace_table_safely(conn, name, self._plugin_enablement, lambda c: None)
                 logger.info("Migrated plugin_enablement to the vault-scoped schema (old rows dropped -- re-enable per vault).")
         except Exception as e:
-            logger.error(f"plugin_enablement vault-scoping migration failed (non-fatal): {e}")
+            logger.error(f"plugin_enablement vault-scoping migration failed: {e}")
+            self._restore_table_backup(name)
 
     def _upsert(self, conn, table: Table, record: dict, pk_cols: list) -> None:
         pk_filter = [table.c[col] == record[col] for col in pk_cols]
@@ -491,6 +764,65 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 related_path=related_path,
             ))
 
+    def record_change(self, owner_username: str, vault_id: str, path: str, meta: Dict[str, Any]) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(insert(self._vault_change_log).values(
+                owner_username=owner_username,
+                vault_id=vault_id,
+                path=path,
+                content_hash=meta["content_hash"],
+                size_bytes=meta["size_bytes"],
+                modified_at_ms=meta["modified_at_ms"],
+                is_deleted=bool(meta["is_deleted"]),
+                recorded_at_ms=int(time.time() * 1000),
+            ))
+
+    def get_changes_since(self, owner_username: str, vault_id: str, since_change_id: int) -> list:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(self._vault_change_log).where(
+                    self._vault_change_log.c.owner_username == owner_username,
+                    self._vault_change_log.c.vault_id == vault_id,
+                    self._vault_change_log.c.change_id > since_change_id,
+                ).order_by(self._vault_change_log.c.change_id)
+            ).fetchall()
+            # Folds to each path's LATEST row -- rows are read in ascending change_id order, so
+            # a later dict assignment for the same path naturally clobbers an earlier one.
+            folded: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                folded[r.path] = {
+                    "path": r.path,
+                    "modified_at_ms": r.modified_at_ms,
+                    "size_bytes": r.size_bytes,
+                    "content_hash": r.content_hash,
+                    "is_deleted": bool(r.is_deleted),
+                }
+            return list(folded.values())
+
+    def get_latest_change_id(self, owner_username: str, vault_id: str) -> int:
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                select(func.max(self._vault_change_log.c.change_id)).where(
+                    self._vault_change_log.c.owner_username == owner_username,
+                    self._vault_change_log.c.vault_id == vault_id,
+                )
+            ).scalar()
+            return int(result) if result is not None else 0
+
+    def find_live_file_by_content_hash(self, owner_username: str, vault_id: str, content_hash: str) -> Optional[Dict[str, Any]]:
+        if not content_hash:
+            return None
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._file_metadata).where(
+                    self._file_metadata.c.owner_username == owner_username,
+                    self._file_metadata.c.vault_id == vault_id,
+                    self._file_metadata.c.content_hash == content_hash,
+                    self._file_metadata.c.is_deleted.is_(False),
+                )
+            ).fetchone()
+            return self._row_to_meta(row) if row else None
+
     @contextmanager
     def batch(self):
         with self.engine.begin() as conn:
@@ -540,13 +872,19 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             ).fetchone()
             return dict(row._mapping) if row else None
 
-    def add_published_file(self, owner_username: str, vault_id: str, path: str, content_hash: str) -> None:
+    def add_published_file(self, owner_username: str, vault_id: str, path: str, content_hash: str,
+                            permalink: Optional[str] = None, updated_at_ms: Optional[int] = None,
+                            description: Optional[str] = None, image: Optional[str] = None) -> None:
         with self.engine.begin() as conn:
             self._upsert(conn, self._published_files, {
                 "owner_username": owner_username,
                 "vault_id": vault_id,
                 "path": path,
                 "content_hash": content_hash,
+                "permalink": permalink,
+                "updated_at_ms": updated_at_ms if updated_at_ms is not None else int(time.time() * 1000),
+                "description": description,
+                "image": image,
             }, ["owner_username", "vault_id", "path"])
 
     def remove_published_file(self, owner_username: str, vault_id: str, path: str) -> None:
@@ -567,7 +905,112 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                     self._published_files.c.vault_id == vault_id,
                 )
             ).fetchall()
-            return [{"path": r.path, "hash": r.content_hash} for r in rows]
+            return [
+                {"path": r.path, "hash": r.content_hash, "permalink": r.permalink,
+                 "description": r.description, "image": r.image}
+                for r in rows
+            ]
+
+    def get_published_file_by_permalink(self, owner_username: str, vault_id: str, permalink: str) -> Optional[dict]:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._published_files).where(
+                    self._published_files.c.owner_username == owner_username,
+                    self._published_files.c.vault_id == vault_id,
+                    self._published_files.c.permalink == permalink,
+                )
+                # Collision tie-break (see 19_permalink_지원.md): the most recently published file
+                # wins when two files share a permalink -- deterministic, unlike real Obsidian's own
+                # unspecified iteration-order behavior.
+                .order_by(self._published_files.c.updated_at_ms.desc())
+                .limit(1)
+            ).fetchone()
+            return {"path": row.path, "hash": row.content_hash} if row else None
+
+    def set_published_file_aliases(self, owner_username: str, vault_id: str, path: str, aliases: list) -> None:
+        # Full replace, not incremental upsert: a republish's alias list is the complete current
+        # truth for this file, so any alias no longer present (removed from frontmatter, or the
+        # list shrank) must stop redirecting -- same reasoning as add_published_file's
+        # permalink=None clearing a previously-set permalink.
+        with self.engine.begin() as conn:
+            conn.execute(
+                delete(self._published_file_aliases).where(
+                    self._published_file_aliases.c.owner_username == owner_username,
+                    self._published_file_aliases.c.vault_id == vault_id,
+                    self._published_file_aliases.c.path == path,
+                )
+            )
+            for alias in aliases:
+                self._upsert(conn, self._published_file_aliases, {
+                    "owner_username": owner_username,
+                    "vault_id": vault_id,
+                    # Stored lowercased: real Obsidian's own aliases lookup is case-insensitive
+                    # (confirmed via obsidian.asar -- see 22_aliases_리다이렉트_및_파비콘_자동감지.md).
+                    "alias_path": alias.lower(),
+                    "path": path,
+                }, ["owner_username", "vault_id", "alias_path"])
+
+    def get_published_file_by_alias(self, owner_username: str, vault_id: str, alias_path: str) -> Optional[str]:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._published_file_aliases.c.path).where(
+                    self._published_file_aliases.c.owner_username == owner_username,
+                    self._published_file_aliases.c.vault_id == vault_id,
+                    self._published_file_aliases.c.alias_path == alias_path.lower(),
+                )
+            ).fetchone()
+            return row.path if row else None
+
+    def set_custom_domain(self, owner_username: str, vault_id: str, hostname: str,
+                           redirect: bool = False) -> None:
+        hostname = (hostname or "").strip().lower()
+        with self.engine.begin() as conn:
+            if hostname:
+                existing = conn.execute(
+                    select(self._custom_domains.c.owner_username, self._custom_domains.c.vault_id)
+                    .where(self._custom_domains.c.hostname == hostname)
+                ).fetchone()
+                if existing and (existing.owner_username, existing.vault_id) != (owner_username, vault_id):
+                    raise CustomDomainAlreadyClaimedError(hostname)
+            # A vault has at most one custom domain -- full replace, same pattern as
+            # set_published_file_aliases (delete this vault's row, then re-add if a hostname
+            # was given). hostname="" just releases it.
+            conn.execute(delete(self._custom_domains).where(
+                self._custom_domains.c.owner_username == owner_username,
+                self._custom_domains.c.vault_id == vault_id,
+            ))
+            if hostname:
+                self._upsert(conn, self._custom_domains, {
+                    "hostname": hostname,
+                    "owner_username": owner_username,
+                    "vault_id": vault_id,
+                    "redirect_to_custom_domain": redirect,
+                    "updated_at_ms": int(time.time() * 1000),
+                }, ["hostname"])
+
+    def get_vault_by_custom_domain(self, hostname: str) -> Optional[dict]:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._custom_domains).where(
+                    self._custom_domains.c.hostname == (hostname or "").strip().lower()
+                )
+            ).fetchone()
+            return {
+                "owner_username": row.owner_username, "vault_id": row.vault_id,
+                "redirect_to_custom_domain": bool(row.redirect_to_custom_domain),
+            } if row else None
+
+    def get_custom_domain(self, owner_username: str, vault_id: str) -> Optional[dict]:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(self._custom_domains).where(
+                    self._custom_domains.c.owner_username == owner_username,
+                    self._custom_domains.c.vault_id == vault_id,
+                )
+            ).fetchone()
+            return {
+                "hostname": row.hostname, "redirect_to_custom_domain": bool(row.redirect_to_custom_domain),
+            } if row else None
 
     def enable_plugin(self, owner_username: str, vault_id: str, plugin_id: str, enabled_at_ms: int) -> None:
         with self.engine.begin() as conn:
@@ -731,6 +1174,79 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             ).fetchall()}
             return sorted(meta_ids | pub_ids)
 
+    def get_vault_size_bytes(self, owner_username: str, vault_id: str) -> int:
+        with self.engine.connect() as conn:
+            total = conn.execute(
+                select(func.sum(self._file_metadata.c.size_bytes)).where(
+                    self._file_metadata.c.owner_username == owner_username,
+                    self._file_metadata.c.vault_id == vault_id,
+                    self._file_metadata.c.is_deleted.is_(False),
+                )
+            ).scalar()
+            return int(total) if total is not None else 0
+
+    def get_total_size_bytes(self, owner_username: str) -> int:
+        with self.engine.connect() as conn:
+            total = conn.execute(
+                select(func.sum(self._file_metadata.c.size_bytes)).where(
+                    self._file_metadata.c.owner_username == owner_username,
+                    self._file_metadata.c.is_deleted.is_(False),
+                )
+            ).scalar()
+            return int(total) if total is not None else 0
+
+    def purge_vault(self, owner_username: str, vault_id: str) -> list:
+        """Deletes every file_metadata/file_history row for (owner, vault) and returns the
+        removed history rows' backup_file_path list -- this class never touches the filesystem
+        itself (see the rest of this file), so the caller (service.py, which already owns
+        _backup_file/finalize_pushed_file's disk I/O) is responsible for actually deleting
+        those backup files and the vault's own directory.
+
+        Also records a tombstone in vault_change_log for every currently-live path before
+        wiping file_metadata (#14_옵시디언싱크_정렬_구현계획.md's "PurgeVault와의 상호작용"): a
+        client resuming from an old lastKnownChangeId must still learn every one of its known
+        files is gone, not just find "nothing changed since then" because the rows it would have
+        compared against no longer exist at all."""
+        with self.engine.begin() as conn:
+            backup_paths = [
+                r.backup_file_path for r in conn.execute(
+                    select(self._file_history.c.backup_file_path).where(
+                        self._file_history.c.owner_username == owner_username,
+                        self._file_history.c.vault_id == vault_id,
+                    )
+                ).fetchall()
+            ]
+
+            live_paths = conn.execute(
+                select(self._file_metadata.c.path).where(
+                    self._file_metadata.c.owner_username == owner_username,
+                    self._file_metadata.c.vault_id == vault_id,
+                    self._file_metadata.c.is_deleted.is_(False),
+                )
+            ).fetchall()
+            now_ms = int(time.time() * 1000)
+            for row in live_paths:
+                conn.execute(insert(self._vault_change_log).values(
+                    owner_username=owner_username,
+                    vault_id=vault_id,
+                    path=row.path,
+                    content_hash="",
+                    size_bytes=0,
+                    modified_at_ms=now_ms,
+                    is_deleted=True,
+                    recorded_at_ms=now_ms,
+                ))
+
+            conn.execute(delete(self._file_history).where(
+                self._file_history.c.owner_username == owner_username,
+                self._file_history.c.vault_id == vault_id,
+            ))
+            conn.execute(delete(self._file_metadata).where(
+                self._file_metadata.c.owner_username == owner_username,
+                self._file_metadata.c.vault_id == vault_id,
+            ))
+            return backup_paths
+
     def get_all_users(self) -> list:
         with self.engine.connect() as conn:
             rows = conn.execute(select(self._users)).fetchall()
@@ -759,6 +1275,142 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             conn.execute(
                 update(self._users).where(self._users.c.username == username).values(name=name, email=email)
             )
+
+    def add_vault_share(self, owner_username: str, vault_id: str, email: str) -> str:
+        email = email.strip().lower()
+        with self.engine.begin() as conn:
+            existing = conn.execute(
+                select(self._vault_shares).where(
+                    self._vault_shares.c.owner_username == owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                    self._vault_shares.c.email == email,
+                )
+            ).fetchone()
+            if existing:
+                return existing.uid
+
+            share_uid = str(uuid.uuid4())
+            conn.execute(insert(self._vault_shares).values(
+                uid=share_uid,
+                owner_username=owner_username,
+                vault_id=vault_id,
+                email=email,
+                accepted=False,
+                created_at_ms=int(time.time() * 1000),
+            ))
+            return share_uid
+
+    def list_vault_shares(self, owner_username: str, vault_id: str) -> list:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(self._vault_shares).where(
+                    self._vault_shares.c.owner_username == owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                ).order_by(self._vault_shares.c.created_at_ms)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def remove_vault_share(self, owner_username: str, vault_id: str, share_uid: str) -> bool:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                delete(self._vault_shares).where(
+                    self._vault_shares.c.owner_username == owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                    self._vault_shares.c.uid == share_uid,
+                )
+            )
+            return result.rowcount > 0
+
+    def remove_vault_share_by_invited_user(self, caller_username: str, owner_username: str, vault_id: str) -> bool:
+        with self.engine.begin() as conn:
+            caller = conn.execute(
+                select(self._users.c.email).where(self._users.c.username == caller_username)
+            ).fetchone()
+            if not caller or not caller.email:
+                return False
+
+            result = conn.execute(
+                delete(self._vault_shares).where(
+                    self._vault_shares.c.owner_username == owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                    self._vault_shares.c.email == caller.email.strip().lower(),
+                )
+            )
+            return result.rowcount > 0
+
+    def list_shared_vaults_for_user(self, username: str) -> list:
+        with self.engine.connect() as conn:
+            user_row = conn.execute(
+                select(self._users.c.email).where(self._users.c.username == username)
+            ).fetchone()
+            if not user_row or not user_row.email:
+                return []
+
+            rows = conn.execute(
+                select(self._vault_shares).where(
+                    self._vault_shares.c.email == user_row.email.strip().lower(),
+                ).order_by(self._vault_shares.c.created_at_ms)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def get_accepted_share_usernames(self, owner_username: str, vault_id: str) -> list:
+        with self.engine.connect() as conn:
+            share_emails = conn.execute(
+                select(self._vault_shares.c.email).where(
+                    self._vault_shares.c.owner_username == owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                    self._vault_shares.c.accepted.is_(True),
+                )
+            ).fetchall()
+            usernames = []
+            for row in share_emails:
+                user_row = conn.execute(
+                    select(self._users.c.username).where(func.lower(self._users.c.email) == row.email)
+                ).fetchone()
+                if user_row:
+                    usernames.append(user_row.username)
+            return usernames
+
+    def resolve_vault_owner(self, caller_username: str, requested_owner_username: str, vault_id: str,
+                             mark_accepted: bool = False) -> str:
+        # Self-owned short circuit: today's exact behavior, zero extra queries. Every existing
+        # (non-shared) call site keeps working byte-for-byte identically through this branch.
+        if not requested_owner_username or requested_owner_username == caller_username:
+            return caller_username
+
+        with self.engine.begin() as conn:
+            caller = conn.execute(
+                select(self._users.c.email).where(self._users.c.username == caller_username)
+            ).fetchone()
+            if not caller or not caller.email:
+                raise VaultAccessDenied(f"{caller_username} has no email on file")
+
+            caller_email = caller.email.strip().lower()
+            share = conn.execute(
+                select(self._vault_shares).where(
+                    self._vault_shares.c.owner_username == requested_owner_username,
+                    self._vault_shares.c.vault_id == vault_id,
+                    self._vault_shares.c.email == caller_email,
+                )
+            ).fetchone()
+            if not share:
+                raise VaultAccessDenied(
+                    f"{caller_username} has no share for {requested_owner_username}/{vault_id}"
+                )
+
+            # Binary access, no role gate: a still-pending share already grants full access
+            # (matches real Obsidian Sync -- accepted is just an owner-facing status label, not
+            # a permission check). mark_accepted=True flips it exactly once, from the one call
+            # site (SyncWsSession._handle_init) where a live sync connection is the strongest
+            # signal of genuine access-taking.
+            if mark_accepted and not share.accepted:
+                conn.execute(
+                    update(self._vault_shares).where(self._vault_shares.c.id == share.id).values(
+                        accepted=True, accepted_at_ms=int(time.time() * 1000),
+                    )
+                )
+
+        return requested_owner_username
 
 
 class _SqlAlchemyBatch:
@@ -796,5 +1448,17 @@ class _SqlAlchemyBatch:
             user_name=user_name,
             deleted=deleted,
             related_path=related_path,
+        ))
+
+    def record_change(self, owner_username: str, vault_id: str, path: str, meta: Dict[str, Any]) -> None:
+        self._conn.execute(insert(self._repo._vault_change_log).values(
+            owner_username=owner_username,
+            vault_id=vault_id,
+            path=path,
+            content_hash=meta["content_hash"],
+            size_bytes=meta["size_bytes"],
+            modified_at_ms=meta["modified_at_ms"],
+            is_deleted=bool(meta["is_deleted"]),
+            recorded_at_ms=int(time.time() * 1000),
         ))
 

@@ -56,6 +56,9 @@ class FakeRepository:
     def save_one(self, owner_username, vault_id, path, meta):
         self.calls.append(("save_one", owner_username, vault_id, path, meta))
 
+    def record_change(self, owner_username, vault_id, path, meta):
+        self.calls.append(("record_change", owner_username, vault_id, path, meta))
+
     def add_history(self, **kwargs):
         self.calls.append(("add_history", kwargs))
 

@@ -1,0 +1,37 @@
+/* Example publish.js -- demonstrates docs/PUBLISH_JS.md's timing note: a fixed corner badge
+   runs immediately (no dependency on note content), while the appended paragraph waits for
+   #pumice-note-root to actually have children, since there's no "note content ready" event to
+   listen for. Drop a file named exactly this at the vault root and pumice-server auto-loads it
+   -- but only once the site has a custom domain configured (see docs/PUBLISH_JS.md). */
+
+console.log("[publish.js example] loaded");
+
+var badge = document.createElement("div");
+badge.textContent = "⚡ Custom publish.js active";
+badge.style.cssText =
+  "position:fixed;bottom:12px;right:12px;background:#0969da;color:#fff;" +
+  "padding:6px 12px;border-radius:6px;font:13px sans-serif;z-index:999;";
+document.body.appendChild(badge);
+
+function whenNoteReady(callback) {
+  var root = document.getElementById("pumice-note-root");
+  if (root && root.children.length > 0) {
+    callback(root);
+    return;
+  }
+  var timer = setInterval(function () {
+    var r = document.getElementById("pumice-note-root");
+    if (r && r.children.length > 0) {
+      clearInterval(timer);
+      callback(r);
+    }
+  }, 100);
+}
+
+whenNoteReady(function (root) {
+  console.log("[publish.js example] note content ready, appending paragraph");
+  var note = document.createElement("p");
+  note.textContent = "This paragraph was appended by publish.js after the note finished rendering.";
+  note.style.cssText = "margin-top:24px;padding:12px;border-left:3px solid #0969da;color:#57606a;";
+  root.appendChild(note);
+});

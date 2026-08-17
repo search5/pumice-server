@@ -1,6 +1,6 @@
 [project]
 name = "pumice-server"
-version = "0.2.8"
+version = "0.2.9"
 description = "Self-hosted sync/version-history/publish backend for the Pumice Obsidian plugin."
 readme = "README.md"
 authors = [
@@ -8,10 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "grpcio>=1.81.1",
-    "grpcio-tools>=1.81.1",
     "markdown>=3.10.2",
-    "protobuf>=6.33.6",
     "psycopg2-binary>=2.9",
     "pymysql>=1.1",
     "sqlalchemy>=2.0",
@@ -24,6 +21,8 @@ dependencies = [
     "pyramid-jinja2>=2.10.1",
     "babel>=2.18.0",
     "pumice-plugin-immich>=0.1.0",
+    "autobahn[twisted]>=26.7.1",
+    "pyyaml>=6.0.3",
 ]
 
 [project.urls]
@@ -42,9 +41,21 @@ sqlalchemy-cubrid = { git = "https://github.com/search5/sqlalchemy_cubrid" }
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
     "pytest-twisted>=1.14.3",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["src/pumice_server"]
+
+[tool.coverage.report]
+# Abstract-method stub bodies (MetadataRepository's @abstractmethod defs) are never executed --
+# the concrete SqlAlchemyMetadataRepository always overrides them -- so chasing "coverage" on a
+# bare `pass` there is meaningless busywork, not a real test gap.
+exclude_also = [
+    "^\\s*pass$",
+]

@@ -3,11 +3,15 @@
 🇺🇸 English | [🇰🇷 한국어](README.ko.md)
 
 Self-hosted sync/version-history/publish backend for the [Pumice](https://github.com/search5/pumice)
-Obsidian plugin. Built on Python 3.13+ and Twisted (`asyncioreactor`): the sync RPCs (`Delta`,
-`UploadFiles`, `DownloadFiles`, ...) are served by a native gRPC-Web `Resource`
-(`src/pumice_server/grpc_web_resource.py`) driven directly off the reactor's event loop, and a Pyramid app
-handles the publish site, REST endpoints, and the web login/admin dashboard -- both share a single
-HTTP port.
+Obsidian plugin. Built on Python 3.13+ and Twisted (`asyncioreactor`): file sync (`delta`,
+file push/pull, version history) runs over a single persistent WebSocket connection per vault
+(`/ws`, `src/pumice_server/ws_sync_resource.py`), modeled on Obsidian's own built-in Sync plugin
+protocol so changes made anywhere show up live instead of on a polling interval. A Pyramid app
+handles the publish site, REST endpoints, and the web login/admin dashboard -- both share a
+single HTTP port.
+
+Older versions used gRPC-Web (one request per RPC, no live push); this version replaces that
+entirely with the always-on WebSocket connection above.
 
 ## Setup
 
@@ -91,10 +95,10 @@ dashboard or `POST /api/admin/users/create`. Once an account exists:
 - **Obsidian plugin**: the "Log in" button opens
   `/login?redirect=obsidian://pumice-auth&device_name=...` in the system browser; on success the
   page hands the token back via that `obsidian://` callback instead of the user copy/pasting one.
-  The plugin then sends that same token for *everything* — gRPC sync metadata, and every HTTP call
-  (Publish, version history) via `Authorization: Bearer`, `obs-token`, or a JSON-body `token`
-  field, depending on the endpoint. The server accepts any of those, plus the cookie, uniformly
-  (`extract_token()` in `web.py`, checked against `get_device_token()`).
+  The plugin then sends that same token for *everything* — the `/ws` connection's `init`
+  message, and every HTTP call (Publish, etc.) via `Authorization: Bearer`, `obs-token`, or a
+  JSON-body `token` field, depending on the endpoint. The server accepts any of those, plus the
+  cookie, uniformly (`extract_token()` in `web.py`, checked against `get_device_token()`).
 - **Device management**: every account can see/revoke its own sessions at `/api/user/devices`
   (surfaced in the dashboard's "내 정보 관리" tab); admins can see/revoke *any* user's sessions at
   `/api/admin/users/{username}/devices` (surfaced per-user in the admin users table).
@@ -161,19 +165,45 @@ renders accordingly rather than hardcoding a language.
 ## What it does
 
 - `/` — redirects to `/dashboard` or `/login` depending on whether a session cookie is present.
-- `Delta` / `UploadFiles` / `DownloadFiles` (gRPC-Web) — the core file sync protocol.
-- `GetFileHistory` / `DownloadHistoryVersion` / `RestoreHistoryVersion` (gRPC-Web) — per-file
-  version history, backed by a physical backup (hard-linked where possible) on every change.
-- `UploadFilesStream` (`/obsidian.sync.v1.SyncService/UploadFilesStream`, opt-in) — true
-  client-streaming upload for browsers that support `fetch()` request-body streaming, handled
-  entirely outside the gRPC-Web dispatch above (see "Streaming upload" below).
+- `/ws` — the sync protocol: one persistent WebSocket connection per vault carries file delta,
+  push/pull, and version history (list/download/restore), plus a live push whenever another
+  device changes the vault. See "Sync protocol" below.
 - `/api/*` (HTTP, Pyramid) — publish (upload/list/remove/download), publish sharing (invite by
   email, accept via invite code), version history REST mirrors, user accounts, device management,
   and the admin dashboard.
 - `/publish/{username}/{vault}/...` — the actual published site, rendering markdown on the fly
-  (wikilinks resolved, YAML frontmatter stripped).
+  (wikilinks resolved, YAML frontmatter stripped). A `publish.css` at the vault root is
+  auto-loaded on every page, same as real Obsidian Publish — see
+  [`docs/PUBLISH_CSS.md`](docs/PUBLISH_CSS.md) for the overridable variables/classes.
+  `publish.js` works the same way but only activates once a custom domain is configured (see
+  [`docs/PUBLISH_JS.md`](docs/PUBLISH_JS.md)).
 - `/mcp` — an MCP (Model Context Protocol) server over Streamable HTTP, giving AI clients
   read/write access to a synced vault (see "MCP" below).
+
+## Sync protocol
+
+Every connected device keeps one WebSocket open to `/ws` for as long as the plugin is
+configured, instead of opening a new connection per sync action. This is what makes changes
+show up on other devices immediately rather than waiting for the next scheduled sync:
+
+- **Auth happens over the connection itself** — the first message a client sends is `init`
+  (device name, vault id, and an optional `lastKnownChangeId`), not a WS handshake header
+  (browsers don't allow custom headers on the WebSocket handshake, and Obsidian's own client has
+  the same constraint).
+- **One request in flight per connection at a time** — matches Obsidian core Sync's own client
+  exactly; there's no request-id multiplexing to reason about on either side.
+- **Reconnects catch up instead of rescanning** — a client that already knows its last change ID
+  gets just the changes it missed, replayed as ordinary push frames, instead of a full vault
+  scan every time the connection drops and comes back (mobile backgrounding, flaky wifi, etc.).
+- **File pushes dedup by content hash** — if a file's exact content already exists elsewhere in
+  the vault (a copy, a rename), the server links it into place without asking the client to
+  upload the bytes again.
+- **Every other open connection for the same vault gets pushed the change immediately** — so a
+  second device (or a second Obsidian window) reflects an edit within about as long as the
+  round trip takes, not on its next poll.
+
+This design (and its legal basis — reference/behavior only, no code copied) is documented in
+the `pumice` client repo's `11_websocket_동기화_프로토콜_설계.md`.
 
 ## MCP (Model Context Protocol)
 
@@ -273,50 +303,6 @@ touches file content instead accepts an optional per-call `e2ee_password` argume
 Server-initiated notifications (the GET/SSE half of Streamable HTTP) aren't implemented yet — `GET
 /mcp` returns `501`. There's currently nothing this server needs to push to a connected MCP client
 proactively.
-
-## Streaming upload (`UploadFilesStream`)
-
-`UploadFiles` (above) buffers the whole request body in memory before processing any of it --
-fine for its intended batch sizes, but not something a much larger single request should rely
-on. `UploadFilesStream` is an opt-in alternative that parses the request body incrementally as
-bytes arrive (`src/pumice_server/streaming.py`'s `EnvelopeStreamParser` and
-`src/pumice_server/streaming_upload_resource.py`'s
-`StreamingUploadRequest`/`StreamingUploadResource`), so files land on disk and get
-hashed/backed up/recorded exactly like `UploadFiles`, without ever buffering the whole body in
-memory. It's reached by a hand-rolled `fetch()` + envelope framing on the client rather than the
-generated gRPC-Web stub, since browsers' grpc-web/connect-es libraries don't support
-client-streaming at all.
-
-Guarantees:
-
-- **Auth-before-streaming** — the `Authorization` header is resolved to a device/owner identity
-  before a single body byte is handed to the parser. An invalid/missing token gets a bare `401`
-  and the connection is dropped without the (possibly attacker-controlled) body ever being
-  processed.
-- **Backpressure** — every piece of blocking work (token resolution, each frame's disk I/O)
-  pauses the transport until it drains, so a fast or malicious sender can't queue arbitrarily far
-  ahead of what's actually been written to disk.
-- **Blocking I/O avoidance** — token resolution and all file I/O run via
-  `twisted.internet.threads.deferToThread`, matching the `asyncio.to_thread` convention
-  `service.py` already uses for the same operations on `UploadFiles`, so the reactor never
-  blocks on upload I/O.
-
-### Timeouts & observability
-
-- **Auth-resolution timeout** (`AUTH_TIMEOUT_SECONDS = 10`) — a stuck auth lookup (DB pool
-  exhaustion, deadlock) errors out with `503` rather than hanging the request and its paused
-  transport indefinitely, distinct from a `401` ("too slow" vs. "wrong credentials").
-- **Max-upload-duration ceiling** (`MAX_UPLOAD_SECONDS = 600`) — an activity-independent ceiling
-  on the whole request, separate from the idle timeout below, so a sender that drips bytes just
-  often enough to never go idle still can't hold a connection open indefinitely.
-- **Global idle timeout** (60s) — set explicitly via `Site(root_resource, timeout=60)` in
-  `main.py`, applied to every connection through Twisted's `HTTPFactory`/`HTTPChannel`.
-- **Metrics** (`StreamingUploadMetrics`) — active/total uploads, bytes received, file
-  success/failure counts (broken down by failure reason: invalid vault/path, temp-file error,
-  path mismatch, hash mismatch), rejection counts (auth failed/timed out, frame too large,
-  malformed frame, max duration exceeded), and backpressure pause frequency/total duration.
-  Exposed via `GET /api/admin/streaming-stats` (`permission='admin'`) and a periodic log summary
-  (`main.py`'s `log_streaming_upload_stats`).
 
 ## Server plugins
 

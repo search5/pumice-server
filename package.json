@@ -1,0 +1,13 @@
+{
+  "name": "pumice-server-static",
+  "private": true,
+  "description": "TypeScript source + build for pumice-server's client-side static JS (Publish pages). See client/README.md.",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "test": "tsc && node --test tests/publish_render.test.cjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

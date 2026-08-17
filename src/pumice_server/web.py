@@ -3,8 +3,9 @@ import json
 import logging
 import re
 import os
-import shutil
 import uuid
+import html as html_module
+from typing import Optional
 from babel.messages.pofile import read_po
 from babel.support import Translations
 from urllib.parse import quote, unquote
@@ -12,10 +13,12 @@ from pyramid.config import Configurator
 from pyramid.response import Response
 from pyramid.view import view_config
 
+from .repository import CustomDomainAlreadyClaimedError
 from .plugin_registry import discover_plugins
 from .plugin_loader import load_plugin_autofill_paths, load_plugin_config_fields, run_enabled_plugins, suggest_plugin_autofill
 from .plugin_config_crypto import PluginConfigEncryptionError, decrypt_json, encrypt_json
 from .plugin_resolve_disk_cache import make_disk_cache
+from .metadata_cache import extract_metadata_cache_entry
 from .plugin_autofill import read_vault_files, sanitize_autofill_suggestions
 from . import oauth_server
 
@@ -166,7 +169,7 @@ def clear_session_cookie(request) -> None:
 from pyramid.authorization import Allow, Authenticated, Everyone, ACLHelper
 from pyramid.security import NO_PERMISSION_REQUIRED
 from pyramid.view import forbidden_view_config
-from pyramid.httpexceptions import HTTPForbidden, HTTPFound
+from pyramid.httpexceptions import HTTPForbidden, HTTPFound, HTTPMovedPermanently, HTTPNotFound
 
 class DeviceTokenSecurityPolicy:
     def identity(self, request):
@@ -228,13 +231,63 @@ def _extract_vault_id(request) -> str:
         pass
     return ""
 
+def _extract_target_owner(request) -> Optional[str]:
+    """Site collaboration (36_실제_아키텍처_전환_Site_collaboration.md) needs the caller to
+    explicitly say whose vault they're acting on -- a plain "caller is always the owner"
+    assumption (the only mode that existed before this) can never address anyone else's vault.
+    Mirrors _extract_vault_id's own multi-source lookup precedence (params -> obs-owner header
+    -> JSON body) so every existing calling convention gets the same new field for free. Returns
+    None (not "") when absent, so VaultContext can cleanly distinguish "no override given"
+    (preserve the exact old self-owned behavior) from an empty string."""
+    owner = request.params.get("owner")
+    if owner:
+        return owner
+    owner = request.headers.get("obs-owner")
+    if owner:
+        return owner
+    try:
+        if request.body:
+            body = request.json_body
+            return body.get("owner") or None
+    except Exception:
+        pass
+    return None
+
+def _is_accepted_publish_collaborator(request, owner: str, vault_id: str, caller_username: str) -> bool:
+    """Whether caller_username has been added and has accepted a Site collaboration invite
+    (see 36_실제_아키텍처_전환_Site_collaboration.md) on (owner, vault_id)'s shares.json --
+    accepted_by_username is set once, at accept time (see publish_share_accept_view), so this
+    never needs to re-derive/re-compare email addresses on every request."""
+    data_dir = request.registry.settings.get("data_dir")
+    shares = load_publish_meta(data_dir, owner, vault_id, "shares.json", [])
+    return any(s.get("accepted") and s.get("accepted_by_username") == caller_username for s in shares)
+
 class VaultContext:
     """Route factory for every endpoint scoped to a single vault. Resolves the vault_id from
     whichever of matchdict/params/obs-id header/JSON body the calling convention uses (see
-    _extract_vault_id). A vault's true identity is (owner_username, vault_id), and
-    owner_username always comes from the caller's own authenticated identity, never from client
-    input -- so there's no cross-account vault access to check: a caller can only ever address
-    their own vaults. (An earlier version of this checked vault_id against a global
+    _extract_vault_id). A vault's true identity is (owner_username, vault_id).
+
+    Two ways to reach a vault's ACL:
+    1. Self-owned (no explicit target owner, or target owner equals the caller): owner_username
+       comes from the caller's own authenticated identity, exactly as before Site collaboration
+       existed -- the caller gets both "vault-access" (full vault-scoped access: options,
+       passwords, custom domain, managing collaborators, ...) and "publish-access" (a strict
+       subset of that, see below).
+    2. Collaborator-on-someone-else's-vault (an explicit target owner from _extract_target_owner,
+       different from the caller): owner_username is the target owner, and the caller only gets
+       "publish-access" -- and only if they're an accepted Site collaborator on that exact
+       (owner, vault_id). Real Obsidian's own collaborator permission table (confirmed via the
+       official docs, obsidianmd/obsidian-help's "Collaborate on a Publish site.md") grants
+       collaborators publish/unpublish but explicitly NOT "Configure site options" or "Manage
+       permissions" -- so only publish_list/publish_upload/publish_remove/publish_download
+       (the only views using permission='publish-access') become reachable; every other
+       VaultContext-scoped route (publish_options, publish_customurl, publish_password,
+       publish_share_*, publish_slug, ...) still requires 'vault-access', which a collaborator
+       is never granted. A caller impersonating an owner they're not an accepted collaborator
+       for still gets self.owner set to that owner (for consistency), but __acl__ stays empty --
+       no permission is ever granted, so no view body ever runs with that borrowed owner.
+
+    (An earlier version of self-owned resolution checked vault_id against a global
     vault_id -> owner registry and let the first caller "claim" an unclaimed vault_id -- removed,
     because vault_id alone isn't globally unique: "Obsidian Vault" is Obsidian's own default vault
     name, so two different accounts' same-named vaults collided and whichever synced first
@@ -243,17 +296,34 @@ class VaultContext:
     def __init__(self, request):
         self.vault_id = _extract_vault_id(request)
         identity = request.identity
-        self.owner = identity["username"] if identity else None
-        self.__acl__ = [(Allow, f"user:{self.owner}", "vault-access")] if self.owner else []
+        caller_username = identity["username"] if identity else None
+        target_owner = _extract_target_owner(request)
 
-@forbidden_view_config(path_info=r'^/api/', renderer="json")
+        self.__acl__ = []
+        if target_owner and caller_username and target_owner != caller_username:
+            self.owner = target_owner
+            if _is_accepted_publish_collaborator(request, target_owner, self.vault_id, caller_username):
+                self.__acl__.append((Allow, f"user:{caller_username}", "publish-access"))
+        else:
+            self.owner = caller_username
+            if caller_username:
+                self.__acl__.append((Allow, f"user:{caller_username}", "vault-access"))
+                self.__acl__.append((Allow, f"user:{caller_username}", "publish-access"))
+
+@forbidden_view_config(path_info=r'^/(api/|publish/share/)', renderer="json")
 def forbidden_view_api(request):
     # Same 401-vs-403 distinction the manual per-view checks used to make: no identity at all
     # is "you need to log in" (401), a real identity that just isn't allowed here is "you're
     # logged in as the wrong person" (403). Every /api/* caller (Obsidian plugin and the
     # dashboard's own fetch() calls alike) expects JSON here, never a redirect -- fetch()
     # follows redirects transparently and would hand the caller /login's HTML instead of an
-    # error it can act on.
+    # error it can act on. /publish/share/* (Site collaboration, see 36_실제_아키텍처_전환_
+    # Site_collaboration.md) is the same kind of fetch()-only JSON API despite living under
+    # /publish/ rather than /api/ -- unlike /publish/{username}/{vault_id}/{path}, which is a
+    # real browser-navigable page (and permission=NO_PERMISSION_REQUIRED there anyway, so it
+    # never reaches this view). Site collaboration is what actually made this reachable: before
+    # it, every /publish/share/* caller was always implicitly the vault's own owner, so a denied
+    # request here literally couldn't happen.
     status = 401 if request.identity is None else 403
     request.response.status = status
     return {"error": "Unauthorized" if status == 401 else "Forbidden"}
@@ -309,6 +379,33 @@ def save_publish_meta(data_dir: str, owner_username: str, vault_id: str, filenam
     path = os.path.join(meta_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+_METADATA_CACHE_FILENAME = "metadata_cache.json"
+
+def _update_metadata_cache_entry(data_dir: str, owner_username: str, vault_id: str, path: str, file_path: str) -> None:
+    """Keeps `metadata_cache.json` (see 28_실제_아키텍처_전환_Phase1_노트본문.md, pumice repo)
+    up to date incrementally on every upload -- mirrors _warm_plugin_resolve_cache's existing
+    "compute once at upload time" pattern rather than re-parsing the whole vault on every page
+    view. Non-markdown files (media, publish.css/js, ...) get a `null` entry, matching what real
+    Obsidian's own /cache/{uid} payload does for non-note paths (confirmed via 27_...md)."""
+    cache = load_publish_meta(data_dir, owner_username, vault_id, _METADATA_CACHE_FILENAME, {})
+    if path.lower().endswith(".md"):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw_md = f.read()
+            cache[path] = extract_metadata_cache_entry(raw_md)
+        except Exception as e:
+            logger.error(f"Failed to update metadata cache entry for '{path}' in vault={vault_id}: {e}")
+            cache[path] = None
+    else:
+        cache[path] = None
+    save_publish_meta(data_dir, owner_username, vault_id, _METADATA_CACHE_FILENAME, cache)
+
+def _remove_metadata_cache_entry(data_dir: str, owner_username: str, vault_id: str, path: str) -> None:
+    cache = load_publish_meta(data_dir, owner_username, vault_id, _METADATA_CACHE_FILENAME, {})
+    if path in cache:
+        del cache[path]
+        save_publish_meta(data_dir, owner_username, vault_id, _METADATA_CACHE_FILENAME, cache)
 
 @view_config(route_name='root', permission='authenticated')
 def root_view(request):
@@ -674,133 +771,6 @@ def oauth_token_view(request):
         "token_type": "bearer",
     }
 
-# 1. API for looking up a file's backup version history
-@view_config(route_name='get_history', renderer='json', permission='vault-access')
-def get_history_view(request):
-    vault_id = request.context.vault_id
-    path = request.params.get("path")
-    if not path:
-        return Response(body=json.dumps({"error": "Missing vault_id or path"}).encode("utf-8"), status=400, content_type="application/json")
-
-    try:
-        history_rows = request.repository.get_history(request.context.owner, vault_id, path)
-        versions = []
-        for row in history_rows:
-            versions.append({
-                "history_id": row["history_id"],
-                "modified_at_ms": row["modified_at_ms"],
-                "size_bytes": row["size_bytes"],
-                "content_hash": row["content_hash"],
-                "device_name": row.get("device_name", "Unknown Device"),
-                "user_name": row.get("user_name", "Unknown User"),
-                "deleted": bool(row.get("deleted", False)),
-                "related_path": row.get("related_path"),
-            })
-        return {"versions": versions}
-    except Exception as e:
-        logger.error(f"HTTP get_history failed for {path}: {e}")
-        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
-
-# 2. API for downloading a specific version's file (binary response)
-@view_config(route_name='download_history', permission='vault-access')
-def download_history_view(request):
-    history_id_str = request.params.get("history_id")
-    if not history_id_str:
-        return Response("Missing vault_id or history_id", status=400)
-
-    try:
-        history_id = int(history_id_str)
-        row = request.repository.get_history_by_id(request.context.owner, history_id)
-        if not row:
-            return Response("History version not found", status=404)
-            
-        backup_file_path = row["backup_file_path"]
-        if not os.path.exists(backup_file_path):
-            return Response("Backup file not found on disk", status=404)
-            
-        with open(backup_file_path, 'rb') as f:
-            file_data = f.read()
-            
-        response = Response(body=file_data, content_type="application/octet-stream")
-        response.headers["X-File-Path"] = quote(row["path"])
-        response.headers["X-File-Size"] = str(row["size_bytes"])
-        response.headers["X-File-Mtime"] = str(row["modified_at_ms"])
-        return response
-    except Exception as e:
-        logger.error(f"HTTP download_history failed: {e}")
-        return Response(str(e), status=500)
-
-# 3. API for restoring a server-side file to a specific version (POST)
-@view_config(route_name='restore_history', renderer='json', permission='vault-access')
-def restore_history_view(request):
-    try:
-        vault_id = request.context.vault_id
-        body = request.json_body
-        history_id = body.get("history_id")
-        req_path = body.get("path", "")
-
-        if history_id is None:
-            return Response(body=json.dumps({"error": "Missing vault_id or history_id"}).encode("utf-8"), status=400, content_type="application/json")
-
-        row = request.repository.get_history_by_id(request.context.owner, history_id)
-        if not row:
-            return {"ok": False, "error": "History version not found"}
-
-        backup_file_path = row["backup_file_path"]
-        if not os.path.exists(backup_file_path):
-            return {"ok": False, "error": "Backup file not found on disk"}
-
-        target_path = req_path if req_path else row["path"]
-
-        data_dir = request.registry.settings.get("data_dir")
-        vault_path = get_vault_path(data_dir, request.context.owner, vault_id)
-        dest_file_path = os.path.join(vault_path, target_path)
-        
-        if not dest_file_path.startswith(os.path.abspath(vault_path)):
-            return {"ok": False, "error": "Invalid target path (escape attempt)"}
-            
-        os.makedirs(os.path.dirname(dest_file_path), exist_ok=True)
-        if os.path.exists(dest_file_path):
-            os.remove(dest_file_path)
-        shutil.copy2(backup_file_path, dest_file_path)
-        
-        current_mtime_ms = int(time.time() * 1000)
-        mtime_sec = current_mtime_ms / 1000.0
-        os.utime(dest_file_path, (mtime_sec, mtime_sec))
-        
-        meta = {
-            "path": target_path,
-            "modified_at_ms": current_mtime_ms,
-            "size_bytes": row["size_bytes"],
-            "content_hash": row["content_hash"],
-            "is_deleted": False
-        }
-        request.repository.save_one(request.context.owner, vault_id, target_path, meta)
-
-        try:
-            device_name = unquote(request.headers.get("X-Device-Name", "Unknown Device"))
-            user_name = unquote(request.headers.get("X-User-Name", "Unknown User"))
-
-            request.repository.add_history(
-                owner_username=request.context.owner,
-                vault_id=vault_id,
-                path=target_path,
-                modified_at_ms=current_mtime_ms,
-                size_bytes=row["size_bytes"],
-                content_hash=row["content_hash"],
-                backup_file_path=backup_file_path,
-                device_name=device_name,
-                user_name=user_name
-            )
-            logger.info(f"Restore version history added for {target_path} referencing {backup_file_path}")
-        except Exception as backup_err:
-            logger.error(f"Failed to record restore version history for {target_path}: {backup_err}")
-            
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"HTTP restore_history failed: {e}")
-        return {"ok": False, "error": str(e)}
-
 FRONTMATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
 
 # YAML frontmatter holding the publish flag and similar fields isn't content meant for site visitors
@@ -810,40 +780,135 @@ FRONTMATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
 def strip_frontmatter(md_content: str) -> str:
     return FRONTMATTER_RE.sub("", md_content, count=1)
 
-def parse_wikilinks(text: str, username: str, vault_id: str) -> str:
+def _build_path_to_permalink(files: list) -> dict:
+    """Builds a wikilink-target -> permalink lookup from get_published_files()'s result, so
+    parse_wikilinks can resolve each link's pretty URL with plain dict lookups instead of a
+    DB query per link (see 19_permalink_지원.md, pumice repo). Each stored path is registered
+    under both its full form ("notes/a.md") and, for .md files, its extension-stripped form
+    ("notes/a") -- wikilink targets are written either way."""
+    lookup = {}
+    for f in files:
+        permalink = f.get("permalink")
+        if not permalink:
+            continue
+        path = f["path"]
+        lookup[path] = permalink
+        if path.lower().endswith(".md"):
+            lookup[path[:-3]] = permalink
+    return lookup
+
+def parse_wikilinks(text: str, url_prefix: str, path_to_permalink: Optional[dict] = None) -> str:
+    path_to_permalink = path_to_permalink or {}
+
     # 1. Handle image wikilinks: ![[image.png|width]]
     def repl_img(match):
         target = match.group(1).strip()
-        safe_target = quote(target, safe='/')
-        src = f"/publish/{username}/{vault_id}/{safe_target}"
+        permalink = path_to_permalink.get(target)
+        if permalink:
+            src = f"{url_prefix}{quote(permalink, safe='/')}"
+        else:
+            safe_target = quote(target, safe='/')
+            src = f"{url_prefix}{safe_target}"
         width_attr = ""
         if match.group(2):
             width = match.group(2).strip()
             if width.isdigit():
                 width_attr = f' width="{width}"'
         return f'<img src="{src}" alt="{target}"{width_attr}>'
-        
+
     text = re.sub(r'!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]', repl_img, text)
 
     # 2. Handle regular document wikilinks: [[target|label]] or [[target]]
     def repl_link(match):
         target = match.group(1).strip()
         label = match.group(2).strip() if match.group(2) else target
-        
+
+        permalink = path_to_permalink.get(target)
+        if permalink:
+            href = f"{url_prefix}{quote(permalink, safe='/')}"
+            return f'<a href="{href}" class="wiki-link">{label}</a>'
+
         base_target, ext = os.path.splitext(target)
         if ext.lower() == ".md":
             url_target = base_target
         else:
             url_target = target
-            
+
         safe_target = quote(url_target, safe='/')
-        href = f"/publish/{username}/{vault_id}/{safe_target}"
+        href = f"{url_prefix}{safe_target}"
         return f'<a href="{href}" class="wiki-link">{label}</a>'
-        
+
     text = re.sub(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]', repl_link, text)
     return text
 
-@view_config(route_name='publish_list', renderer='json', permission='vault-access')
+_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+def _auto_generate_description(rendered_html: str, limit: int = 200) -> str:
+    """Real Obsidian Publish auto-generates a description from note content when the
+    `description` frontmatter override isn't set (see 20_description_image_지원.md, pumice
+    repo) -- the exact truncation length isn't reverse-engineerable (that logic lives in
+    Publish's site-side renderer, not the desktop app this session otherwise reverses), so 200
+    chars is this implementation's own reasonable default, not a confirmed match. Cuts at the
+    last word boundary before the limit rather than mid-word."""
+    plain = html_module.unescape(_TAG_RE.sub(" ", rendered_html))
+    plain = _WHITESPACE_RE.sub(" ", plain).strip()
+    if len(plain) <= limit:
+        return plain
+    truncated = plain[:limit]
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    return truncated.rstrip() + "..."
+
+def _resolve_og_image_url(image_value: Optional[str], request, url_prefix: str) -> Optional[str]:
+    """An `image`/`cover` frontmatter value is either an external absolute URL (used as-is) or a
+    vault-relative path to a file that must itself be published (resolved into this server's own
+    /publish/... URL) -- see 20_description_image_지원.md.
+
+    `url_prefix` is already absolute (`https://customdomain/`) when the vault has a custom
+    domain configured (see 26_커스텀_도메인_지원.md), in which case it's used as-is -- appending
+    `request.scheme`/`request.host` in that case would be wrong whenever the *request* came in
+    via the old /publish/{user}/{vault}/ path while the vault's canonical URL is now the custom
+    domain (request.host is this server's own host, not the vault's real origin)."""
+    if not image_value:
+        return None
+    if image_value.startswith("http://") or image_value.startswith("https://"):
+        return image_value
+    if url_prefix.startswith("http://") or url_prefix.startswith("https://"):
+        return f"{url_prefix}{quote(image_value, safe='/')}"
+    return f"{request.scheme}://{request.host}{url_prefix}{quote(image_value, safe='/')}"
+
+_FAVICON_SIZED_RE = re.compile(r"^favicon-([0-9]+)(x[0-9]+)?\.png$", re.IGNORECASE)
+
+def _build_favicon_links(files: list, url_prefix: str) -> list:
+    """Real Obsidian Publish auto-detects any published favicon.ico or favicon-NN(xNN).png file
+    and adds a <link rel="icon"> tag for each -- confirmed via obsidian.asar's own
+    `Q$ = /^favicon-([0-9]+)(x[0-9]+)?.png$/i` pattern and Customize your site.md's documented
+    size list (see 22_aliases_리다이렉트_및_파비콘_자동감지.md). A bare `favicon-32.png` (no `x32`
+    part) is treated as square, same as the real formula: `G[1] + (G[2] || "x" + G[1])`."""
+    icons = []
+    for f in files:
+        basename = os.path.basename(f["path"])
+        href = f"{url_prefix}{quote(f['path'], safe='/')}"
+        if basename.lower() == "favicon.ico":
+            icons.append({"href": href, "sizes": None})
+            continue
+        m = _FAVICON_SIZED_RE.match(basename)
+        if m:
+            size, dim = m.group(1), m.group(2)
+            sizes = f"{size}x{dim[1:]}" if dim else f"{size}x{size}"
+            icons.append({"href": href, "sizes": sizes})
+    return icons
+
+def _find_root_asset_href(files: list, filename: str, url_prefix: str) -> Optional[str]:
+    """publish.css/publish.js must sit at the vault root (see Customize your site.md) --
+    a same-named file in a subfolder doesn't count."""
+    if not any(f["path"] == filename for f in files):
+        return None
+    return f"{url_prefix}{quote(filename, safe='')}"
+
+@view_config(route_name='publish_list', renderer='json', permission='publish-access')
 def publish_list_view(request):
     try:
         vault_id = request.context.vault_id
@@ -878,17 +943,32 @@ def publish_list_view(request):
         logger.error(f"HTTP publish_list failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_upload', renderer='json', permission='vault-access')
+@view_config(route_name='publish_upload', renderer='json', permission='publish-access')
 def publish_upload_view(request):
     try:
         vault_id = request.context.vault_id
         obs_path_enc = request.headers.get("obs-path")
         obs_hash = request.headers.get("obs-hash")
+        obs_permalink_enc = request.headers.get("obs-permalink")
+        obs_description_enc = request.headers.get("obs-description")
+        obs_image_enc = request.headers.get("obs-image")
+        obs_aliases_enc = request.headers.get("obs-aliases")
 
         if not obs_path_enc or not obs_hash:
             return Response(body=json.dumps({"error": "Missing obs-id, obs-path or obs-hash header"}).encode("utf-8"), status=400, content_type="application/json")
 
         path = unquote(obs_path_enc)
+        permalink = unquote(obs_permalink_enc) if obs_permalink_enc else None
+        description = unquote(obs_description_enc) if obs_description_enc else None
+        image = unquote(obs_image_enc) if obs_image_enc else None
+        aliases = []
+        if obs_aliases_enc:
+            try:
+                parsed = json.loads(unquote(obs_aliases_enc))
+                if isinstance(parsed, list):
+                    aliases = [a for a in parsed if isinstance(a, str) and a]
+            except Exception as e:
+                logger.warning(f"Ignoring malformed obs-aliases header for path={path}: {e}")
 
         # File storage location: data_dir/published/username/vault_id/path
         data_dir = request.registry.settings.get("data_dir")
@@ -905,9 +985,22 @@ def publish_upload_view(request):
         with open(dest_file_path, "wb") as f:
             f.write(body_data)
             
-        request.repository.add_published_file(request.context.owner, vault_id, path, obs_hash)
+        if permalink:
+            existing = request.repository.get_published_file_by_permalink(request.context.owner, vault_id, permalink)
+            if existing and existing["path"] != path:
+                logger.warning(
+                    f"permalink collision: '{permalink}' now points to '{path}' "
+                    f"(was '{existing['path']}') in vault={vault_id}"
+                )
+
+        request.repository.add_published_file(
+            request.context.owner, vault_id, path, obs_hash,
+            permalink=permalink, description=description, image=image,
+        )
+        request.repository.set_published_file_aliases(request.context.owner, vault_id, path, aliases)
         logger.info(f"Published file saved: vault={vault_id}, path={path}, hash={obs_hash}")
 
+        _update_metadata_cache_entry(data_dir, username, vault_id, path, dest_file_path)
         _warm_plugin_resolve_cache(request, username, vault_id, dest_file_path, data_dir)
 
         return {"ok": True}
@@ -935,7 +1028,9 @@ def _warm_plugin_resolve_cache(request, owner: str, vault_id: str, file_path: st
 
         with open(file_path, "r", encoding="utf-8") as f:
             md_content = f.read()
-        processed_md = parse_wikilinks(strip_frontmatter(md_content), owner, vault_id)
+        url_prefix, _, _ = _resolve_publish_url_prefix(request.repository, owner, vault_id)
+        path_to_permalink = _build_path_to_permalink(request.repository.get_published_files(owner, vault_id))
+        processed_md = parse_wikilinks(strip_frontmatter(md_content), url_prefix, path_to_permalink)
         plugin_configs = _load_decrypted_plugin_configs(request, owner, vault_id, enabled_plugin_ids)
         cache_get, cache_set = make_disk_cache(data_dir)
         run_enabled_plugins(
@@ -945,7 +1040,7 @@ def _warm_plugin_resolve_cache(request, owner: str, vault_id: str, file_path: st
     except Exception as e:
         logger.error(f"Failed to eagerly warm plugin resolve cache for vault '{vault_id}': {e}")
 
-@view_config(route_name='publish_remove', renderer='json', permission='vault-access')
+@view_config(route_name='publish_remove', renderer='json', permission='publish-access')
 def publish_remove_view(request):
     try:
         # Obsidian Publish format: JSON body {path, id, token}
@@ -974,14 +1069,18 @@ def publish_remove_view(request):
                 pass
                 
         request.repository.remove_published_file(request.context.owner, vault_id, path)
+        # A removed file's old-URL redirects must go with it -- otherwise they'd point at
+        # content that no longer exists (see 22_aliases_리다이렉트_및_파비콘_자동감지.md).
+        request.repository.set_published_file_aliases(request.context.owner, vault_id, path, [])
+        _remove_metadata_cache_entry(data_dir, username, vault_id, path)
         logger.info(f"Published file removed: vault={vault_id}, path={path}")
-        
+
         return {"ok": True}
     except Exception as e:
         logger.error(f"HTTP publish_remove failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_download', permission='vault-access')
+@view_config(route_name='publish_download', permission='publish-access')
 def publish_download_view(request):
     try:
         body = request.json_body
@@ -1022,11 +1121,8 @@ _PUBLISH_MEDIA_MIME_TYPES = {
     ".wav": "audio/wav",
 }
 
-def _published_file_hrefs(username: str, vault_id: str, files: list) -> dict:
-    return {
-        f: f'/publish/{quote(username, safe="")}/{quote(vault_id, safe="")}/{quote(f, safe="/")}'
-        for f in files
-    }
+def _published_file_hrefs(url_prefix: str, files: list) -> dict:
+    return {f: f'{url_prefix}{quote(f, safe="/")}' for f in files}
 
 def _load_decrypted_plugin_configs(request, owner: str, vault_id: str, enabled_plugin_ids: list) -> dict:
     """{plugin_id: {entry_id: decrypted_config_dict}} for every plugin in enabled_plugin_ids --
@@ -1044,33 +1140,221 @@ def _load_decrypted_plugin_configs(request, owner: str, vault_id: str, enabled_p
         plugin_configs[plugin_id] = entries
     return plugin_configs
 
-@view_config(route_name='publish_view', permission=NO_PERMISSION_REQUIRED, renderer='templates/publish_page.jinja2')
-def publish_view(request):
-    username = request.matchdict.get("username")
-    vault_id = request.matchdict.get("vault_id")
-    path = request.matchdict.get("path", "")
+def _resolve_publish_url_prefix(repository, owner_username: str, vault_id: str):
+    """(url_prefix, is_custom_domain, domain) -- matches real Obsidian's own `isCustomDomain()`
+    exactly (confirmed via obsidian.asar: `!!this.customurl`, which only checks whether the site
+    *has* a custom domain configured, not which URL the current request came in on). So a vault
+    with a custom domain gets its custom-domain url_prefix and is_custom_domain=True regardless
+    of whether this particular request arrived via the old /publish/{user}/{vault}/ path or the
+    custom domain itself -- see 26_커스텀_도메인_지원.md."""
+    domain = repository.get_custom_domain(owner_username, vault_id)
+    if domain:
+        return f"https://{domain['hostname']}/", True, domain
+    return f"/publish/{quote(owner_username, safe='')}/{quote(vault_id, safe='')}/", False, None
+
+_SEARCH_RESULT_LIMIT = 20
+_SEARCH_SNIPPET_CONTEXT_CHARS = 40
+
+
+def _extract_snippet(text: str, query: str, context_chars: int = _SEARCH_SNIPPET_CONTEXT_CHARS) -> str:
+    """Ports publish_render.js's own (now-removed) client-side extractSnippet -- moved server-side
+    once search itself moved server-side (see 38_실제_아키텍처_전환_검색_그래프_실제화.md, pumice
+    repo). Same behavior, just in Python: a window of `context_chars` on each side of the first
+    match, with an ellipsis where the window doesn't reach the start/end of the text."""
+    lower_text = text.lower()
+    idx = lower_text.find(query.lower())
+    if idx == -1:
+        return text[: context_chars * 2]
+    start = max(0, idx - context_chars)
+    end = min(len(text), idx + len(query) + context_chars)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(text) else ""
+    return prefix + text[start:end] + suffix
+
+
+def _search_note_bodies(cache: dict, query: str, limit: int = _SEARCH_RESULT_LIMIT) -> list:
+    """Full-text search over a vault's already-cached `searchText` (metadata_cache.py's
+    _plain_text_for_search, computed once at upload time) -- moved server-side after reading real
+    Obsidian's own app.js (client-only reversing, same methodology as this project's obsidian.asar
+    reversing) confirmed it does the same split: instant client-side title/filename matching (see
+    publish_render.js's buildSearchIndex/searchNotes) plus a debounced `POST {host}/search` call
+    for actual body-text matches -- real Obsidian's own client never receives full note bodies at
+    all; pumice previously baked `searchText` into every `_cache.json` entry for client-side
+    matching, which this endpoint now replaces (see the `_cache.json` handler below, which no
+    longer includes `searchText`). Case-insensitive substring match, ranked by how many times the
+    query occurs (most first, ties broken by path for determinism), capped at `limit`."""
+    trimmed = query.strip()
+    if not trimmed:
+        return []
+    lower_query = trimmed.lower()
+    scored = []
+    for entry_path, entry in cache.items():
+        if not entry or not entry_path.lower().endswith(".md"):
+            continue
+        text = entry.get("searchText") or ""
+        count = text.lower().count(lower_query)
+        if count == 0:
+            continue
+        scored.append((count, entry_path, text))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [
+        {"path": entry_path, "snippet": _extract_snippet(text, trimmed)}
+        for _, entry_path, text in scored[:limit]
+    ]
+
+
+def _render_publish_page(request, username: str, vault_id: str, path: str, via_custom_domain_route: bool):
     lang = detect_lang(request)
+    url_prefix, is_custom_domain, domain = _resolve_publish_url_prefix(request.repository, username, vault_id)
+
+    # "Redirect to your custom domain" (see Custom domains.md) -- only fires when visiting the
+    # *old* URL while the vault has both a custom domain and the redirect toggle configured.
+    # Unlike permalink/alias redirects (client-side history.replaceState, see
+    # 19_permalink_지원.md/22_aliases_리다이렉트_및_파비콘_자동감지.md), this is a genuine
+    # cross-origin move -- there's no way to fake that with same-origin JS -- so a real HTTP 301
+    # is the only option (and the semantically correct one: the user configuring this is
+    # explicitly saying "I've permanently moved").
+    if is_custom_domain and not via_custom_domain_route and domain["redirect_to_custom_domain"]:
+        target = f"{url_prefix}{quote(path, safe='/')}"
+        if request.query_string:
+            target += f"?{request.query_string}"
+        return HTTPMovedPermanently(location=target)
 
     data_dir = request.registry.settings.get("data_dir")
     published_base = os.path.abspath(os.path.join(data_dir, "published", username, vault_id))
 
-    # Root: show the list of published files. `files=None` is how the template tells this
-    # branch apart from an actual note's rendered content -- an empty *list* still means "show
-    # the (empty) file list", not "render a note".
-    if not path:
-        files = []
-        if os.path.isdir(published_base):
-            for root, _, fnames in os.walk(published_base):
-                for fname in fnames:
-                    rel = os.path.relpath(os.path.join(root, fname), published_base)
-                    files.append(rel.replace(os.sep, "/"))
-        files = sorted(files)
-        return {
-            "lang": lang, "t": lambda key, **params: t(key, lang, **params),
-            "username": username, "vault_id": vault_id, "title": "",
-            "files": files, "file_hrefs": _published_file_hrefs(username, vault_id, files),
-            "content": None,
+    # Real Obsidian Publish's client-side renderer (see 27_실제_퍼블리시_사이트_아키텍처_조사.md/
+    # 28_실제_아키텍처_전환_Phase1_노트본문.md, pumice repo) fetches a whole-vault metadata cache
+    # and each note's raw markdown separately, then renders client-side -- these three reserved
+    # sub-paths (_cache.json/_raw/_search) mirror that (adapted to this server's username/
+    # vault_id URL scheme instead of real Obsidian's opaque site uid). Handled here, before the
+    # normal path-lookup/permalink/alias logic below, so a real published file can never collide
+    # with them -- an actual vault file literally named "_cache.json"/"_search" (or under a
+    # "_raw/" folder) is assumed not to occur in practice; if it ever does, the reserved path
+    # wins.
+    if path == "_cache.json":
+        cache = load_publish_meta(data_dir, username, vault_id, "metadata_cache.json", {})
+        # Permalinks live in the DB (get_published_files), not the markdown-derived cache file,
+        # so they're merged in here rather than baked into metadata_cache.json -- a permalink can
+        # change independently of a note's content, and this way there's nothing to go stale.
+        # The client renderer needs this to turn a `[[wikilink]]` target into the same pretty URL
+        # parse_wikilinks already produces server-side (see 19_permalink_지원.md).
+        permalink_by_path = {
+            f["path"]: f["permalink"] for f in request.repository.get_published_files(username, vault_id)
+            if f.get("permalink")
         }
+        enriched = {}
+        for file_path_key, entry in cache.items():
+            if entry is None:
+                enriched[file_path_key] = None
+                continue
+            enriched_entry = dict(entry)
+            # Real Obsidian's own client never receives full note bodies (confirmed via app.js)
+            # -- searchText only exists so this server's own _search handler (below) can do
+            # full-text matching; the client's job is now just the instant title/filename
+            # prefilter.
+            enriched_entry.pop("searchText", None)
+            permalink = permalink_by_path.get(file_path_key)
+            if permalink:
+                enriched_entry["permalink"] = permalink
+            enriched[file_path_key] = enriched_entry
+        return Response(body=json.dumps(enriched, ensure_ascii=False).encode("utf-8"), content_type="application/json")
+    if path.startswith("_raw/"):
+        raw_rel_path = path[len("_raw/"):]
+        raw_file_path = os.path.abspath(os.path.join(published_base, raw_rel_path))
+        if not raw_file_path.startswith(published_base) or not os.path.exists(raw_file_path):
+            return Response("Not found", status=404)
+        with open(raw_file_path, "rb") as f:
+            raw_bytes = f.read()
+        return Response(body=raw_bytes, content_type="text/markdown; charset=utf-8")
+
+    # Full-text search (see 38_실제_아키텍처_전환_검색_그래프_실제화.md, pumice repo) -- a third
+    # reserved sub-path alongside _cache.json/_raw/ above. Real Obsidian Publish's own client
+    # calls `POST {host}/search` with `{id, query}`; this server's route scheme is already
+    # per-vault (`/publish/{username}/{vault_id}/...`), so `{query}` alone is enough. The three
+    # publish routes (publish_view/custom_domain_view/publish_serve_proxy) don't restrict
+    # request_method, so POST already reaches this same view -- no new route needed.
+    if path == "_search":
+        if request.method != "POST":
+            return Response(body=json.dumps({"error": "POST required"}).encode("utf-8"), status=405, content_type="application/json")
+        try:
+            query = (request.json_body or {}).get("query", "")
+        except Exception:
+            query = ""
+        cache = load_publish_meta(data_dir, username, vault_id, _METADATA_CACHE_FILENAME, {})
+        results = _search_note_bodies(cache, query)
+        return Response(body=json.dumps({"results": results}, ensure_ascii=False).encode("utf-8"), content_type="application/json")
+
+    # Fetched once and shared by both branches below -- used for permalink/description/image
+    # lookups on a note page, and for favicon/static-asset detection (both site-wide concerns)
+    # on both.
+    published_files = request.repository.get_published_files(username, vault_id)
+    favicon_links = _build_favicon_links(published_files, url_prefix)
+    publish_css_href = _find_root_asset_href(published_files, "publish.css", url_prefix)
+    publish_js_href = _find_root_asset_href(published_files, "publish.js", url_prefix) if is_custom_domain else None
+
+    # First batch of the "Change site options" dialog (see
+    # 25_사이트_옵션_1차_구현.md, pumice repo) -- shared by both branches below since siteName/
+    # logo/noindex are header/meta concerns that apply to every page, not just note pages.
+    options = _load_site_options(data_dir, username, vault_id)
+    site_name = options["siteName"] or vault_id
+    logo_href = _resolve_og_image_url(options["logo"], request, url_prefix)
+    common_option_fields = {
+        "site_name": site_name, "logo_href": logo_href, "noindex": options["noindex"],
+        "hide_title": options["hideTitle"], "readable_line_length": options["readableLineLength"],
+        # Real Obsidian only activates Google Analytics on a custom domain too (confirmed via
+        # obsidian.asar: the gtag setup is gated behind the same isCustomDomain() check as
+        # publish.js) -- see 26_커스텀_도메인_지원.md.
+        "google_analytics": options["googleAnalytics"] if is_custom_domain else None,
+        "url_prefix": url_prefix, "username": username, "vault_id": vault_id,
+        "show_search": options["showSearch"],
+        "show_navigation": options["showNavigation"],
+        "navigation_tree": _build_navigation_tree(
+            published_files, options["navigationOrdering"], options["navigationHiddenItems"], url_prefix,
+        ),
+        "theme_attr": _resolve_theme_attr(options["defaultTheme"]),
+        "show_theme_toggle": options["showThemeToggle"],
+    }
+
+    # Root: show the list of published files, UNLESS an indexFile is configured and actually
+    # published, in which case it's served here instead (matches real Obsidian's `indexFile`
+    # site option) -- falls through to the normal note-rendering code below rather than
+    # returning, so it gets the exact same permalink/alias/plugin handling as any other note.
+    if not path:
+        index_file = options["indexFile"]
+        has_index_file = index_file and any(f["path"] == index_file for f in published_files)
+        if has_index_file:
+            path = index_file
+        else:
+            files = []
+            if os.path.isdir(published_base):
+                for root, _, fnames in os.walk(published_base):
+                    for fname in fnames:
+                        rel = os.path.relpath(os.path.join(root, fname), published_base)
+                        files.append(rel.replace(os.sep, "/"))
+            files = sorted(files)
+            # The file-listing page never runs plugins (it has no note content of its own), so
+            # search (see 28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 3) can always load its
+            # preload script here regardless of whether this vault has plugins enabled -- unlike
+            # the note-rendering branch below, where client_rendered is conditional on that.
+            return {
+                "lang": lang, "t": lambda key, **params: t(key, lang, **params),
+                "title": "",
+                "files": files, "file_hrefs": _published_file_hrefs(url_prefix, files),
+                "content": None, "description": None, "image": None, "favicons": favicon_links,
+                "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
+                "client_rendered": False, "path": None,
+                "preload_json": json.dumps({"url_prefix": url_prefix, "path": None}, ensure_ascii=False),
+                **common_option_fields,
+            }
+
+    # permalink routing takes priority over the literal path lookup below, matching real
+    # Obsidian's Site router (see 19_permalink_지원.md, pumice repo) -- a miss just falls
+    # through to the unchanged literal-path handling, so the original path URL stays valid
+    # even for a file that also has a permalink set.
+    resolved = request.repository.get_published_file_by_permalink(username, vault_id, path)
+    if resolved:
+        path = resolved["path"]
 
     file_path = os.path.abspath(os.path.join(published_base, path))
 
@@ -1078,15 +1362,25 @@ def publish_view(request):
         return Response("Forbidden", status=403)
 
     if not os.path.exists(file_path):
+        resolved_via_ext_fallback = False
         if not os.path.splitext(file_path)[1]:
             alt_path = file_path + ".md"
             if os.path.exists(alt_path):
                 file_path = alt_path
+                resolved_via_ext_fallback = True
+
+        if not resolved_via_ext_fallback:
+            # Last-resort fallback: an old/removed note's URL, redirected via `aliases` (see
+            # 22_aliases_리다이렉트_및_파비콘_자동감지.md) -- matches real Obsidian's own routing
+            # precedence: permalink -> literal path (+.md) -> aliases -> 404.
+            alias_target = request.repository.get_published_file_by_alias(username, vault_id, path)
+            alias_file_path = os.path.abspath(os.path.join(published_base, alias_target)) if alias_target else None
+            if alias_target and alias_file_path.startswith(published_base) and os.path.exists(alias_file_path):
+                path = alias_target
+                file_path = alias_file_path
             else:
                 return Response(f"Page not found: {path}", status=404)
-        else:
-            return Response(f"Page not found: {path}", status=404)
-            
+
     _, ext = os.path.splitext(file_path)
     ext = ext.lower()
 
@@ -1094,14 +1388,16 @@ def publish_view(request):
         content_type = _PUBLISH_MEDIA_MIME_TYPES.get(ext, "application/octet-stream")
         with open(file_path, "rb") as f:
             return Response(body=f.read(), content_type=content_type)
-            
+
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             md_content = f.read()
     except Exception as e:
         return Response(f"Failed to read file: {e}", status=500)
-        
-    processed_md = parse_wikilinks(strip_frontmatter(md_content), username, vault_id)
+
+    path_to_permalink = _build_path_to_permalink(published_files)
+    processed_md = parse_wikilinks(strip_frontmatter(md_content), url_prefix, path_to_permalink)
+    own = next((f for f in published_files if f["path"] == path), {})
 
     enabled_plugin_ids = [p["plugin_id"] for p in request.repository.list_enabled_plugins(username, vault_id)]
     if enabled_plugin_ids:
@@ -1113,17 +1409,107 @@ def publish_view(request):
         )
 
     import markdown
-    html_content = markdown.markdown(processed_md, extensions=['extra', 'codehilite', 'toc'])
+    md_extensions = ['extra', 'codehilite', 'toc']
+    if options["strictLineBreaks"]:
+        md_extensions.append('nl2br')
+    html_content = markdown.markdown(processed_md, extensions=md_extensions)
 
     title = os.path.basename(path)
     if title.endswith(".md"):
         title = title[:-3]
 
+    description = own.get("description") or _auto_generate_description(html_content)
+    image = _resolve_og_image_url(own.get("image"), request, url_prefix)
+
+    # 28_실제_아키텍처_전환_Phase1_노트본문.md: notes render client-side (raw markdown + the
+    # metadata cache built above, fetched by static/publish_render.js) to match real Obsidian
+    # Publish's actual architecture -- EXCEPT when this vault has enabled plugins. Plugins
+    # transform `processed_md` (already wikilink-resolved by parse_wikilinks) before it reaches
+    # Python-Markdown; moving wikilink resolution client-side would hand plugins a different
+    # input shape than they're written to expect, so plugin-enabled vaults keep the old
+    # fully-server-rendered path unchanged for now (see Phase 1's explicitly-out-of-scope list).
+    # `html_content`/`description` are computed unconditionally either way -- description/
+    # og:description must stay server-rendered regardless, since crawlers read <meta> tags
+    # without executing JS.
+    client_rendered = not enabled_plugin_ids
+    preload_json = json.dumps({
+        "url_prefix": url_prefix, "path": path, "sliding_window_mode": options["slidingWindowMode"],
+    }, ensure_ascii=False) if client_rendered else None
+
     return {
         "lang": lang, "t": lambda key, **params: t(key, lang, **params),
-        "username": username, "vault_id": vault_id, "title": title,
+        "title": title,
         "files": None, "file_hrefs": {}, "content": html_content,
+        "description": description, "image": image, "favicons": favicon_links,
+        "publish_css_href": publish_css_href, "publish_js_href": publish_js_href,
+        "client_rendered": client_rendered, "path": path, "preload_json": preload_json,
+        **common_option_fields,
     }
+
+@view_config(route_name='publish_view', permission=NO_PERMISSION_REQUIRED, renderer='templates/publish_page.jinja2')
+def publish_view(request):
+    username = request.matchdict.get("username")
+    vault_id = request.matchdict.get("vault_id")
+    path = request.matchdict.get("path", "")
+    return _render_publish_page(request, username, vault_id, path, via_custom_domain_route=False)
+
+def _parse_custom_domain_url_param(value: str) -> tuple:
+    """Splits a `?url=`/`x-obsidian-custom-domain` value (real Obsidian's own reverse-proxy
+    mechanism for hosts that can't forward the original Host header -- confirmed via the
+    official docs, obsidianmd/obsidian-help's "Custom domains.md", "Set up using a proxy"
+    section) into (hostname, path). Only the hostname portion is used for the vault lookup here
+    -- see get_vault_by_custom_domain's own docstring in repository.py for why pumice-server
+    only ever stores/matches a bare hostname, never a custom-domain-as-subpath-of-an-existing-
+    site (`mysite.com/my-notes`, also documented but out of scope -- see
+    35_실제_아키텍처_전환_리버스_프록시_커스텀_도메인.md)."""
+    value = (value or "").strip()
+    hostname, _, path = value.partition("/")
+    return hostname.strip().lower(), path
+
+def _resolve_custom_domain_hostname(request) -> str:
+    """The hostname to look up for this request's custom domain -- the `x-obsidian-custom-
+    domain` header (real Obsidian's proxy fallback for services that can't pass a query string,
+    see _parse_custom_domain_url_param) takes priority when present, since a request carrying it
+    is explicitly telling us the true Host was rewritten and can't be trusted; otherwise falls
+    back to the actual request Host (request.domain), the normal non-proxied case."""
+    header_value = request.headers.get("x-obsidian-custom-domain")
+    if header_value:
+        hostname, _ = _parse_custom_domain_url_param(header_value)
+        return hostname
+    return request.domain
+
+def custom_domain_route_predicate(info, request):
+    """Route predicate for custom_domain_view -- registered as the very first route (see
+    create_pyramid_app below) so it gets first refusal on every request. Returning False falls
+    through to the next-registered route as normal (Pyramid's standard predicate behavior), so
+    no explicit "is this actually a custom domain" guard is needed anywhere else. A plain
+    (info, request) function rather than a predicate-factory class so it's directly unit
+    testable with a minimal fake request (see tests/test_custom_domain_predicate.py) -- see
+    26_커스텀_도메인_지원.md."""
+    return request.repository.get_vault_by_custom_domain(_resolve_custom_domain_hostname(request)) is not None
+
+@view_config(route_name='custom_domain_view', permission=NO_PERMISSION_REQUIRED, renderer='templates/publish_page.jinja2')
+def custom_domain_view(request):
+    mapping = request.repository.get_vault_by_custom_domain(_resolve_custom_domain_hostname(request))
+    if not mapping:
+        return HTTPNotFound()  # predicate already guarantees this; re-checked for a race (the domain got released between predicate and view)
+    path = request.matchdict.get("path", "")
+    return _render_publish_page(request, mapping["owner_username"], mapping["vault_id"], path, via_custom_domain_route=True)
+
+@view_config(route_name='publish_serve_proxy', permission=NO_PERMISSION_REQUIRED, renderer='templates/publish_page.jinja2')
+def publish_serve_proxy_view(request):
+    """`GET /serve?url=<hostname>[/<path>]` -- the other half of real Obsidian's documented
+    reverse-proxy setup (35_실제_아키텍처_전환_리버스_프록시_커스텀_도메인.md), for proxies that
+    rewrite both the Host header AND the request path (nginx/Apache/Netlify/Vercel examples in
+    the official docs all `proxy_pass`/rewrite to this exact `/serve?url=...` shape) -- unlike
+    custom_domain_view, the note path comes from the `url` param's own contents, not from
+    Pyramid's own path matching, since the visited path never reaches this route as a real path
+    segment."""
+    hostname, path = _parse_custom_domain_url_param(request.params.get("url", ""))
+    mapping = request.repository.get_vault_by_custom_domain(hostname)
+    if not mapping:
+        return HTTPNotFound()
+    return _render_publish_page(request, mapping["owner_username"], mapping["vault_id"], path, via_custom_domain_route=True)
 
 
 @view_config(route_name='publish_slugs', renderer='json', permission='authenticated')
@@ -1176,9 +1562,164 @@ def publish_site_view(request):
         logger.error(f"HTTP publish_site failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_customurl', renderer='json', permission=NO_PERMISSION_REQUIRED)
+@view_config(route_name='publish_customurl', renderer='json', permission='vault-access')
 def publish_customurl_view(request):
-    return {"url": "", "redirect": False}
+    # real Obsidian's apiCustomUrl(url, redirect) posts {token, id, host, url, redirect} to this
+    # same endpoint for both fetching (called with no args) and saving (see 26_커스텀_도메인_
+    # 지원.md) -- "host" is the caller's own pumice-server instance host:port (same convention
+    # as /api/slug's "host" field), received but never stored/used here, just like /api/slug.
+    try:
+        vault_id = request.context.vault_id
+        owner = request.context.owner
+        url = request.json_body.get("url")
+        if url is not None:
+            try:
+                request.repository.set_custom_domain(owner, vault_id, url, bool(request.json_body.get("redirect", False)))
+            except CustomDomainAlreadyClaimedError:
+                return Response(
+                    body=json.dumps({"error": "This domain is already in use by a different site."}).encode("utf-8"),
+                    status=409, content_type="application/json")
+        domain = request.repository.get_custom_domain(owner, vault_id)
+        return {
+            "url": domain["hostname"] if domain else "",
+            "redirect": domain["redirect_to_custom_domain"] if domain else False,
+        }
+    except Exception as e:
+        logger.error(f"HTTP publish_customurl failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+# First batch of real Obsidian Publish's "Change site options" dialog (~20 settings total, see
+# 24_사이트_옵션_다이얼로그_실제_옵시디언과_비교.md) -- the ones that only need a stored value
+# plus a template conditional, no new site feature (graph/search/outline/backlinks/sliding
+# window/navigation sidebar/custom domain/collaboration are deferred, see that doc). Defaults are
+# real Obsidian's own (confirmed via obsidian.asar's XQ defaults table -- see
+# 25_사이트_옵션_1차_구현.md), notably readableLineLength defaulting to True (readable by
+# default, not full-width) and googleAnalytics being stored but never rendered here (real
+# Obsidian itself only activates it on a custom domain -- same reasoning as publish.js in
+# 23_사이트_커스터마이징_정적_에셋.md, and pumice-server has no such isolation yet).
+_SITE_OPTIONS_DEFAULTS = {
+    "siteName": "",
+    "indexFile": "",
+    "logo": "",
+    "noindex": False,
+    "hideTitle": False,
+    "readableLineLength": True,
+    "strictLineBreaks": False,
+    "googleAnalytics": "",
+    # Gates the search box added in 28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 3 (client-
+    # side search over the metadata cache, see static/publish_render.js). True matches the one
+    # real site's live /options/{uid} payload captured in 27_실제_퍼블리시_사이트_아키텍처_조사.md
+    # -- that confirms the field name, not necessarily that True is real Obsidian's actual
+    # factory default (only one real site was sampled), so treat this default the same way as
+    # googleAnalytics's gtag snippet: a reasonable own choice, not a confirmed match.
+    "showSearch": True,
+    # Navigation sidebar + sliding-window note navigation (28_실제_아키텍처_전환_Phase1_
+    # 노트본문.md's Phase 5). Field names confirmed via the same real /options/{uid} payload as
+    # showSearch (27_...md) -- that capture had showNavigation=false and slidingWindowMode=true,
+    # but that's one site's own customization, not necessarily Obsidian's factory defaults, so
+    # both default to False here (the more conservative "off unless the owner turns it on"
+    # choice -- same "reasonable own choice, not confirmed" category as showSearch's default).
+    "showNavigation": False,
+    "slidingWindowMode": False,
+    # Real Obsidian's own navigationOrdering/navigationHiddenItems only ever order/hide
+    # *top-level* vault entries (folder names and top-level filenames mixed in one flat list --
+    # confirmed via the real captured sample in 27_...md), not a full recursive tree -- see
+    # _build_navigation_tree.
+    "navigationOrdering": [],
+    "navigationHiddenItems": [],
+    # Theme switching (별도 대형 기능 — see 33_실제_아키텍처_전환_테마_전환.md, pumice repo).
+    # Field names confirmed via the real captured /options/{uid} sample (27_...md, which had
+    # defaultTheme="light"/showThemeToggle=true), but -- unlike the Phase 3/5 fields above --
+    # this default deliberately does NOT match that sample: pumice-server's Publish page has
+    # always shipped with a single hardcoded dark look, and picking "dark" here preserves that
+    # exact look for every already-deployed site the moment this ships, with zero visual change
+    # unless the owner explicitly opts into "light"/"system" or turns the toggle on. "system"
+    # (not "light"/"dark") falls back to the visitor's OS `prefers-color-scheme`.
+    "defaultTheme": "dark",
+    "showThemeToggle": False,
+}
+
+def _load_site_options(data_dir: str, owner: str, vault_id: str) -> dict:
+    stored = load_publish_meta(data_dir, owner, vault_id, "options.json", {})
+    return {**_SITE_OPTIONS_DEFAULTS, **{k: v for k, v in stored.items() if k in _SITE_OPTIONS_DEFAULTS}}
+
+def _resolve_theme_attr(default_theme: str) -> Optional[str]:
+    """`<html data-theme="...">`'s value -- "light"/"dark" render that theme unconditionally,
+    everything else (including "system", the third real dropdown option) resolves to None so no
+    attribute is emitted and the page's `@media (prefers-color-scheme: dark)` rule decides
+    instead. Any unrecognized stored value degrades the same way "system" does, rather than
+    erroring -- see 33_실제_아키텍처_전환_테마_전환.md."""
+    return default_theme if default_theme in ("light", "dark") else None
+
+def _strip_md_suffix(name: str) -> str:
+    return name[:-3] if name.lower().endswith(".md") else name
+
+def _build_navigation_tree(published_files: list, ordering: list, hidden: list, url_prefix: str) -> list:
+    """Navigation sidebar tree (see 28_실제_아키텍처_전환_Phase1_노트본문.md's Phase 5). Real
+    Obsidian's own navigationOrdering/navigationHiddenItems only ever contain *top-level* vault
+    entries -- folder names and top-level filenames mixed into one flat list (confirmed via the
+    real captured sample in 27_실제_퍼블리시_사이트_아키텍처_조사.md) -- so that's the only level
+    this reorders/hides too; a folder's own contents are just listed underneath it in path order,
+    since real Obsidian's confirmed data doesn't cover recursive subfolder ordering and inventing
+    one here would be guessing past the evidence.
+
+    Returns a list of {"type": "file", "display", "href"} or {"type": "folder", "display",
+    "children": [{"display", "href"}, ...]} entries, in final display order.
+    """
+    top_level = {}
+    order_seen = []
+    for f in published_files:
+        path = f["path"]
+        if "/" in path:
+            name = path.split("/", 1)[0]
+            if name not in top_level:
+                top_level[name] = {"type": "folder", "children": []}
+                order_seen.append(name)
+            top_level[name]["children"].append(path)
+        else:
+            top_level[path] = {"type": "file"}
+            order_seen.append(path)
+
+    hidden_set = set(hidden)
+    visible_names = [n for n in order_seen if n not in hidden_set]
+    ordered_names = [n for n in ordering if n in top_level and n not in hidden_set]
+    remaining_names = sorted(n for n in visible_names if n not in ordered_names)
+    final_order = ordered_names + remaining_names
+
+    entries = []
+    for name in final_order:
+        item = top_level[name]
+        if item["type"] == "file":
+            entries.append({
+                "type": "file", "display": _strip_md_suffix(name),
+                "href": f"{url_prefix}{quote(name, safe='/')}",
+            })
+        else:
+            children = [
+                {
+                    "display": _strip_md_suffix(child_path[len(name) + 1:]),
+                    "href": f"{url_prefix}{quote(child_path, safe='/')}",
+                }
+                for child_path in sorted(item["children"])
+            ]
+            entries.append({"type": "folder", "display": name, "children": children})
+    return entries
+
+@view_config(route_name='publish_options', renderer='json', permission='vault-access')
+def publish_options_view(request):
+    try:
+        vault_id = request.context.vault_id
+        owner = request.context.owner
+        data_dir = request.registry.settings.get("data_dir")
+        incoming = request.json_body.get("options")
+        if isinstance(incoming, dict):
+            current = load_publish_meta(data_dir, owner, vault_id, "options.json", {})
+            current.update({k: v for k, v in incoming.items() if k in _SITE_OPTIONS_DEFAULTS})
+            save_publish_meta(data_dir, owner, vault_id, "options.json", current)
+        return {"options": _load_site_options(data_dir, owner, vault_id)}
+    except Exception as e:
+        logger.error(f"HTTP publish_options failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
 @view_config(route_name='publish_slug', renderer='json', permission='vault-access')
 def publish_slug_view(request):
@@ -1291,13 +1832,17 @@ def publish_share_remove_view(request):
         logger.error(f"HTTP publish_share_remove failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
 
-@view_config(route_name='publish_share_accept', renderer='json', permission=NO_PERMISSION_REQUIRED)
+@view_config(route_name='publish_share_accept', renderer='json', permission='authenticated')
 def publish_share_accept_view(request):
     try:
         body = request.json_body
         code = body.get("code")
         if not code:
             return Response(body=json.dumps({"error": "Missing code"}).encode("utf-8"), status=400, content_type="application/json")
+
+        caller_username = request.identity["username"]
+        caller = request.repository.get_user_by_username(caller_username)
+        caller_email = (caller.get("email") or "").strip().lower() if caller else ""
 
         data_dir = request.registry.settings.get("data_dir")
         meta_root = os.path.join(data_dir, "publish_meta")
@@ -1313,12 +1858,22 @@ def publish_share_accept_view(request):
                     if not os.path.isdir(vault_meta_dir):
                         continue
                     shares = load_publish_meta(data_dir, owner, vault_id, "shares.json", [])
-                    changed = False
                     for s in shares:
-                        if s.get("invite_code") == code:
-                            s["accepted"] = True
-                            changed = True
-                    if changed:
+                        if s.get("invite_code") != code:
+                            continue
+                        # This grants real publish-access from here on (see VaultContext/
+                        # _is_accepted_publish_collaborator, 36_실제_아키텍처_전환_
+                        # Site_collaboration.md) -- unlike before, when "accepted" had no actual
+                        # consequence, the accepting account's own email must now match the
+                        # invite's, so a leaked/guessed invite_code alone can't grant access to
+                        # someone the owner didn't actually invite.
+                        invite_email = (s.get("email") or "").strip().lower()
+                        if not caller_email or invite_email != caller_email:
+                            return Response(
+                                body=json.dumps({"error": "This invite is for a different email address."}).encode("utf-8"),
+                                status=403, content_type="application/json")
+                        s["accepted"] = True
+                        s["accepted_by_username"] = caller_username
                         save_publish_meta(data_dir, owner, vault_id, "shares.json", shares)
                         return {"ok": True}
 
@@ -1326,6 +1881,128 @@ def publish_share_accept_view(request):
     except Exception as e:
         logger.error(f"HTTP publish_share_accept failed: {e}")
         return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+@view_config(route_name='publish_share_mine', renderer='json', permission='authenticated')
+def publish_share_mine_view(request):
+    """The Publish sites this authenticated user has been added as an accepted Site
+    collaborator on, across every owner/vault -- see 36_실제_아키텍처_전환_Site_collaboration.md.
+    Same "no factory, permission='authenticated', walk the whole publish_meta tree" pattern as
+    vault_shared_with_me_view (the vault-sync-sharing equivalent) and
+    publish_share_accept_view above."""
+    try:
+        caller_username = request.identity["username"]
+        data_dir = request.registry.settings.get("data_dir")
+        meta_root = os.path.join(data_dir, "publish_meta")
+        sites = []
+        if os.path.isdir(meta_root):
+            for owner in os.listdir(meta_root):
+                owner_meta_dir = os.path.join(meta_root, owner)
+                if not os.path.isdir(owner_meta_dir):
+                    continue
+                for vault_id in os.listdir(owner_meta_dir):
+                    vault_meta_dir = os.path.join(owner_meta_dir, vault_id)
+                    if not os.path.isdir(vault_meta_dir):
+                        continue
+                    shares = load_publish_meta(data_dir, owner, vault_id, "shares.json", [])
+                    if not any(s.get("accepted") and s.get("accepted_by_username") == caller_username for s in shares):
+                        continue
+                    options = _load_site_options(data_dir, owner, vault_id)
+                    sites.append({
+                        "owner": owner, "vault_id": vault_id,
+                        "site_name": options["siteName"] or vault_id,
+                    })
+        return {"sites": sites}
+    except Exception as e:
+        logger.error(f"HTTP publish_share_mine failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+
+# ─── Vault sync sharing (see pumice's 14_vault_sharing_설계.md) ────────────────────────────────
+# Distinct from the /publish/share/* views above: those grant write access (publish new pages,
+# publish changes, unpublish -- confirmed via the official docs, obsidianmd/obsidian-help's
+# "Collaborate on a Publish site.md" permission table; see 36_실제_아키텍처_전환_
+# Site_collaboration.md) to a published site's own content, enforced via VaultContext's
+# "publish-access" permission -- not read access (a published site is already public, or
+# separately password-protected, so "read access" isn't even a meaningful grant here). These
+# vault-sync-sharing views below grant full read/write SYNC access to the vault itself, backed by
+# the vault_shares DB table (repository.py) rather than the JSON-file-per-vault pattern publish
+# sharing uses -- sync access is checked on every WS connect (SyncWsSession._handle_init), not
+# just an occasional REST call, so an indexed table is the right fit here.
+
+@view_config(route_name='vault_share_invite', renderer='json', permission='vault-access')
+def vault_share_invite_view(request):
+    try:
+        body = request.json_body
+        email = (body.get("email") or "").strip()
+        if not email:
+            return Response(body=json.dumps({"error": "Missing email"}).encode("utf-8"), status=400, content_type="application/json")
+
+        share_uid = request.repository.add_vault_share(request.context.owner, request.context.vault_id, email)
+        return {"ok": True, "uid": share_uid}
+    except Exception as e:
+        logger.error(f"HTTP vault_share_invite failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+@view_config(route_name='vault_share_list', renderer='json', permission='vault-access')
+def vault_share_list_view(request):
+    try:
+        shares = request.repository.list_vault_shares(request.context.owner, request.context.vault_id)
+        public_shares = [
+            {"uid": s["uid"], "email": s["email"], "accepted": s["accepted"], "createdAtMs": s["created_at_ms"]}
+            for s in shares
+        ]
+        return {"shares": public_shares}
+    except Exception as e:
+        logger.error(f"HTTP vault_share_list failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+@view_config(route_name='vault_share_remove', renderer='json', permission='vault-access')
+def vault_share_remove_view(request):
+    try:
+        body = request.json_body
+        share_uid = body.get("share_uid")
+        if not share_uid:
+            return Response(body=json.dumps({"error": "Missing share_uid"}).encode("utf-8"), status=400, content_type="application/json")
+
+        ok = request.repository.remove_vault_share(request.context.owner, request.context.vault_id, share_uid)
+        return {"ok": ok}
+    except Exception as e:
+        logger.error(f"HTTP vault_share_remove failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+@view_config(route_name='vault_share_leave', renderer='json', permission='authenticated')
+def vault_share_leave_view(request):
+    # Not VaultContext-scoped: the caller here is the invited collaborator, not the vault's
+    # owner, so VaultContext.owner (always the caller's own identity) would resolve to the
+    # wrong account -- ownerUsername/vaultId are read directly from the body instead.
+    try:
+        body = request.json_body
+        owner_username = body.get("ownerUsername")
+        vault_id = body.get("vaultId")
+        if not owner_username or not vault_id:
+            return Response(body=json.dumps({"error": "Missing ownerUsername or vaultId"}).encode("utf-8"), status=400, content_type="application/json")
+
+        caller = request.identity["username"]
+        ok = request.repository.remove_vault_share_by_invited_user(caller, owner_username, vault_id)
+        return {"ok": ok}
+    except Exception as e:
+        logger.error(f"HTTP vault_share_leave failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
+@view_config(route_name='vault_shared_with_me', renderer='json', permission='authenticated')
+def vault_shared_with_me_view(request):
+    try:
+        caller = request.identity["username"]
+        shared = request.repository.list_shared_vaults_for_user(caller)
+        vaults = [
+            {"ownerUsername": s["owner_username"], "vaultId": s["vault_id"], "accepted": s["accepted"], "createdAtMs": s["created_at_ms"]}
+            for s in shared
+        ]
+        return {"vaults": vaults}
+    except Exception as e:
+        logger.error(f"HTTP vault_shared_with_me failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
 
 @view_config(route_name='user_logout', renderer='json', permission=NO_PERMISSION_REQUIRED)
 def user_logout_view(request):
@@ -1335,13 +2012,6 @@ def user_logout_view(request):
         logger.info("Session logged out.")
     clear_session_cookie(request)
     return {"ok": True}
-
-@view_config(route_name='admin_streaming_stats', renderer='json', permission='admin')
-def admin_streaming_stats_view(request):
-    # See streaming_upload_resource.py's StreamingUploadMetrics docstring -- in-process
-    # counters only (reset on restart), not persisted history/billing data.
-    upload_metrics = request.registry.settings.get("streaming_upload_metrics")
-    return upload_metrics.snapshot() if upload_metrics is not None else {}
 
 @view_config(route_name='admin_users', renderer='json', permission='admin')
 def admin_users_view(request):
@@ -1764,18 +2434,10 @@ def user_profile_update_view(request):
         logger.error(f"Failed to update profile: {e}")
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
 
-def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
-    if streaming_upload_metrics is None:
-        # Defaults to the same module-level singleton streaming_upload_resource.py's
-        # StreamingUploadRequest/_UploadAccumulator update by default -- passing it in
-        # explicitly (as main.py does) keeps that wiring visible instead of relying on two
-        # separate places importing the same global.
-        from .streaming_upload_resource import metrics as streaming_upload_metrics
-
+def create_pyramid_app(repository, data_dir):
     settings = {
         "repository": repository,
         "data_dir": data_dir,
-        "streaming_upload_metrics": streaming_upload_metrics,
     }
     # Initialize the Pyramid Configurator
     config = Configurator(settings=settings)
@@ -1797,6 +2459,30 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.set_root_factory(RootFactory)
     config.set_default_permission("authenticated")
 
+    # custom_domain_view MUST be the very first add_route call: its pattern (`/{path:.*}`)
+    # matches literally every path, so if any more specific route were registered before it,
+    # that route would win the match first and custom_domain_route_predicate would never even
+    # run for that path. The predicate itself (checking request.domain against a registered
+    # custom domain) is what keeps this from swallowing normal traffic -- a non-matching
+    # predicate just falls through to try the next-registered route, same as any Pyramid
+    # predicate (see 26_커스텀_도메인_지원.md). add_static_view above is unaffected since static
+    # assets are dispatched before route matching.
+    # custom_predicates (rather than the newer add_route_predicate) is what actually accepts a
+    # plain (context, request) -> bool function directly -- add_route_predicate instead expects
+    # a *factory* called at config-commit time as (value, config) that must itself return the
+    # per-request predicate callable, which is a different shape (confirmed the hard way: it
+    # blew up make_wsgi_app() at commit time). custom_predicates is deprecated since Pyramid 1.5
+    # but still fully functional (just a DeprecationWarning) -- simplicity here wins over
+    # chasing the newer API's extra indirection for a single predicate.
+    config.add_route('custom_domain_view', '/{path:.*}', custom_predicates=[custom_domain_route_predicate])
+
+    # Real Obsidian's other documented reverse-proxy custom-domain mechanism (see
+    # 35_실제_아키텍처_전환_리버스_프록시_커스텀_도메인.md) -- a fixed, non-wildcard path, so no
+    # ordering concern with custom_domain_view above (that predicate already excludes any
+    # request whose Host doesn't match a registered custom domain, and this server's own base
+    # domain is never expected to double as someone's custom domain).
+    config.add_route('publish_serve_proxy', '/serve')
+
     # Add routes. Endpoints scoped to a single vault get VaultContext as their route factory,
     # which resolves vault_id (from matchdict/params/obs-id header/JSON body, whichever that
     # endpoint uses) and builds its ACL from ownership -- paired with permission='vault-access'
@@ -1812,6 +2498,16 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.add_route('user_devices', '/api/user/devices')
     config.add_route('user_device_create', '/api/user/devices/create')
     config.add_route('user_device_delete', '/api/user/devices/delete')
+    # Vault sync sharing (see pumice's 14_vault_sharing_설계.md) -- distinct from the
+    # /publish/share/* routes above, which grant read access to a published static site, not
+    # to a vault's own sync data. invite/list/remove are owner-only (VaultContext); leave/
+    # shared-with-me act on the caller's own account instead, so they use the default
+    # RootFactory (permission='authenticated' is all they need -- see RootFactory.__acl__).
+    config.add_route('vault_share_invite', '/api/vault/share/invite', factory=VaultContext)
+    config.add_route('vault_share_list', '/api/vault/share/list', factory=VaultContext)
+    config.add_route('vault_share_remove', '/api/vault/share/remove', factory=VaultContext)
+    config.add_route('vault_share_leave', '/api/vault/share/leave')
+    config.add_route('vault_shared_with_me', '/api/vault/shared-with-me')
     config.add_route('admin_users', '/api/admin/users')
     config.add_route('admin_user_create', '/api/admin/users/create')
     config.add_route('admin_user_delete', '/api/admin/users/delete')
@@ -1821,7 +2517,6 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.add_route('admin_vaults', '/api/admin/vaults')
     config.add_route('admin_vault_files', '/api/admin/vaults/{vault_id}', factory=VaultContext)
     config.add_route('admin_published', '/api/admin/published')
-    config.add_route('admin_streaming_stats', '/api/admin/streaming-stats')
     config.add_route('admin_plugins', '/api/admin/plugins')
     config.add_route('get_token_info', '/api/token/info')
     config.add_route('oauth_protected_resource_metadata', '/.well-known/oauth-protected-resource')
@@ -1829,16 +2524,14 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.add_route('oauth_register', '/oauth/register')
     config.add_route('oauth_authorize', '/oauth/authorize')
     config.add_route('oauth_token', '/oauth/token')
-    config.add_route('get_history', '/api/history', factory=VaultContext)
-    config.add_route('download_history', '/api/history/download', factory=VaultContext)
-    config.add_route('restore_history', '/api/history/restore', factory=VaultContext)
     config.add_route('publish_list', '/api/list', factory=VaultContext)
     config.add_route('publish_upload', '/api/upload', factory=VaultContext)
     config.add_route('publish_remove', '/api/remove', factory=VaultContext)
     config.add_route('publish_download', '/api/download', factory=VaultContext)
     config.add_route('publish_slugs', '/api/slugs')
     config.add_route('publish_site', '/api/site')
-    config.add_route('publish_customurl', '/api/customurl')
+    config.add_route('publish_customurl', '/api/customurl', factory=VaultContext)
+    config.add_route('publish_options', '/api/options', factory=VaultContext)
     config.add_route('publish_slug', '/api/slug', factory=VaultContext)
     config.add_route('publish_password', '/api/password', factory=VaultContext)
     config.add_route('publish_plugins', '/api/publish/plugins', factory=VaultContext)
@@ -1852,6 +2545,7 @@ def create_pyramid_app(repository, data_dir, streaming_upload_metrics=None):
     config.add_route('publish_share_invite', '/publish/share/invite', factory=VaultContext)
     config.add_route('publish_share_remove', '/publish/share/remove', factory=VaultContext)
     config.add_route('publish_share_accept', '/publish/share/accept')
+    config.add_route('publish_share_mine', '/publish/share/mine')
     config.add_route('publish_view', '/publish/{username}/{vault_id}/{path:.*}')
 
     # Scan for decorators (@view_config, etc.)

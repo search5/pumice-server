@@ -1,13 +1,54 @@
 <!DOCTYPE html>
-<html lang="{{ lang }}">
+<html lang="{{ lang }}"{% if theme_attr %} data-theme="{{ theme_attr }}"{% endif %}>
 <head>
+    {% if show_theme_toggle %}
+    <script>
+    // Applies a visitor's own theme choice (see 33_실제_아키텍처_전환_테마_전환.md) before first
+    // paint, overriding whatever theme_attr the server rendered -- runs synchronously and this
+    // early in <head> specifically to avoid a flash of the wrong theme on load.
+    (function () {
+      try {
+        var saved = localStorage.getItem("pumiceTheme");
+        if (saved === "light" || saved === "dark") {
+          document.documentElement.setAttribute("data-theme", saved);
+        }
+      } catch (e) {}
+    })();
+    </script>
+    {% endif %}
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ title }} - {{ vault_id }} Publish</title>
+    <title>{{ title }} - {{ site_name }} Publish</title>
+    <meta property="og:title" content="{{ title }} - {{ site_name }} Publish">
+    {% if noindex %}
+    <meta name="robots" content="noindex">
+    {% endif %}
+    {% if description %}
+    <meta name="description" content="{{ description }}">
+    <meta property="og:description" content="{{ description }}">
+    <meta name="twitter:description" content="{{ description }}">
+    {% endif %}
+    {% if image %}
+    <meta property="og:image" content="{{ image }}">
+    <meta name="twitter:card" content="summary_large_image">
+    {% else %}
+    <meta name="twitter:card" content="summary">
+    {% endif %}
+    {% for icon in favicons %}
+    <link rel="icon" href="{{ icon.href }}"{% if icon.sizes %} sizes="{{ icon.sizes }}"{% endif %}>
+    {% endfor %}
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
+        /* Theme switching (별도 대형 기능, see 33_실제_아키텍처_전환_테마_전환.md). This page has
+           always shipped with a single hardcoded dark look, so that stays the baseline here (a
+           dark-first palette) -- a light palette is layered on top only when actually asked for
+           (OS prefers-color-scheme:light, an explicit data-theme="light" from defaultTheme, or a
+           visitor's own toggle choice via the inline <script> in <head>), never the reverse. An
+           explicit data-theme always wins over the OS preference; :root[data-theme="dark"] exists
+           mainly so a visitor's own toggle-to-dark still applies even when their OS prefers
+           light. */
         :root {
             --bg-color: #0d1117;
             --container-bg: rgba(22, 27, 34, 0.7);
@@ -19,6 +60,67 @@
             --wiki-link: #a371f7;
             --wiki-link-hover: #b893f9;
             --code-bg: #161b22;
+            --heading-color: #ffffff;
+            --link-hover-color: #79c0ff;
+            --code-text-color: #e6edf3;
+            --bg-gradient-start: #1c1d2e;
+            --bg-gradient-end: #0d1117;
+        }
+
+        @media (prefers-color-scheme: light) {
+            :root:not([data-theme="dark"]) {
+                --bg-color: #ffffff;
+                --container-bg: rgba(255, 255, 255, 0.85);
+                --border-color: rgba(31, 35, 40, 0.15);
+                --text-primary: #1f2328;
+                --text-muted: #59636e;
+                --accent-purple: #8250df;
+                --accent-blue: #0969da;
+                --wiki-link: #8250df;
+                --wiki-link-hover: #6639ba;
+                --code-bg: #f6f8fa;
+                --heading-color: #1f2328;
+                --link-hover-color: #0550ae;
+                --code-text-color: #24292f;
+                --bg-gradient-start: #eef1f5;
+                --bg-gradient-end: #ffffff;
+            }
+        }
+
+        :root[data-theme="light"] {
+            --bg-color: #ffffff;
+            --container-bg: rgba(255, 255, 255, 0.85);
+            --border-color: rgba(31, 35, 40, 0.15);
+            --text-primary: #1f2328;
+            --text-muted: #59636e;
+            --accent-purple: #8250df;
+            --accent-blue: #0969da;
+            --wiki-link: #8250df;
+            --wiki-link-hover: #6639ba;
+            --code-bg: #f6f8fa;
+            --heading-color: #1f2328;
+            --link-hover-color: #0550ae;
+            --code-text-color: #24292f;
+            --bg-gradient-start: #eef1f5;
+            --bg-gradient-end: #ffffff;
+        }
+
+        :root[data-theme="dark"] {
+            --bg-color: #0d1117;
+            --container-bg: rgba(22, 27, 34, 0.7);
+            --border-color: rgba(48, 54, 61, 0.8);
+            --text-primary: #c9d1d9;
+            --text-muted: #8b949e;
+            --accent-purple: #8ab4f8;
+            --accent-blue: #58a6ff;
+            --wiki-link: #a371f7;
+            --wiki-link-hover: #b893f9;
+            --code-bg: #161b22;
+            --heading-color: #ffffff;
+            --link-hover-color: #79c0ff;
+            --code-text-color: #e6edf3;
+            --bg-gradient-start: #1c1d2e;
+            --bg-gradient-end: #0d1117;
         }
 
         * {
@@ -28,7 +130,7 @@
         }
 
         body {
-            background: radial-gradient(circle at 50% 0%, #1c1d2e 0%, #0d1117 70%);
+            background: radial-gradient(circle at 50% 0%, var(--bg-gradient-start) 0%, var(--bg-gradient-end) 70%);
             color: var(--text-primary);
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             line-height: 1.7;
@@ -41,10 +143,282 @@
             margin: 0 auto;
         }
 
-        header {
+        .layout.wide {
+            max-width: 1400px;
+        }
+
+        .layout.has-nav {
+            max-width: 1200px;
+            display: flex;
+            align-items: flex-start;
+            gap: 24px;
+        }
+
+        .layout.has-nav.wide {
+            max-width: 1600px;
+        }
+
+        .layout.has-nav.has-graph {
+            max-width: 1400px;
+        }
+
+        .layout.has-nav.has-graph.wide {
+            max-width: 1800px;
+        }
+
+        /* Left sidebar: title/theme/search/nav (matches real Obsidian's own
+           site-body-left-column, see 43_사이트_제목_왼쪽_사이드바_이동.md) plus the outline --
+           the outline stays here per explicit user direction even though real Obsidian's own
+           outline lives in the right column alongside the graph (45_그래프_다시_오른쪽으로_
+           이동_및_드래그_패닝.md: user asked for the graph specifically to move back right,
+           chose to keep the outline on the left when asked). No max-height/overflow cap on the
+           sidebar itself: with outline+nav both potentially present, a fixed viewport-height cap
+           would force scroll clipping that'd either cut off content or (per the
+           .pumice-search-results bug fixed in 32-sidebar-and-graph-bg-fix.md) clip an
+           absolutely-positioned child -- letting it grow past the viewport and scroll with the
+           page is simpler and avoids both. */
+        .pumice-nav-sidebar {
+            flex: 0 0 220px;
+            position: sticky;
+            top: 24px;
+            padding-top: 4px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .pumice-nav-sidebar ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+        }
+
+        .pumice-nav-sidebar li {
+            margin: 2px 0;
+        }
+
+        .pumice-nav-sidebar a:not(.site-title) {
+            display: block;
+            padding: 4px 8px;
+            border-radius: 6px;
+            color: var(--text-primary);
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        .pumice-nav-sidebar a:not(.site-title):hover {
+            background: rgba(138, 180, 248, 0.1);
+        }
+
+        .pumice-nav-folder-title {
+            display: block;
+            padding: 4px 8px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+
+        .pumice-nav-sidebar .nav-folder ul {
+            padding-left: 12px;
+        }
+
+        .pumice-main-column {
+            flex: 1;
+            min-width: 0;
+        }
+
+        /* Right column: graph only now (outline stays in the left sidebar, per user direction --
+           see the .pumice-nav-sidebar comment above). Matches real Obsidian's own
+           site-body-right-column for flex-basis/sticky/scroll behavior even though it no longer
+           holds the outline too. */
+        .pumice-right-column {
+            flex: 0 0 240px;
+            position: sticky;
+            top: 24px;
+            max-height: calc(100vh - 48px);
+            overflow-y: auto;
+        }
+
+        /* Graph mini-view -- real Obsidian Publish's own graph is NOT hidden behind a toggle
+           button; it's a small, always-visible box in the sidebar (confirmed live: 290x250px on
+           lab.marconoris.com/now, reading window.app.graph directly) with an expand icon and a
+           local/global scope icon. Replaces the earlier click-to-open dark-modal design
+           (38_실제_아키텍처_전환_검색_그래프_실제화.md) entirely -- see 40_그래프_뷰_실제_UI_형태.md. */
+        .pumice-graph-mini {
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            background: var(--container-bg);
+            overflow: hidden;
+            flex: 0 0 auto;
+        }
+
+        .pumice-graph-mini-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
+            padding: 8px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+        }
+
+        .pumice-graph-mini-icons {
+            display: flex;
+            gap: 4px;
+        }
+
+        .pumice-graph-icon-button {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 13px;
+            line-height: 1;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+
+        .pumice-graph-icon-button:hover {
+            color: var(--text-primary);
+            background: rgba(138, 180, 248, 0.1);
+        }
+
+        #pumice-graph-mini-canvas {
+            width: 100%;
+            height: 220px;
+        }
+
+        #pumice-graph-mini-canvas canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        /* Expanded state -- takes over the whole viewport outright, no dimmed backdrop over
+           existing content (confirmed live: real Obsidian's `.mod-expanded` state replaces the
+           page, it isn't a modal on top of it). Own simplification vs real Obsidian: covers the
+           entire viewport rather than leaving a persistent app-chrome sidebar visible, since this
+           page doesn't have an equivalent persistent chrome region to preserve. */
+        .pumice-graph-fullpage {
+            position: fixed;
+            inset: 0;
+            z-index: 100;
+            background: var(--bg-color);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .pumice-graph-fullpage[hidden] {
+            display: none;
+        }
+
+        .pumice-graph-fullpage-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 24px;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            flex: 0 0 auto;
+        }
+
+        #pumice-graph-fullpage-canvas {
+            flex: 1;
+            min-height: 0;
+        }
+
+        #pumice-graph-fullpage-canvas canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        .pumice-outline-sidebar {
+            font-size: 13px;
+        }
+
+        .pumice-outline-sidebar:empty {
+            display: none;
+        }
+
+        .pumice-outline-sidebar ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+        }
+
+        .pumice-outline-sidebar li {
+            margin: 2px 0;
+        }
+
+        .pumice-outline-sidebar a {
+            display: block;
+            padding: 3px 6px;
+            border-radius: 6px;
+            color: var(--text-muted);
+            text-decoration: none;
+        }
+
+        .pumice-outline-sidebar a:hover {
+            color: var(--text-primary);
+            background: rgba(138, 180, 248, 0.1);
+        }
+
+        /* Scroll-spy (37_실제_아키텍처_전환_TOC_재설계.md's follow-up correction) -- real
+           Obsidian's outline highlights whichever section is currently in view as the visitor
+           scrolls (confirmed live by reading app.js's onScroll->highlightLine handler; an earlier
+           check in this same investigation wrongly found no such behavior because it inspected
+           the wrong DOM node). `.is-active` is toggled by static/publish_render.js's
+           wireOutlineScrollSpy. */
+        .pumice-outline-sidebar a.is-active {
+            color: var(--accent-blue);
+            font-weight: 600;
+            background: rgba(88, 166, 255, 0.08);
+        }
+
+        /* Real Obsidian nests a child heading's own <ul> under its parent <li> and indents via
+           the children container itself (padding-left + a left guide line), not per-level
+           classes on each item -- confirmed live via DOM inspection on lab.marconoris.com/now. */
+        .pumice-outline-sidebar .pumice-outline-children {
+            padding-left: 14px;
+            border-left: 1px solid var(--border-color);
+            margin-left: 6px;
+        }
+
+        .pumice-sliding-track {
+            display: flex;
+            overflow-x: auto;
+            gap: 24px;
+            scroll-snap-type: x proximity;
+        }
+
+        .pumice-sliding-pane {
+            flex: 0 0 min(600px, 100%);
+            scroll-snap-align: start;
+        }
+
+        .pumice-sliding-pane + .pumice-sliding-pane {
+            border-left: 1px solid var(--border-color);
+            padding-left: 24px;
+        }
+
+        .site-logo {
+            height: 24px;
+            width: 24px;
+            border-radius: 4px;
+            object-fit: cover;
+        }
+
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
             margin-bottom: 40px;
             padding-bottom: 20px;
             border-bottom: 1px solid var(--border-color);
@@ -69,6 +443,112 @@
             font-size: 20px;
         }
 
+        .site-title.has-logo::before {
+            content: none;
+        }
+
+        .pumice-search {
+            position: relative;
+            width: 100%;
+            flex: 0 0 auto;
+        }
+
+        .pumice-search input {
+            width: 100%;
+            box-sizing: border-box;
+            background: var(--code-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            padding: 8px 12px;
+            font-size: 14px;
+        }
+
+        .pumice-search-results {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            right: 0;
+            z-index: 10;
+            background: var(--container-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            max-height: 320px;
+            overflow-y: auto;
+        }
+
+        .pumice-search-results:empty {
+            display: none;
+            border: none;
+        }
+
+        /* Sized in JS (wireSearch's syncClearance, publish_render.js) to match the results
+           dropdown's *actual* rendered height, not a flat constant -- a fixed 324px whenever
+           anything was showing looked like a second, redundant gap stacked below a dropdown
+           that only had one or two results in it (46_...md's first attempt reserved a permanent
+           324px regardless of state; 47_...md tried toggling that same flat 324px on/off, which
+           was still wrong for short result lists; this is the second follow-up correction).
+           Collapsed to 0 by default -- own layout choice, not matched against real Obsidian (its
+           own left-column search sits above the folder tree only, no outline in that column to
+           worry about, see 43_사이트_제목_왼쪽_사이드바_이동.md). */
+        .pumice-search-clearance {
+            flex: 0 0 0;
+            transition: flex-basis 0.15s ease;
+        }
+
+        .pumice-search-results a {
+            display: block;
+            padding: 8px 12px;
+            color: var(--text-primary);
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        .pumice-search-results a:hover {
+            background: rgba(138, 180, 248, 0.1);
+        }
+
+        .pumice-search-results .search-result-title {
+            font-weight: 600;
+        }
+
+        .pumice-search-results .search-result-snippet {
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
+        /* Shown while the debounced POST _search body-text lookup is in flight (38_실제_아키텍처_
+           전환_검색_그래프_실제화.md) -- matches real Obsidian's own "Searching..." copy. */
+        .pumice-search-results .search-status {
+            padding: 8px 12px;
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+
+        .pumice-icon-button {
+            background: var(--code-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            width: 36px;
+            height: 36px;
+            font-size: 16px;
+            cursor: pointer;
+            flex: 0 0 auto;
+            align-self: flex-start;
+        }
+
+        .pumice-icon-button:hover {
+            background: rgba(138, 180, 248, 0.1);
+        }
+
+        /* Graph rendering itself: PixiJS/WebGL canvas (38_실제_아키텍처_전환_검색_그래프_실제화.md)
+           -- real Obsidian's own graph is WebGL-rendered too (confirmed by reading app.js).
+           static/publish_render.js's renderGraphPixi reads --border-color/--wiki-link/
+           --accent-blue/--text-muted directly (via cssColorToPixiHex) to stay theme-aware, so no
+           CSS color rules are needed here -- just canvas sizing (see .pumice-graph-mini/
+           .pumice-graph-fullpage above, inside .pumice-right-column). */
+
         .vault-badge {
             background: rgba(138, 180, 248, 0.1);
             color: var(--accent-purple);
@@ -89,13 +569,44 @@
             -webkit-backdrop-filter: blur(12px);
         }
 
+        .pumice-sidebar:empty {
+            display: none;
+        }
+
+        .pumice-sidebar {
+            margin: 24px 0;
+            padding: 16px 20px;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            background: var(--container-bg);
+            font-size: 14px;
+        }
+
+        .pumice-sidebar h2 {
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin: 0 0 8px 0;
+        }
+
+        .pumice-sidebar ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+        }
+
+        .pumice-sidebar li {
+            margin: 4px 0;
+        }
+
         .markdown-body h1 {
             font-family: 'Outfit', sans-serif;
             font-size: 2.2em;
             font-weight: 700;
             margin-top: 0;
             margin-bottom: 24px;
-            color: #ffffff;
+            color: var(--heading-color);
             border-bottom: 1px solid rgba(48, 54, 61, 0.4);
             padding-bottom: 12px;
         }
@@ -105,7 +616,7 @@
             font-size: 1.6em;
             margin-top: 36px;
             margin-bottom: 16px;
-            color: #f0f6fc;
+            color: var(--heading-color);
             display: flex;
             align-items: center;
         }
@@ -122,7 +633,7 @@
             font-size: 1.3em;
             margin-top: 24px;
             margin-bottom: 12px;
-            color: #f0f6fc;
+            color: var(--heading-color);
         }
 
         .markdown-body p {
@@ -139,8 +650,8 @@
         }
 
         .markdown-body a:hover {
-            color: #79c0ff;
-            border-bottom-color: #79c0ff;
+            color: var(--link-hover-color);
+            border-bottom-color: var(--link-hover-color);
         }
 
         .markdown-body a.wiki-link {
@@ -192,7 +703,7 @@
             background-color: transparent;
             padding: 0;
             font-size: 90%;
-            color: #e6edf3;
+            color: var(--code-text-color);
             border-radius: 0;
         }
 
@@ -235,7 +746,7 @@
 
         .markdown-body th {
             background-color: rgba(138, 180, 248, 0.05);
-            color: #ffffff;
+            color: var(--heading-color);
             font-weight: 600;
         }
 
@@ -260,6 +771,15 @@
         }
 
         @media (max-width: 768px) {
+            .layout.has-nav {
+                flex-direction: column;
+            }
+            .pumice-nav-sidebar,
+            .pumice-right-column {
+                position: static;
+                max-height: none;
+                width: 100%;
+            }
             .container {
                 padding: 24px;
                 border-radius: 12px;
@@ -269,23 +789,138 @@
             }
         }
     </style>
+    {% if publish_css_href %}
+    <link rel="stylesheet" href="{{ publish_css_href }}">
+    {% endif %}
+    {% if publish_js_href %}
+    <script src="{{ publish_js_href }}" defer></script>
+    {% endif %}
+    {% if google_analytics %}
+    <!-- Standard gtag.js snippet -- real Obsidian gates Google Analytics behind the same
+         isCustomDomain() check as publish.js (confirmed via obsidian.asar), but the exact
+         snippet it injects wasn't confirmed, so this is a reasonable default, not a byte-exact
+         match (see 26_커스텀_도메인_지원.md). -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id={{ google_analytics }}"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', '{{ google_analytics }}');
+    </script>
+    {% endif %}
 </head>
 <body>
-    <div class="layout">
-        <header>
-            <a href="/publish/{{ username }}/{{ vault_id }}/" class="site-title">{{ vault_id }} Publish</a>
-            <span class="vault-badge">Vault: {{ vault_id }}</span>
-        </header>
-        <main class="container markdown-body">
-            {% if files is not none -%}
-            <h1>{{ vault_id }}</h1>{% if files %}<ul>{% for f in files %}<li><a href="{{ file_hrefs[f] }}">{{ f }}</a></li>{% endfor %}</ul>{% else %}<p>{{ t('publish_public.empty_no_files') }}</p>{% endif %}
-            {%- else -%}
-            {{ content | safe }}
-            {%- endif %}
-        </main>
-        <footer>
-            <p>Powered by Antigravity Obsidian Publish Server | <a href="/publish/{{ username }}/{{ vault_id }}/index.md">Index</a></p>
-        </footer>
+    {# Site title/logo lives in this sidebar too now (matches real Obsidian: confirmed live
+       that .site-body-left-column-inner's own first two children are the logo and site name,
+       above the theme toggle and search box -- see 43_사이트_제목_왼쪽_사이드바_이동.md), so
+       the sidebar itself is unconditional -- it always has at least the title to show. #}
+    <div class="layout{% if not readable_line_length %} wide{% endif %} has-nav{% if client_rendered and preload_json %} has-graph{% endif %}">
+        <nav class="pumice-nav-sidebar">
+            <a href="{{ url_prefix }}" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
+            {% if show_theme_toggle %}
+            <button id="pumice-theme-toggle" class="pumice-icon-button" type="button" aria-label="{{ t('publish_public.theme_toggle') }}" title="{{ t('publish_public.theme_toggle') }}">🌓</button>
+            <script>
+            (function () {
+              var btn = document.getElementById("pumice-theme-toggle");
+              if (!btn) return;
+              btn.addEventListener("click", function () {
+                // No explicit data-theme yet means this page is following the OS preference
+                // -- this CSS is dark-first (see the <style> block), so "no preference for
+                // light" effectively means dark.
+                var current = document.documentElement.getAttribute("data-theme");
+                if (!current) {
+                  current = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+                }
+                var next = current === "dark" ? "light" : "dark";
+                document.documentElement.setAttribute("data-theme", next);
+                try { localStorage.setItem("pumiceTheme", next); } catch (e) {}
+              });
+            })();
+            </script>
+            {% endif %}
+            {% if show_search and preload_json %}
+            <div class="pumice-search">
+                <input id="pumice-search-input" type="search" placeholder="{{ t('publish_public.search_placeholder') }}" autocomplete="off">
+                <div id="pumice-search-results" class="pumice-search-results"></div>
+            </div>
+            <div id="pumice-search-clearance" class="pumice-search-clearance" aria-hidden="true"></div>
+            {% endif %}
+            {% if client_rendered %}
+            <aside id="pumice-outline" class="pumice-outline-sidebar"></aside>
+            {% endif %}
+            {% if show_navigation and navigation_tree %}
+            <ul>
+                {% for entry in navigation_tree %}
+                {% if entry.type == "folder" -%}
+                <li class="nav-folder">
+                    <span class="pumice-nav-folder-title">{{ entry.display }}</span>
+                    <ul>
+                        {% for child in entry.children %}
+                        <li><a href="{{ child.href }}">{{ child.display }}</a></li>
+                        {% endfor %}
+                    </ul>
+                </li>
+                {%- else -%}
+                <li><a href="{{ entry.href }}">{{ entry.display }}</a></li>
+                {%- endif %}
+                {% endfor %}
+            </ul>
+            {% endif %}
+        </nav>
+        <div class="pumice-main-column">
+            <header>
+                <span class="vault-badge">Vault: {{ vault_id }}</span>
+            </header>
+            {% if preload_json %}
+            <div id="pumice-graph-fullpage" class="pumice-graph-fullpage" hidden>
+                <div class="pumice-graph-fullpage-header">
+                    <span>{{ t('publish_public.graph_view') }}</span>
+                    <button id="pumice-graph-collapse" class="pumice-graph-icon-button" type="button" aria-label="{{ t('common.button_close') }}" title="{{ t('common.button_close') }}">✕</button>
+                </div>
+                <div id="pumice-graph-fullpage-canvas"></div>
+            </div>
+            {% endif %}
+            <main class="container markdown-body">
+                {% if files is not none -%}
+                <h1>{{ site_name }}</h1>{% if files %}<ul>{% for f in files %}<li><a href="{{ file_hrefs[f] }}">{{ f }}</a></li>{% endfor %}</ul>{% else %}<p>{{ t('publish_public.empty_no_files') }}</p>{% endif %}
+                {%- elif client_rendered -%}
+                {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
+                <div id="pumice-note-root" data-note-path="{{ path }}"></div>
+                <aside id="pumice-backlinks" class="pumice-sidebar"></aside>
+                {%- else -%}
+                {% if not hide_title %}<h1 class="note-title">{{ title }}</h1>{% endif %}
+                {{ content | safe }}
+                {%- endif %}
+            </main>
+            {% if preload_json %}
+            <script>window.pumicePreload = {{ preload_json | safe }};</script>
+            <!-- Graph view rendering (38_실제_아키텍처_전환_검색_그래프_실제화.md) -- vendored,
+                 unmodified pixi.min.js (MIT), loaded as its own plain global `PIXI` before
+                 publish_render.js, the same way real Obsidian Publish's own page loads it. This
+                 is the "pixi.js-legacy" build specifically (WebGL with an automatic Canvas 2D
+                 fallback), not plain pixi.js (WebGL-only) -- own choice beyond what was confirmed
+                 live, so a visitor without WebGL still sees the graph instead of nothing. -->
+            <script defer src="/static/pixi.min.js"></script>
+            <script defer src="/static/publish_render.js"></script>
+            {% endif %}
+            <footer>
+                <p>Powered by Antigravity Obsidian Publish Server | <a href="{{ url_prefix }}index.md">Index</a></p>
+            </footer>
+        </div>
+        {% if client_rendered and preload_json %}
+        <div class="pumice-right-column">
+            <div class="pumice-graph-mini">
+                <div class="pumice-graph-mini-header">
+                    <span>{{ t('publish_public.graph_view') }}</span>
+                    <span class="pumice-graph-mini-icons">
+                        <button id="pumice-graph-scope-toggle" class="pumice-graph-icon-button" type="button" aria-label="{{ t('publish_public.graph_toggle_scope') }}" title="{{ t('publish_public.graph_toggle_scope') }}">⑂</button>
+                        <button id="pumice-graph-expand" class="pumice-graph-icon-button" type="button" aria-label="{{ t('publish_public.graph_expand') }}" title="{{ t('publish_public.graph_expand') }}">⤢</button>
+                    </span>
+                </div>
+                <div id="pumice-graph-mini-canvas"></div>
+            </div>
+        </div>
+        {% endif %}
     </div>
 </body>
 </html>

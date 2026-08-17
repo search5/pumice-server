@@ -3,17 +3,16 @@ import os
 import shutil
 import time
 import hashlib
-import grpc
 import logging
 import secrets
 from typing import Dict, Optional
 from urllib.parse import unquote
 
-from . import sync_pb2
-from . import sync_pb2_grpc
-from .change_notifier import did_metadata_change
+from . import wire_types
+from .change_notifier import diff_changed_files
 from .history_policy import is_history_excluded_path
 from .repository import MetadataRepository
+from .status_codes import StatusCode
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +34,12 @@ def _backup_file(src_path: str, dst_path: str) -> None:
     except OSError:
         shutil.copy2(src_path, dst_path)
 
-class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
+DEFAULT_MAX_FILE_SIZE_BYTES = 2 * 1024 ** 3  # 2 GiB -- see max_file_size_bytes below
+
+
+class SyncServiceServicer:
     def __init__(self, data_dir: str, repository: MetadataRepository, change_notifier=None,
-                 download_concurrency: int = 8):
+                 download_concurrency: int = 8, max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES):
         self.data_dir = data_dir
         self.vaults_dir = os.path.join(data_dir, "vaults")
         self.repository = repository
@@ -49,21 +51,31 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
         # fresh vault's first sync that can be thousands of files -- and this used to spawn one
         # unbounded asyncio task per path (see DownloadFiles below).
         self._download_semaphore = asyncio.Semaphore(download_concurrency)
+        # Per-file upload cap, enforced in ws_sync_resource.py's _run_push (PR6 of
+        # #14_옵시디언싱크_정렬_구현계획.md) and advertised to the client as maxFileSizeBytes in
+        # init_ok (_handle_init reads this attribute directly). No cap existed at all before
+        # this -- 2 GiB is a deliberately generous
+        # default chosen not to break any existing self-hosted deployment's real usage, matching
+        # this project's small/personal-scale design (see #11_websocket_동기화_프로토콜_설계.md).
+        self.max_file_size_bytes = max_file_size_bytes
         os.makedirs(self.vaults_dir, exist_ok=True)
 
     def _verify_vault_access(self, vault_id: str, context) -> str:
-        """Resolves and returns the caller's own username from their device token, aborting the
-        RPC if the token is missing/invalid. A vault's identity is (owner_username, vault_id), and
-        owner_username always comes from this resolved caller identity, never from client input --
-        so there's nothing left to check beyond authentication itself: a caller can only ever
-        address vaults under their own name. (An earlier version of this checked vault_id against
-        a global vault_id -> owner registry and let the first caller "claim" an unclaimed vault_id
-        -- removed, because vault_id alone isn't globally unique: "Obsidian Vault" is Obsidian's
-        own default vault name, so two different accounts' same-named vaults collided.)"""
+        """Resolves and returns the vault owner this call is authorized against, aborting the
+        RPC if the token is missing/invalid. Still authenticates via the token exactly as
+        before; the returned owner is the caller's own username UNLESS an 'x-vault-owner'
+        metadata entry is present, in which case that value wins.
+
+        That metadata entry is never client input -- for the WS path it's synthesized by
+        WsServicerContext.invocation_metadata() straight from SyncWsSession.owner_username,
+        which _handle_init only ever assigns the verified return value of
+        repository.resolve_vault_owner() to (see 14_vault_sharing_설계.md, pumice repo). REST
+        callers of this servicer never set the header, so they keep resolving to their own
+        username exactly like before vault sharing existed."""
         metadata = dict(context.invocation_metadata())
         auth_header = metadata.get('authorization', '')
         if not auth_header:
-            context.abort(grpc.StatusCode.UNAUTHENTICATED, "Missing authorization metadata")
+            context.abort(StatusCode.UNAUTHENTICATED, "Missing authorization metadata")
             return ""
 
         if auth_header.startswith('Bearer '):
@@ -73,10 +85,11 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
 
         device = self.repository.get_device_token(token)
         if not device:
-            context.abort(grpc.StatusCode.UNAUTHENTICATED, "Invalid or missing auth token")
+            context.abort(StatusCode.UNAUTHENTICATED, "Invalid or missing auth token")
             return ""
 
-        return device["username"]
+        owner_hint = unquote(metadata.get('x-vault-owner', ''))
+        return owner_hint if owner_hint else device["username"]
 
     def _get_vault_path(self, owner_username: str, vault_id: str) -> str:
         owner_dir = os.path.join(self.vaults_dir, owner_username)
@@ -184,16 +197,38 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                         "is_deleted": True
                     }
                 else:
-                    # Keep the existing deleted state
-                    merged_files[path] = old_meta
+                    # Keep the existing deleted state -- normalized to the same 5-key shape as
+                    # every other merged_files entry. old_meta came straight from
+                    # repository.load_all(), which returns full DB rows (owner_username,
+                    # vault_id, ...); reusing it verbatim let that extra shape leak into
+                    # Delta()'s sync_pb2.FileMeta(**server_meta) for any tombstone a client
+                    # hadn't caught up to yet ("Protocol message FileMeta has no
+                    # "owner_username" field"). See did_metadata_change's docstring in
+                    # change_notifier.py for the same shape mismatch biting a different caller.
+                    merged_files[path] = {
+                        "path": path,
+                        "modified_at_ms": old_meta["modified_at_ms"],
+                        "size_bytes": old_meta["size_bytes"],
+                        "content_hash": old_meta["content_hash"],
+                        "is_deleted": old_meta["is_deleted"],
+                    }
 
         # Persist the metadata updates
         self.repository.save_all(owner_username, vault_id, merged_files)
         # Delta calls this on every sync/poll cycle regardless of whether anything actually
-        # changed, so this must be gated -- an unconditional notify would make a client's own
-        # no-op poll re-notify itself (and every other watcher) every single cycle.
-        if self.change_notifier is not None and did_metadata_change(metadata_files, merged_files):
-            self.change_notifier.notify_change(owner_username, vault_id)
+        # changed, so both the journal write and the live notify below must be gated on an
+        # actual diff -- an unconditional notify would make a client's own no-op poll
+        # re-notify itself (and every other watcher) every single cycle, and an unconditional
+        # journal write would make every no-op poll bump every file's change_id forever. One
+        # record_change()/notify_change() per actually-changed file (not one per whole scan) so
+        # a push carries that file's own metadata, matching real Obsidian Sync -- see
+        # diff_changed_files. record_change() always runs (even with no change_notifier
+        # configured) since the journal is read by init's catch-up regardless of live-push
+        # wiring; notify_change() stays conditional.
+        for changed_path, changed_meta in diff_changed_files(metadata_files, merged_files).items():
+            self.repository.record_change(owner_username, vault_id, changed_path, changed_meta)
+            if self.change_notifier is not None:
+                self.change_notifier.notify_change(owner_username, vault_id, changed_meta)
         return merged_files
 
     def _delete_on_server(self, vault_path: str, owner_username: str, vault_id: str, path: str,
@@ -263,13 +298,8 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             "is_deleted": True
         }
         self.repository.save_one(owner_username, vault_id, path, meta)
+        self.repository.record_change(owner_username, vault_id, path, meta)
         return meta
-
-    async def Ping(self, request, context):
-        return sync_pb2.Pong(
-            server_version="0.1.0",
-            timestamp_ms=int(time.time() * 1000)
-        )
 
     async def Delta(self, request, context):
         logger.info(f"gRPC Delta called: vault_id={request.vault_id}, local_files_count={len(request.local_files)}")
@@ -277,7 +307,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             owner_username = self._verify_vault_access(request.vault_id, context)
             vault_path = self._get_vault_path(owner_username, request.vault_id)
         except ValueError as e:
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+            await context.abort(StatusCode.INVALID_ARGUMENT, str(e))
             return
 
         # 1. Scan and merge the server's current metadata (offloaded to a worker thread —
@@ -319,7 +349,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                     # Deleted and also absent on the client -> ignore
                     continue
                 # Needs download
-                need_download.append(sync_pb2.FileMeta(**server_meta))
+                need_download.append(wire_types.FileMeta(**server_meta))
 
             else:
                 # Exists on both sides
@@ -348,7 +378,7 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                 elif s_del and not c_del:
                     # Deleted on the server -> propagate the tombstone to the client (a download
                     # instruction that prompts the client to remove its own file)
-                    need_download.append(sync_pb2.FileMeta(**server_meta))
+                    need_download.append(wire_types.FileMeta(**server_meta))
                     continue
 
                 # 2. Regular files (both sides exist) — compare hashes
@@ -359,86 +389,67 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                         need_upload.append(path)
                     elif s_time > c_time:
                         # Server is newer -> needs download
-                        need_download.append(sync_pb2.FileMeta(**server_meta))
+                        need_download.append(wire_types.FileMeta(**server_meta))
                     else:
                         # Timestamps are exactly equal -> default to uploading the client's version
                         # (a safety pin against ending up out of sync)
                         need_upload.append(path)
 
-        return sync_pb2.DeltaResponse(
+        return wire_types.DeltaResponse(
             need_upload=need_upload,
             need_download=need_download,
             conflicts=[]
         )
 
-    def _finalize_uploaded_file(self, owner_username: str, vault_id: str, current_rel_path: str,
-                                 current_temp_path: str, current_file_path: str,
-                                 total_bytes: int, modified_at_ms: int, calculated_hash: str,
-                                 device_name: str, user_name: str,
-                                 metadata_cache: Dict[str, dict], tombstones_by_hash: Dict[str, str]):
-        # metadata_cache/tombstones_by_hash are loaded once per vault per UploadFiles batch
-        # (see UploadFiles) and kept up to date here, instead of re-reading the whole vault's
-        # metadata from the DB for every single file — that turned an N-file batch into an
-        # O(N * vault size) scan.
-        dest_dir = os.path.dirname(current_file_path)
-        os.makedirs(dest_dir, exist_ok=True)
+    def finalize_pushed_file(self, owner_username: str, vault_id: str, rel_path: str, data: bytes,
+                              declared_size: int, modified_at_ms: int, declared_hash: str,
+                              device_name: str, user_name: str):
+        """PR6 of #14_옵시디언싱크_정렬_구현계획.md: finalizes one push_req's binary frame (the
+        dedup-miss case -- see finalize_deduped_file for the hit case). Per-file, not batched --
+        looks up just this one path via repository.load_one() rather than a pre-loaded
+        whole-vault cache, since there's no longer a batch boundary to amortize that load
+        against (the old UploadFiles/_finalize_uploaded_file batch flow this replaced is gone --
+        see llm-wiki/'s PR6 writeup)."""
+        calculated_hash = hashlib.sha256(data).hexdigest()
+        if declared_hash and calculated_hash != declared_hash:
+            return False, "Header/eof content hash mismatch"
+        if len(data) != declared_size:
+            return False, f"Size mismatch: declared {declared_size}, got {len(data)}"
+
+        vault_path = self._get_vault_path(owner_username, vault_id)
+        current_file_path = os.path.join(vault_path, rel_path)
+        temp_path = current_file_path + f".tmp-{secrets.token_hex(4)}"
 
         try:
+            os.makedirs(os.path.dirname(current_file_path), exist_ok=True)
+            with open(temp_path, "wb") as f:
+                f.write(data)
+
             is_new_file = not os.path.exists(current_file_path)
             should_backup = True
-            rename_related_path = None
-
-            if is_history_excluded_path(current_rel_path):
+            if is_history_excluded_path(rel_path):
                 should_backup = False
-            elif is_new_file:
-                # Check whether some previous path (old_path) exists as a deletion tombstone
-                # with the same hash (an O(1) lookup instead of scanning every file)
-                old_path = tombstones_by_hash.get(calculated_hash)
-                if old_path:
-                    try:
-                        logger.info(f"Rename detected: migrating history from {old_path} to {current_rel_path}")
-                        self.repository.migrate_history_on_rename(owner_username, vault_id, old_path, current_rel_path)
-                        # Carry over the previous history, but also record the rename
-                        # event itself as its own history entry (related_path)
-                        rename_related_path = old_path
-                        tombstones_by_hash.pop(calculated_hash, None)
-                        metadata_cache.pop(old_path, None)
-                    except Exception as migrate_err:
-                        logger.error(f"Failed to migrate history on rename: {migrate_err}")
-            else:
-                try:
-                    old_meta = metadata_cache.get(current_rel_path)
-                    old_hash = old_meta.get("content_hash") if old_meta else calculate_sha256(current_file_path)
-                    if old_hash == calculated_hash:
-                        history_rows = self.repository.get_history(owner_username, vault_id, current_rel_path)
-                        if not history_rows:
-                            should_backup = True
-                            logger.info(f"First history for {current_rel_path} - force backup despite same hash.")
-                        else:
-                            should_backup = False
-                            logger.info(f"Skip duplicate backup for {current_rel_path} (same hash: {calculated_hash})")
-                except Exception as hash_err:
-                    logger.error(f"Failed to check duplicate hash: {hash_err}")
+            elif not is_new_file:
+                old_meta = self.repository.load_one(owner_username, vault_id, rel_path)
+                old_hash = old_meta.get("content_hash") if old_meta else None
+                if old_hash == calculated_hash:
+                    history_rows = self.repository.get_history(owner_username, vault_id, rel_path)
+                    should_backup = not history_rows
 
             if os.path.exists(current_file_path):
                 os.remove(current_file_path)
-            os.rename(current_temp_path, current_file_path)
-
-            # Set the modification time
+            os.rename(temp_path, current_file_path)
             mtime_sec = modified_at_ms / 1000.0
             os.utime(current_file_path, (mtime_sec, mtime_sec))
 
             meta = {
-                "path": current_rel_path,
+                "path": rel_path,
                 "modified_at_ms": modified_at_ms,
-                "size_bytes": total_bytes,
+                "size_bytes": len(data),
                 "content_hash": calculated_hash,
-                "is_deleted": False
+                "is_deleted": False,
             }
 
-            # Copy the new version into the backup directory first. Kept as its own try/except
-            # (separate from the DB write below) so a filesystem backup failure never blocks the
-            # metadata update that makes the upload count as successful.
             backup_file_path = None
             if should_backup:
                 try:
@@ -448,203 +459,80 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                     backup_file_path = os.path.join(backup_dir, f"{timestamp}_{secrets.token_hex(4)}.bak")
                     _backup_file(current_file_path, backup_file_path)
                 except Exception as backup_err:
-                    logger.error(f"Failed to create backup version for {current_rel_path}: {backup_err}")
+                    logger.error(f"Failed to create backup version for {rel_path}: {backup_err}")
                     backup_file_path = None
 
-            # The metadata update and the history entry (if any) share a single commit.
             with self.repository.batch() as batch:
-                batch.save_one(owner_username, vault_id, current_rel_path, meta)
+                batch.save_one(owner_username, vault_id, rel_path, meta)
+                batch.record_change(owner_username, vault_id, rel_path, meta)
                 if backup_file_path:
                     batch.add_history(
-                        owner_username=owner_username,
-                        vault_id=vault_id,
-                        path=current_rel_path,
-                        modified_at_ms=modified_at_ms,
-                        size_bytes=total_bytes,
-                        content_hash=calculated_hash,
-                        backup_file_path=backup_file_path,
-                        device_name=device_name,
-                        user_name=user_name,
-                        related_path=rename_related_path,
+                        owner_username=owner_username, vault_id=vault_id, path=rel_path,
+                        modified_at_ms=modified_at_ms, size_bytes=len(data),
+                        content_hash=calculated_hash, backup_file_path=backup_file_path,
+                        device_name=device_name, user_name=user_name,
                     )
 
-            if backup_file_path:
-                logger.info(f"Backup version created for {current_rel_path} -> {backup_file_path}")
-
-            # A successful upload is an unconditional change -- no need for did_metadata_change()
-            # here the way _scan_and_merge() needs it (this path only runs when a file's content
-            # actually differs, never as a no-op poll). Fires once per file in a batch upload;
-            # harmless -- syncNow() on the receiving end already coalesces concurrent/rapid calls
-            # (main.ts's isSyncing/syncQueuedWhileRunning guard).
             if self.change_notifier is not None:
-                self.change_notifier.notify_change(owner_username, vault_id)
-
-            # Keep the in-memory cache in sync so later files in this same batch see this
-            # file's new state without a DB round trip.
-            metadata_cache[current_rel_path] = meta
+                self.change_notifier.notify_change(owner_username, vault_id, meta)
 
             return True, ""
         except Exception as e:
-            logger.error(f"UploadFiles EOF processing failed for {current_rel_path}: {e}", exc_info=True)
-            if os.path.exists(current_temp_path):
-                os.remove(current_temp_path)
+            logger.error(f"push finalize failed for {rel_path}: {e}", exc_info=True)
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
             return False, f"File move failed: {e}"
 
-    async def UploadFiles(self, request, context):
-        logger.info("gRPC UploadFiles batch started.")
-        current_file_path = None
-        current_rel_path = None
-        current_temp_path = None
-        file_handle = None
-        total_bytes = 0
-        received_bytes = 0
-        modified_at_ms = 0
-        sha256_hash = None
-        vault_id = None
+    def finalize_deduped_file(self, owner_username: str, vault_id: str, rel_path: str,
+                               source_meta: dict, modified_at_ms: int,
+                               device_name: str, user_name: str) -> None:
+        """PR6: the server already has this exact content live at some other path in this vault
+        (a content-hash dedup hit -- see ws_sync_resource.py's push_req handling), so no bytes
+        were transferred. Hard-links (or copies, see _backup_file) the source file onto the new
+        path and records it exactly like a real upload would."""
+        vault_path = self._get_vault_path(owner_username, vault_id)
+        source_path = os.path.join(vault_path, source_meta["path"])
+        dest_path = os.path.join(vault_path, rel_path)
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        _backup_file(source_path, dest_path)
+        mtime_sec = modified_at_ms / 1000.0
+        os.utime(dest_path, (mtime_sec, mtime_sec))
 
-        # Loading a vault's metadata is O(vault size); load it once per vault seen in this
-        # batch (lazily, on that vault's first file) and reuse it for every file instead of
-        # reloading the whole vault from the DB per file.
-        metadata_caches: Dict[str, Dict[str, dict]] = {}
-        tombstone_indexes: Dict[str, Dict[str, str]] = {}
-        # Every file in a batch shares one authenticated caller, so the owner_username resolved
-        # on the first header applies to the whole batch (vault_id can vary chunk to chunk, but
-        # the caller's own identity can't).
-        owner_username = None
+        meta = {
+            "path": rel_path,
+            "modified_at_ms": modified_at_ms,
+            "size_bytes": source_meta["size_bytes"],
+            "content_hash": source_meta["content_hash"],
+            "is_deleted": False,
+        }
 
-        try:
-            for chunk in request.chunks:
-                payload_type = chunk.WhichOneof("payload")
-                logger.info(f"UploadFiles received chunk: payload_type={payload_type}")
+        backup_file_path = None
+        if not is_history_excluded_path(rel_path):
+            try:
+                timestamp = int(time.time() * 1000)
+                backup_dir = os.path.join(self.data_dir, "history", owner_username, vault_id)
+                os.makedirs(backup_dir, exist_ok=True)
+                backup_file_path = os.path.join(backup_dir, f"{timestamp}_{secrets.token_hex(4)}.bak")
+                _backup_file(dest_path, backup_file_path)
+            except Exception as backup_err:
+                logger.error(f"Failed to create backup version for deduped {rel_path}: {backup_err}")
+                backup_file_path = None
 
-                if payload_type == "header":
-                    # Clean up if a previous file was left unfinished (e.g. an abnormal termination)
-                    if file_handle:
-                        file_handle.close()
-                        file_handle = None
-                        if current_temp_path and os.path.exists(current_temp_path):
-                            os.remove(current_temp_path)
+        with self.repository.batch() as batch:
+            batch.save_one(owner_username, vault_id, rel_path, meta)
+            batch.record_change(owner_username, vault_id, rel_path, meta)
+            if backup_file_path:
+                batch.add_history(
+                    owner_username=owner_username, vault_id=vault_id, path=rel_path,
+                    modified_at_ms=modified_at_ms, size_bytes=meta["size_bytes"],
+                    content_hash=meta["content_hash"], backup_file_path=backup_file_path,
+                    device_name=device_name, user_name=user_name,
+                )
 
-                    header = chunk.header
-                    vault_id = header.vault_id
-
-                    # Check ownership
-                    try:
-                        owner_username = self._verify_vault_access(vault_id, context)
-                    except Exception as auth_err:
-                        logger.error(f"UploadFiles authorization failed: {auth_err}")
-                        yield sync_pb2.UploadAck(path=header.path, ok=False, error="Authorization failed")
-                        continue
-
-                    current_rel_path = os.path.normpath(header.path).replace("\\", "/")
-
-                    # Security check: prevent escaping into a parent directory
-                    if current_rel_path.startswith("..") or os.path.isabs(current_rel_path):
-                        yield sync_pb2.UploadAck(path=header.path, ok=False, error="Invalid file path")
-                        continue
-
-                    vault_path = self._get_vault_path(owner_username, vault_id)
-                    current_file_path = os.path.join(vault_path, current_rel_path)
-
-                    if vault_id not in metadata_caches:
-                        files = await asyncio.to_thread(self.repository.load_all, owner_username, vault_id)
-                        metadata_caches[vault_id] = files
-                        tombstone_indexes[vault_id] = {
-                            meta["content_hash"]: path
-                            for path, meta in files.items()
-                            if meta.get("is_deleted") and meta.get("content_hash")
-                        }
-
-                    # Set up the temp file path
-                    temp_dir = os.path.join(self.data_dir, "tmp", owner_username, vault_id)
-                    os.makedirs(temp_dir, exist_ok=True)
-                    current_temp_path = os.path.join(temp_dir, f"{secrets.token_hex(8)}.tmp")
-
-                    try:
-                        file_handle = open(current_temp_path, 'wb')
-                    except Exception as e:
-                        yield sync_pb2.UploadAck(path=header.path, ok=False, error=f"Failed to create temp file: {e}")
-                        current_file_path = None
-                        continue
-
-                    total_bytes = header.total_bytes
-                    modified_at_ms = header.modified_at_ms
-                    received_bytes = 0
-                    sha256_hash = hashlib.sha256()
-
-                elif payload_type == "data":
-                    data_payload = chunk.data
-                    if not file_handle:
-                        logger.warning("UploadFiles received data chunk but file_handle is null!")
-                        continue
-
-                    # Security check: make sure the chunk's path matches the header's
-                    chunk_path = os.path.normpath(data_payload.path).replace("\\", "/")
-                    if chunk_path != current_rel_path:
-                        file_handle.close()
-                        file_handle = None
-                        if os.path.exists(current_temp_path):
-                            os.remove(current_temp_path)
-                        yield sync_pb2.UploadAck(path=chunk_path, ok=False, error="Path mismatch in data chunk")
-                        continue
-
-                    file_handle.write(data_payload.data)
-                    sha256_hash.update(data_payload.data)
-                    received_bytes += len(data_payload.data)
-
-                elif payload_type == "eof":
-                    eof_payload = chunk.eof
-                    if not file_handle:
-                        logger.warning("UploadFiles received eof chunk but file_handle is null!")
-                        continue
-
-                    chunk_path = os.path.normpath(eof_payload.path).replace("\\", "/")
-                    if chunk_path != current_rel_path:
-                        file_handle.close()
-                        file_handle = None
-                        if os.path.exists(current_temp_path):
-                            os.remove(current_temp_path)
-                        yield sync_pb2.UploadAck(path=chunk_path, ok=False, error="Path mismatch in eof chunk")
-                        continue
-
-                    file_handle.close()
-                    file_handle = None
-
-                    calculated_hash = sha256_hash.hexdigest()
-                    logger.info(f"UploadFiles verifying hash for {eof_payload.path}: calculated={calculated_hash}, expected={eof_payload.content_hash}")
-
-                    # Verify the hash
-                    if calculated_hash != eof_payload.content_hash:
-                        logger.error(f"Hash mismatch for {eof_payload.path}: calculated={calculated_hash}, expected={eof_payload.content_hash}")
-                        if os.path.exists(current_temp_path):
-                            os.remove(current_temp_path)
-                        yield sync_pb2.UploadAck(path=eof_payload.path, ok=False, error="Hash verification failed")
-                        continue
-
-                    logger.info(f"Hash verified successfully for {eof_payload.path}. Proceeding with file rename and metadata update.")
-
-                    client_metadata = dict(context.invocation_metadata())
-                    device_name = unquote(client_metadata.get("x-device-name", "Unknown Device"))
-                    user_name = unquote(client_metadata.get("x-user-name", "Unknown User"))
-
-                    # Rename + backup + DB writes are all blocking; offload to a worker thread so
-                    # one large batch upload doesn't freeze every other concurrent RPC.
-                    ok, error = await asyncio.to_thread(
-                        self._finalize_uploaded_file, owner_username, vault_id, current_rel_path,
-                        current_temp_path, current_file_path, total_bytes, modified_at_ms,
-                        calculated_hash, device_name, user_name,
-                        metadata_caches[vault_id], tombstone_indexes[vault_id]
-                    )
-                    yield sync_pb2.UploadAck(path=eof_payload.path, ok=ok, error=error)
-
-                    current_file_path = None
-                    current_rel_path = None
-                    current_temp_path = None
-        finally:
-            if file_handle:
-                file_handle.close()
-                if current_temp_path and os.path.exists(current_temp_path):
-                    os.remove(current_temp_path)
+        if self.change_notifier is not None:
+            self.change_notifier.notify_change(owner_username, vault_id, meta)
 
     async def DownloadFiles(self, request, context):
         CHUNK_SIZE = 256 * 1024
@@ -704,35 +592,41 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             # files, so keep it off the event loop.
             content_hash = await asyncio.to_thread(calculate_sha256, file_path)
 
+        # Held for this file's *entire* header-through-eof emission, not re-acquired per chunk --
+        # concurrent tasks for other paths in the same DownloadFiles batch (see below) would
+        # otherwise interleave their own header/data/eof writes with this file's on the wire.
+        # gRPC-Web's FileChunk.ChunkData carried a path field that let the client demultiplex
+        # interleaved chunks; the WS transport's raw binary data frames deliberately don't (see
+        # #11_websocket_동기화_프로토콜_설계.md's "왜 JSON인가"), so the server has to guarantee
+        # non-interleaving instead. Concurrent disk reads across files are unaffected -- only the
+        # wire emission is serialized per file.
         async with write_lock:
-            await context.write(sync_pb2.FileChunk(header=sync_pb2.ChunkHeader(
+            await context.write(wire_types.FileChunk(header=wire_types.ChunkHeader(
                 vault_id=vault_id,
                 path=rel_path,
                 total_bytes=total_bytes,
                 modified_at_ms=mtime_ms,
             )))
 
-        sequence = 0
-        # Blocking file I/O is offloaded to a worker thread so reading one file doesn't
-        # stall the event loop (and therefore every other concurrent download/RPC).
-        f = await asyncio.to_thread(open, file_path, 'rb')
-        try:
-            while True:
-                data = await asyncio.to_thread(f.read, chunk_size)
-                if not data:
-                    break
-                async with write_lock:
-                    await context.write(sync_pb2.FileChunk(data=sync_pb2.ChunkData(
+            sequence = 0
+            # Blocking file I/O is offloaded to a worker thread so reading one file doesn't
+            # stall the event loop (and therefore every other concurrent download/RPC).
+            f = await asyncio.to_thread(open, file_path, 'rb')
+            try:
+                while True:
+                    data = await asyncio.to_thread(f.read, chunk_size)
+                    if not data:
+                        break
+                    await context.write(wire_types.FileChunk(data=wire_types.ChunkData(
                         path=rel_path,
                         sequence=sequence,
                         data=data,
                     )))
-                sequence += 1
-        finally:
-            f.close()
+                    sequence += 1
+            finally:
+                f.close()
 
-        async with write_lock:
-            await context.write(sync_pb2.FileChunk(eof=sync_pb2.ChunkEOF(
+            await context.write(wire_types.FileChunk(eof=wire_types.ChunkEOF(
                 path=rel_path,
                 content_hash=content_hash,
             )))
@@ -745,18 +639,20 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             logger.info(f"Found {len(history_rows)} history rows for {request.path}")
             versions = []
             for row in history_rows:
-                versions.append(sync_pb2.HistoryVersion(
+                versions.append(wire_types.HistoryVersion(
                     history_id=row["history_id"],
                     modified_at_ms=row["modified_at_ms"],
                     size_bytes=row["size_bytes"],
                     content_hash=row["content_hash"],
                     device_name=row.get("device_name", "Unknown Device"),
-                    user_name=row.get("user_name", "Unknown User")
+                    user_name=row.get("user_name", "Unknown User"),
+                    deleted=bool(row.get("deleted", False)),
+                    related_path=row.get("related_path"),
                 ))
-            return sync_pb2.HistoryResponse(versions=versions)
+            return wire_types.HistoryResponse(versions=versions)
         except Exception as e:
             logger.error(f"GetFileHistory failed for {request.path}: {e}")
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            await context.abort(StatusCode.INTERNAL, str(e))
 
     async def DownloadHistoryVersion(self, request, context):
         logger.info(f"gRPC DownloadHistoryVersion called: vault_id={request.vault_id}, history_id={request.history_id}")
@@ -765,24 +661,24 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             owner_username = self._verify_vault_access(request.vault_id, context)
             row = self.repository.get_history_by_id(owner_username, request.history_id)
             if not row:
-                await context.abort(grpc.StatusCode.NOT_FOUND, "History version not found")
+                await context.abort(StatusCode.NOT_FOUND, "History version not found")
                 return
 
             backup_file_path = row["backup_file_path"]
             if not os.path.exists(backup_file_path):
-                await context.abort(grpc.StatusCode.NOT_FOUND, "Backup file not found on disk")
+                await context.abort(StatusCode.NOT_FOUND, "Backup file not found on disk")
                 return
 
             target_path = request.path if request.path else row["path"]
 
             # 1. Send the header
-            header = sync_pb2.ChunkHeader(
+            header = wire_types.ChunkHeader(
                 vault_id=request.vault_id,
                 path=target_path,
                 total_bytes=row["size_bytes"],
                 modified_at_ms=row["modified_at_ms"]
             )
-            yield sync_pb2.FileChunk(header=header)
+            yield wire_types.FileChunk(header=header)
 
             # 2. Send the data
             sequence = 0
@@ -791,23 +687,23 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                     data = f.read(CHUNK_SIZE)
                     if not data:
                         break
-                    chunk_data = sync_pb2.ChunkData(
+                    chunk_data = wire_types.ChunkData(
                         path=target_path,
                         sequence=sequence,
                         data=data
                     )
-                    yield sync_pb2.FileChunk(data=chunk_data)
+                    yield wire_types.FileChunk(data=chunk_data)
                     sequence += 1
 
             # 3. Send the EOF
-            eof = sync_pb2.ChunkEOF(
+            eof = wire_types.ChunkEOF(
                 path=target_path,
                 content_hash=row["content_hash"]
             )
-            yield sync_pb2.FileChunk(eof=eof)
+            yield wire_types.FileChunk(eof=eof)
         except Exception as e:
             logger.error(f"DownloadHistoryVersion failed: {e}")
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            await context.abort(StatusCode.INTERNAL, str(e))
 
     async def RestoreHistoryVersion(self, request, context):
         try:
@@ -815,22 +711,34 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
             # 1. Look up the history entry in the DB
             row = self.repository.get_history_by_id(owner_username, request.history_id)
             if not row:
-                return sync_pb2.RestoreHistoryResponse(ok=False, error="History version not found")
+                return wire_types.RestoreHistoryResponse(ok=False, error="History version not found")
 
             backup_file_path = row["backup_file_path"]
             if not os.path.exists(backup_file_path):
-                return sync_pb2.RestoreHistoryResponse(ok=False, error="Backup file not found on disk")
+                return wire_types.RestoreHistoryResponse(ok=False, error="Backup file not found on disk")
 
             # 2. Set the restore target path
             target_path = request.path if request.path else row["path"]
 
             # 3. Locate the file on the server's physical storage
             vault_path = self._get_vault_path(owner_username, request.vault_id)
-            dest_file_path = os.path.join(vault_path, target_path)
+            # Resolved (os.path.abspath, not just joined) before the prefix check below -- a
+            # relative ".." segment in target_path (e.g. "../escaped.md") otherwise still passes
+            # a plain startswith(vault_path) check on the *unresolved* joined string (it's a
+            # textual prefix match, so ".../vault1/../escaped.md" "starts with" ".../vault1"),
+            # only to have os.makedirs/shutil.copy2 below resolve the ".." for real and write
+            # outside the vault -- this was a live path-traversal bug, found via a coverage-drive
+            # test (llm-wiki/10-*.md), fixed here.
+            dest_file_path = os.path.abspath(os.path.join(vault_path, target_path))
+            vault_path_abs = os.path.abspath(vault_path)
 
-            # Security check: prevent escaping into a parent directory
-            if not dest_file_path.startswith(os.path.abspath(vault_path)):
-                return sync_pb2.RestoreHistoryResponse(ok=False, error="Invalid target path (escape attempt)")
+            # Security check: prevent escaping into a parent directory. The os.sep suffix on
+            # vault_path_abs (rather than a bare startswith) also closes a narrower sibling-path
+            # false positive -- without it, a vault_path_abs of ".../alice" would incorrectly
+            # accept an escape into ".../alice2" too, since that string also "starts with"
+            # ".../alice".
+            if dest_file_path != vault_path_abs and not dest_file_path.startswith(vault_path_abs + os.sep):
+                return wire_types.RestoreHistoryResponse(ok=False, error="Invalid target path (escape attempt)")
 
             # 4. Create the directory and restore by overwriting
             os.makedirs(os.path.dirname(dest_file_path), exist_ok=True)
@@ -855,9 +763,10 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                 "is_deleted": False
             }
             self.repository.save_one(owner_username, request.vault_id, target_path, meta)
+            self.repository.record_change(owner_username, request.vault_id, target_path, meta)
 
             if self.change_notifier is not None:
-                self.change_notifier.notify_change(owner_username, request.vault_id)
+                self.change_notifier.notify_change(owner_username, request.vault_id, meta)
 
             # Record the restored state itself as a new change version in history (reusing the
             # existing path for the physical backup)
@@ -882,7 +791,55 @@ class SyncServiceServicer(sync_pb2_grpc.SyncServiceServicer):
                 logger.error(f"Failed to record restore version history for {target_path}: {backup_err}")
 
             logger.info(f"Server-side restore completed: vault={request.vault_id}, path={target_path}, history_id={request.history_id}")
-            return sync_pb2.RestoreHistoryResponse(ok=True)
+            return wire_types.RestoreHistoryResponse(ok=True)
         except Exception as e:
             logger.error(f"RestoreHistoryVersion failed: {e}")
-            return sync_pb2.RestoreHistoryResponse(ok=False, error=str(e))
+            return wire_types.RestoreHistoryResponse(ok=False, error=str(e))
+
+    async def GetSize(self, request, context):
+        """Mirrors Obsidian core's own Sync client's size() -- see
+        #11_websocket_동기화_프로토콜_설계.md's re-analysis. limit_bytes is always -1 (no
+        limit): this project has no per-account storage quota system, unlike the hosted service
+        core's own client talks to."""
+        owner_username = self._verify_vault_access(request.vault_id, context)
+        vault_size = await asyncio.to_thread(self.repository.get_vault_size_bytes, owner_username, request.vault_id)
+        total_size = await asyncio.to_thread(self.repository.get_total_size_bytes, owner_username)
+        return wire_types.SizeResponse(vault_size_bytes=vault_size, total_size_bytes=total_size, limit_bytes=-1)
+
+    async def PurgeVault(self, request, context):
+        """Mirrors Obsidian core's own Sync client's purge() (the settings screen's destructive
+        "purge remote data" button) -- see #11_websocket_동기화_프로토콜_설계.md's re-analysis.
+        Irreversible: deletes every metadata row, history row, and history backup file for this
+        (owner, vault), then the vault's own file directory. Deliberately does not touch the
+        client's local files or trigger a fresh Delta for other connected sessions of this vault
+        -- that's for a caller to handle (see ws_sync_resource.py's wiring)."""
+        try:
+            owner_username = self._verify_vault_access(request.vault_id, context)
+            backup_paths = await asyncio.to_thread(self.repository.purge_vault, owner_username, request.vault_id)
+            for backup_path in backup_paths:
+                try:
+                    if os.path.exists(backup_path):
+                        await asyncio.to_thread(os.remove, backup_path)
+                except Exception as backup_err:
+                    logger.error(f"Failed to remove history backup {backup_path} during purge: {backup_err}")
+
+            vault_path = self._get_vault_path(owner_username, request.vault_id)
+            if os.path.exists(vault_path):
+                await asyncio.to_thread(shutil.rmtree, vault_path)
+
+            logger.info(f"Vault purged: owner={owner_username}, vault={request.vault_id}")
+            return wire_types.PurgeResponse(ok=True)
+        except Exception as e:
+            logger.error(f"PurgeVault failed: {e}")
+            return wire_types.PurgeResponse(ok=False, error=str(e))
+
+    async def GetUsernames(self, request, context):
+        """Mirrors Obsidian core's own Sync client's getUsernames() (used there to attribute
+        history entries to collaborators on a shared vault) -- see
+        #11_websocket_동기화_프로토콜_설계.md's re-analysis and
+        wire_types.UsernamesResponse's docstring. Lists the vault's owner plus every account
+        with an accepted vault-sharing invite for it (14_vault_sharing_설계.md)."""
+        owner_username = self._verify_vault_access(request.vault_id, context)
+        collaborators = self.repository.get_accepted_share_usernames(owner_username, request.vault_id)
+        usernames = [owner_username] + [u for u in collaborators if u != owner_username]
+        return wire_types.UsernamesResponse(usernames=usernames)
