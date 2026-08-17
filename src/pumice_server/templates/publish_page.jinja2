@@ -202,7 +202,7 @@
             margin: 2px 0;
         }
 
-        .pumice-nav-sidebar a {
+        .pumice-nav-sidebar a:not(.site-title) {
             display: block;
             padding: 4px 8px;
             border-radius: 6px;
@@ -211,7 +211,7 @@
             font-size: 14px;
         }
 
-        .pumice-nav-sidebar a:hover {
+        .pumice-nav-sidebar a:not(.site-title):hover {
             background: rgba(138, 180, 248, 0.1);
         }
 
@@ -429,7 +429,7 @@
         header {
             display: flex;
             align-items: center;
-            justify-content: space-between;
+            justify-content: flex-end;
             margin-bottom: 40px;
             padding-bottom: 20px;
             border-bottom: 1px solid var(--border-color);
@@ -808,10 +808,13 @@
     {% endif %}
 </head>
 <body>
-    {% set show_left_sidebar = (show_navigation and navigation_tree) or (show_search and preload_json) or show_theme_toggle %}
-    <div class="layout{% if not readable_line_length %} wide{% endif %}{% if show_left_sidebar %} has-nav{% endif %}{% if client_rendered %} has-outline{% endif %}">
-        {% if show_left_sidebar %}
+    {# Site title/logo lives in this sidebar too now (matches real Obsidian: confirmed live
+       that .site-body-left-column-inner's own first two children are the logo and site name,
+       above the theme toggle and search box -- see 43_사이트_제목_왼쪽_사이드바_이동.md), so
+       the sidebar itself is unconditional -- it always has at least the title to show. #}
+    <div class="layout{% if not readable_line_length %} wide{% endif %} has-nav{% if client_rendered %} has-outline{% endif %}">
         <nav class="pumice-nav-sidebar">
+            <a href="{{ url_prefix }}" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
             {% if show_theme_toggle %}
             <button id="pumice-theme-toggle" class="pumice-icon-button" type="button" aria-label="{{ t('publish_public.theme_toggle') }}" title="{{ t('publish_public.theme_toggle') }}">🌓</button>
             <script>
@@ -858,10 +861,8 @@
             </ul>
             {% endif %}
         </nav>
-        {% endif %}
         <div class="pumice-main-column">
             <header>
-                <a href="{{ url_prefix }}" class="site-title{% if logo_href %} has-logo{% endif %}">{% if logo_href %}<img class="site-logo" src="{{ logo_href }}" alt="">{% endif %}{{ site_name }} Publish</a>
                 <span class="vault-badge">Vault: {{ vault_id }}</span>
             </header>
             {% if preload_json %}
