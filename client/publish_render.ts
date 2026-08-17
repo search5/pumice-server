@@ -743,12 +743,18 @@ interface PumicePreload {
    * the earlier plain-SVG renderer -- real Obsidian's graph is WebGL-rendered, confirmed by
    * reading app.js's PIXI.* usage. Theme-aware: colors are read from this page's own CSS custom
    * properties (via cssColorToPixiHex) rather than hardcoded, so the graph matches whichever
-   * light/dark theme is active (33_실제_아키텍처_전환_테마_전환.md). Drag-to-pan (own addition,
-   * not confirmed against real Obsidian's own pan/zoom implementation): plain pointer events on
-   * the canvas translate app.stage, independent of PIXI's own pointertap handling on individual
-   * node circles below -- dragging and click-to-navigate coexist because PIXI's tap only fires
-   * when the same target is hit-tested at both pointerdown and pointerup, which a real drag
-   * away from a node naturally fails. Known scope cut still remaining: no zoom. */
+   * light/dark theme is active (33_실제_아키텍처_전환_테마_전환.md). Drag-to-pan: plain pointer
+   * events on the canvas translate app.stage, independent of PIXI's own pointertap handling on
+   * individual node circles below -- dragging and click-to-navigate coexist because PIXI's tap
+   * only fires when the same target is hit-tested at both pointerdown and pointerup, which a
+   * real drag away from a node naturally fails. Confirmed live afterward against
+   * lab.marconoris.com/now (dragging from either empty canvas or directly on a node pans the
+   * *entire* graph uniformly, not an individual node -- reversing the drag reverses the pan
+   * exactly; scroll-wheel over the graph produces no meaningful zoom, page scroll passes
+   * through instead; plain click still navigates) -- this implementation already matched
+   * without changes, see 45_그래프_다시_오른쪽으로_이동_및_드래그_패닝.md's follow-up note.
+   * Known scope cut still remaining: no zoom (real Obsidian doesn't appear to have it either,
+   * per that same check). */
   function renderGraphPixi(
     containerEl: HTMLElement, graph: Graph, positions: Positions, cache: PublishCache, urlPrefix: string,
     currentPath: string | null, width?: number, height?: number,
