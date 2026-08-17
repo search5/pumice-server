@@ -482,14 +482,21 @@
             border: none;
         }
 
-        /* Reserves the vertical space .pumice-search-results can reach (top: calc(100% + 4px)
-           + max-height: 320px = 324px measured from the bottom of the search box) so the
-           dropdown never floats on top of the outline below it -- own layout choice, not
+        /* Opens up only while the results dropdown actually has something in it (.is-open
+           toggled by wireSearch in publish_render.js based on result count), reserving just
+           enough room (top: calc(100% + 4px) + max-height: 320px = 324px measured from the
+           bottom of the search box) that the dropdown never floats on top of the outline below
+           it. A permanent 324px gap looked broken when idle (46_...md's first attempt, corrected
+           here) -- collapsed to 0 by default is the fix. Own layout choice either way, not
            matched against real Obsidian (its own left-column search sits above the folder tree
            only, no outline in that column to worry about, see 43_사이트_제목_왼쪽_사이드바_
-           이동.md). Always empty/invisible; exists purely to hold the gap open whether or not
-           the dropdown is currently showing results, per explicit user direction. */
+           이동.md). */
         .pumice-search-clearance {
+            flex: 0 0 0;
+            transition: flex-basis 0.15s ease;
+        }
+
+        .pumice-search-clearance.is-open {
             flex: 0 0 324px;
         }
 
@@ -840,7 +847,7 @@
                 <input id="pumice-search-input" type="search" placeholder="{{ t('publish_public.search_placeholder') }}" autocomplete="off">
                 <div id="pumice-search-results" class="pumice-search-results"></div>
             </div>
-            <div class="pumice-search-clearance" aria-hidden="true"></div>
+            <div id="pumice-search-clearance" class="pumice-search-clearance" aria-hidden="true"></div>
             {% endif %}
             {% if client_rendered %}
             <aside id="pumice-outline" class="pumice-outline-sidebar"></aside>

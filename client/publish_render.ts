@@ -1054,15 +1054,23 @@ interface PumicePreload {
    * -- mirrors real Obsidian's own updateSearch()/runFullSearch() two-step flow. A response for
    * a query that's no longer in the input (the visitor kept typing) is discarded, matching real
    * Obsidian's own `t.value !== e` staleness check. */
-  function wireSearch(inputEl: HTMLInputElement, resultsEl: HTMLElement, cache: PublishCache, urlPrefix: string): void {
+  function wireSearch(
+    inputEl: HTMLInputElement, resultsEl: HTMLElement, clearanceEl: HTMLElement | null,
+    cache: PublishCache, urlPrefix: string,
+  ): void {
     var index = buildSearchIndex(cache, urlPrefix);
     var debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+    /** Opens .pumice-search-clearance only while there's something in the dropdown to protect
+     * the outline from, instead of reserving that space permanently -- a permanent gap looked
+     * broken when idle (46_검색_드롭다운_공간_확보_및_TOC_메뉴바_순서.md's first attempt,
+     * corrected in the follow-up doc). */
     function renderResults(results: SearchResult[]): void {
       resultsEl.innerHTML = results.map(function (r) {
         var snippetHtml = r.snippet ? '<div class="search-result-snippet">' + escapeHtml(r.snippet) + "</div>" : "";
         return '<a href="' + escapeAttr(r.href) + '"><div class="search-result-title">' + escapeHtml(r.title) + "</div>" + snippetHtml + "</a>";
       }).join("");
+      if (clearanceEl) clearanceEl.classList.toggle("is-open", results.length > 0);
     }
 
     inputEl.addEventListener("input", function () {
@@ -1076,6 +1084,7 @@ interface PumicePreload {
       statusEl.className = "search-status";
       statusEl.textContent = "Searching...";
       resultsEl.appendChild(statusEl);
+      if (clearanceEl) clearanceEl.classList.add("is-open");
       debounceTimer = setTimeout(function () {
         runServerSearch(query, urlPrefix).then(function (serverResults) {
           if (inputEl.value !== query) return;
@@ -1234,9 +1243,10 @@ interface PumicePreload {
 
     var searchInputEl = document.getElementById("pumice-search-input") as HTMLInputElement | null;
     var searchResultsEl = document.getElementById("pumice-search-results");
+    var searchClearanceEl = document.getElementById("pumice-search-clearance");
     if (searchInputEl && searchResultsEl) {
       try {
-        wireSearch(searchInputEl, searchResultsEl, await cachePromise, preload.url_prefix);
+        wireSearch(searchInputEl, searchResultsEl, searchClearanceEl, await cachePromise, preload.url_prefix);
       } catch (e) {
         // Search is a progressive-enhancement affordance on top of the page's real content --
         // a failed cache fetch here shouldn't surface an error where the note body already
