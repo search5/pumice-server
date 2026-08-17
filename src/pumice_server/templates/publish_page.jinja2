@@ -482,6 +482,17 @@
             border: none;
         }
 
+        /* Reserves the vertical space .pumice-search-results can reach (top: calc(100% + 4px)
+           + max-height: 320px = 324px measured from the bottom of the search box) so the
+           dropdown never floats on top of the outline below it -- own layout choice, not
+           matched against real Obsidian (its own left-column search sits above the folder tree
+           only, no outline in that column to worry about, see 43_사이트_제목_왼쪽_사이드바_
+           이동.md). Always empty/invisible; exists purely to hold the gap open whether or not
+           the dropdown is currently showing results, per explicit user direction. */
+        .pumice-search-clearance {
+            flex: 0 0 324px;
+        }
+
         .pumice-search-results a {
             display: block;
             padding: 8px 12px;
@@ -829,6 +840,10 @@
                 <input id="pumice-search-input" type="search" placeholder="{{ t('publish_public.search_placeholder') }}" autocomplete="off">
                 <div id="pumice-search-results" class="pumice-search-results"></div>
             </div>
+            <div class="pumice-search-clearance" aria-hidden="true"></div>
+            {% endif %}
+            {% if client_rendered %}
+            <aside id="pumice-outline" class="pumice-outline-sidebar"></aside>
             {% endif %}
             {% if show_navigation and navigation_tree %}
             <ul>
@@ -847,9 +862,6 @@
                 {%- endif %}
                 {% endfor %}
             </ul>
-            {% endif %}
-            {% if client_rendered %}
-            <aside id="pumice-outline" class="pumice-outline-sidebar"></aside>
             {% endif %}
         </nav>
         <div class="pumice-main-column">
