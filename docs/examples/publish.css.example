@@ -1,0 +1,47 @@
+/* Example publish.css -- "warm editorial" look, demonstrates both theme-variable overrides and
+   structural class overrides documented in docs/PUBLISH_CSS.md. Drop a file named exactly this
+   at the vault root and pumice-server auto-loads it on every published page. */
+
+/* Recolor the accent (site title, active outline item, wikilinks, and the graph's node/edge
+   colors all pick this up automatically since they all read the same variable) -- redefined in
+   all three blocks so it applies regardless of light/dark theme state. */
+:root,
+:root[data-theme="light"],
+:root[data-theme="dark"] {
+  --accent-blue: #c2410c;
+  --wiki-link: #c2410c;
+  --wiki-link-hover: #9a3412;
+  --heading-color: #7c2d12;
+}
+
+/* Serif headings for an editorial feel. */
+.site-title,
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  font-family: Georgia, 'Times New Roman', serif;
+}
+
+/* Slightly wider left sidebar. */
+.pumice-nav-sidebar {
+  flex-basis: 260px;
+}
+
+/* Square-ish corners and a heavier border on the graph box, instead of the default rounded
+   10px/1px look. */
+.pumice-graph-mini {
+  border-radius: 2px;
+  border-width: 2px;
+}
+
+/* Solid-fill vault badge instead of the default translucent pill. */
+.vault-badge {
+  background: #c2410c;
+  color: #fff;
+  border-color: #c2410c;
+}
+
+/* Circular theme-toggle button instead of the default rounded square. */
+.pumice-icon-button {
+  border-radius: 50%;
+}

@@ -93,6 +93,11 @@ whether the flex 2/3-column split is active at all).
 
 ## Example
 
+A fuller, verified-working example lives at
+[`docs/examples/publish.css.example`](examples/publish.css.example) — actually applied against a
+live render of this page and screenshotted (recolored accents/graph, serif headings, wider
+sidebar, solid vault badge, circular theme toggle), not just written from the reference above.
+
 ```css
 /* Wider left sidebar, and a house accent color that also recolors the graph. */
 :root, :root[data-theme="light"], :root[data-theme="dark"] {

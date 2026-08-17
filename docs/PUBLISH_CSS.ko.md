@@ -95,6 +95,12 @@
 
 ## 예시
 
+더 완전하고 실제로 검증된 예시는
+[`docs/examples/publish.css.example`](examples/publish.css.example)에 있습니다 — 위
+레퍼런스만 보고 짐작으로 쓴 게 아니라, 실제 이 문서가 설명하는 페이지에 직접 적용해서
+스크린샷까지 찍어 확인함(강조색/그래프 재색상, 세리프 헤딩, 넓은 사이드바, 단색 볼트 배지,
+동그란 테마토글 버튼).
+
 ```css
 /* 왼쪽 사이드바를 넓히고, 그래프까지 같이 바뀌는 브랜드 강조색 적용 */
 :root, :root[data-theme="light"], :root[data-theme="dark"] {
