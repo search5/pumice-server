@@ -559,9 +559,12 @@
      * the earlier plain-SVG renderer -- real Obsidian's graph is WebGL-rendered, confirmed by
      * reading app.js's PIXI.* usage. Theme-aware: colors are read from this page's own CSS custom
      * properties (via cssColorToPixiHex) rather than hardcoded, so the graph matches whichever
-     * light/dark theme is active (33_실제_아키텍처_전환_테마_전환.md). Known scope cut vs real
-     * Obsidian: no pan/zoom -- the static laid-out positions from the worker are rendered as-is,
-     * matching this project's existing (pre-Pixi) graph's own already-static behavior. */
+     * light/dark theme is active (33_실제_아키텍처_전환_테마_전환.md). Drag-to-pan (own addition,
+     * not confirmed against real Obsidian's own pan/zoom implementation): plain pointer events on
+     * the canvas translate app.stage, independent of PIXI's own pointertap handling on individual
+     * node circles below -- dragging and click-to-navigate coexist because PIXI's tap only fires
+     * when the same target is hit-tested at both pointerdown and pointerup, which a real drag
+     * away from a node naturally fails. Known scope cut still remaining: no zoom. */
     function renderGraphPixi(containerEl, graph, positions, cache, urlPrefix, currentPath, width, height) {
         width = width || 600;
         height = height || 600;
@@ -610,7 +613,44 @@
             label.y = p.y - 6;
             app.stage.addChild(label);
         });
+        enableGraphDragPan(app.view, app.stage);
         return app;
+    }
+    /** Lets the visitor drag inside a graph view to pan it -- plain pointer events on the canvas
+     * element translating app.stage, independent of PixiJS' own per-node pointertap handling (see
+     * the comment above renderGraphPixi for why the two don't conflict). Pan state lives only on
+     * the stage's x/y for the lifetime of this one PIXI.Application; renderInto below always tears
+     * down and recreates the app on toggle/re-render, so panning resets then -- consistent with
+     * this project's existing "always redraw from scratch" choice for the graph rather than a new
+     * exception carved out just for pan state. */
+    function enableGraphDragPan(view, stage) {
+        var dragging = false;
+        var lastClientX = 0;
+        var lastClientY = 0;
+        view.style.cursor = "grab";
+        view.style.touchAction = "none";
+        view.addEventListener("pointerdown", function (e) {
+            dragging = true;
+            lastClientX = e.clientX;
+            lastClientY = e.clientY;
+            view.style.cursor = "grabbing";
+            view.setPointerCapture(e.pointerId);
+        });
+        view.addEventListener("pointermove", function (e) {
+            if (!dragging)
+                return;
+            stage.x += e.clientX - lastClientX;
+            stage.y += e.clientY - lastClientY;
+            lastClientX = e.clientX;
+            lastClientY = e.clientY;
+        });
+        function stopDragging() {
+            dragging = false;
+            view.style.cursor = "grab";
+        }
+        view.addEventListener("pointerup", stopDragging);
+        view.addEventListener("pointercancel", stopDragging);
+        view.addEventListener("pointerleave", stopDragging);
     }
     function renderInline(text, cache, urlPrefix) {
         var escaped = escapeHtml(text);
