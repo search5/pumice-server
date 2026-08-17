@@ -81,6 +81,17 @@ pumice 자체 노트 렌더링(`publish_render.js`)도 `DOMContentLoaded`에서 
 
 ## 예시
 
-실제로 검증된 예시가 [`docs/examples/publish.js.example`](examples/publish.js.example)에
-있습니다 — 라이브 렌더링에 실제로 적용해서(고정 위치 배지 + 노트 콘텐츠가 준비된 다음에
-붙는 문단) 콘솔 출력과 스크린샷으로 확인함, 위 레퍼런스만 보고 짐작으로 쓴 게 아닙니다.
+둘 다 라이브 렌더링에 실제로 적용해서 검증됨, 위 레퍼런스만 보고 짐작으로 쓴 게 아닙니다:
+
+- [`docs/examples/publish.js.example`](examples/publish.js.example) — 고정 위치 배지 +
+  노트 콘텐츠가 준비된 다음에 붙는 문단, 콘솔 출력과 스크린샷으로 확인함.
+- [`docs/examples/publish-slash-search.js.example`](examples/publish-slash-search.js.example)
+  — `/`를 누르면 검색창에 포커스+전체선택, `Esc`면 blur, 이미 다른 입력 필드에 포커스가
+  있으면 단축키를 건너뜀. 아이디어는
+  [옵시디언 포럼의 커뮤니티 publish.js 스니펫](https://forum.obsidian.md/t/publish-js-code-snippet-for-slash-key-quick-search-functionality/53141)
+  에서 가져왔고(실제 옵시디언의 검색창은 거기서 `.search-bar` 클래스를 씀, 라이브로 확인된
+  내용) — pumice 자체의 `#pumice-search-input`을 겨냥해서 새로 구현했습니다, 그대로
+  복사하지 않았습니다. 포럼 버전엔 없던 "이미 편집 가능한 필드에 포커스 중이면 건너뛰기"
+  가드는 자체 추가분입니다. `KeyboardEvent`를 직접 디스패치해서 검증함(`/` → 포커스+선택,
+  `Esc` → blur, 검색창에 이미 포커스가 있고 텍스트가 있는 상태에서 `/`를 눌러도 텍스트가
+  그대로 유지되고 재선택되지 않는 것까지 확인).

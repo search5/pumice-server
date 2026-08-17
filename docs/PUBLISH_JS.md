@@ -83,9 +83,20 @@ only needs to run once at load (inject a banner, set up analytics, etc.), a plai
 (add something after the content, rewrite a link, ...), poll for `#pumice-note-root` actually
 having children — see the example below.
 
-## Example
+## Examples
 
-A verified-working example lives at
-[`docs/examples/publish.js.example`](examples/publish.js.example) — actually applied against a
-live render (fixed corner badge + a paragraph appended once the note content is ready) and
-confirmed via console output and screenshot, not just written from the reference above.
+Both verified-working, actually applied against a live render, not just written from the
+reference above:
+
+- [`docs/examples/publish.js.example`](examples/publish.js.example) — fixed corner badge +
+  a paragraph appended once the note content is ready, confirmed via console output and
+  screenshot.
+- [`docs/examples/publish-slash-search.js.example`](examples/publish-slash-search.js.example) —
+  `/` focuses and selects the search box, `Escape` blurs it, skips the shortcut when focus is
+  already in an editable field. The idea comes from a
+  [community publish.js snippet on the Obsidian forum](https://forum.obsidian.md/t/publish-js-code-snippet-for-slash-key-quick-search-functionality/53141)
+  (real Obsidian's search input there is `.search-bar`, confirmed live) — reimplemented fresh
+  against pumice's own `#pumice-search-input`, not copied, with the editable-field guard as an
+  own addition the forum version didn't have. Verified via direct `KeyboardEvent` dispatch
+  (`/` focuses+selects, `Escape` blurs, and pressing `/` while the search box is already
+  focused and has text leaves the text untouched instead of re-selecting).

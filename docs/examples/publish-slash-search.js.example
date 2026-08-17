@@ -1,0 +1,37 @@
+/* Example publish.js -- "/" focuses+selects the search box, Escape blurs it. The idea comes from
+   a community publish.js snippet on the Obsidian forum (real Obsidian's own search input has
+   class "search-bar" there, confirmed live against lab.marconoris.com earlier in this project's
+   investigation) -- reimplemented fresh against pumice's own #pumice-search-input, not copied:
+   https://forum.obsidian.md/t/publish-js-code-snippet-for-slash-key-quick-search-functionality/53141
+
+   Own addition beyond the forum version: skips the shortcut when focus is already inside an
+   editable field (an <input>/<textarea>/contenteditable element -- including the search box
+   itself), so typing a literal "/" anywhere you're already typing doesn't re-trigger
+   focus()/select() instead of inserting the character. Uses event.key instead of the forum
+   snippet's deprecated numeric keyCode. */
+
+(function () {
+  var SEARCH_INPUT_ID = "pumice-search-input";
+
+  function isEditableTarget(el) {
+    if (!el) return false;
+    var tag = el.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
+  }
+
+  document.addEventListener("keydown", function (event) {
+    var input = document.getElementById(SEARCH_INPUT_ID);
+    if (!input) return;
+
+    if (event.key === "/" && !isEditableTarget(event.target)) {
+      event.preventDefault();
+      input.focus();
+      input.select();
+      return;
+    }
+
+    if (event.key === "Escape" && document.activeElement === input) {
+      input.blur();
+    }
+  });
+})();
