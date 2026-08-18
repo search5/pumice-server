@@ -119,22 +119,38 @@ unowned vault_id" step and no cross-account lookup to get wrong. Every DB table
 `data_dir/published/{owner_username}/{vault_id}`) is scoped this way. `get_history_by_id()` also
 takes `owner_username`, so a history row can't be fetched by ID across vault/account boundaries.
 
+Two features let a second account reach into a vault it doesn't own, each with a different scope:
+
+- **Vault sharing** (`/api/vault/share/invite|list|remove|leave`, `/api/vault/shared-with-me`) —
+  the owner invites another account to full sync access on one vault (same as the owner's own
+  Obsidian client would have). The invited account points its own local vault at it via the
+  `sharedVaultOwner` client setting.
+- **Site collaboration** (`/publish/share/invite|list|remove|accept|mine`) — the owner invites
+  another account to publish/unpublish access on one *published site*, without granting sync
+  access to the underlying vault at all. Modeled on real Obsidian Publish's own collaborator
+  permission set (confirmed against `obsidianmd/obsidian-help`'s "Collaborate on a Publish
+  site.md"): a collaborator can publish and unpublish files but can't touch site
+  options/password or manage other collaborators.
+
 ## Authorization
 
 Permission checking is a real Pyramid ACL, not ad hoc per-view `if`s. `DeviceTokenSecurityPolicy`
 (`web.py`) resolves the caller's identity from `extract_token()`; every view declares
-`permission='authenticated' | 'admin' | 'vault-access'` on its `@view_config` and Pyramid enforces
-it before the view body ever runs (a denial short-circuits to `forbidden_view`, which reproduces
-the old 401-vs-403 split: no identity at all is 401, a real identity that's just not allowed here
-is 403). The default permission is `'authenticated'` — a new route is private unless its view
-explicitly opts out with `permission=NO_PERMISSION_REQUIRED`, the reverse of the old tween's
-manually-maintained bypass-path list.
+`permission='authenticated' | 'admin' | 'vault-access' | 'publish-access'` on its `@view_config`
+and Pyramid enforces it before the view body ever runs (a denial short-circuits to
+`forbidden_view`, which reproduces the old 401-vs-403 split: no identity at all is 401, a real
+identity that's just not allowed here is 403). The default permission is `'authenticated'` — a
+new route is private unless its view explicitly opts out with `permission=NO_PERMISSION_REQUIRED`,
+the reverse of the old tween's manually-maintained bypass-path list.
 
 Vault-scoped routes (Publish, version history, admin's per-vault file view) use `VaultContext` as
 their route `factory=`: it resolves `vault_id` from whichever the endpoint's calling convention is
-(`matchdict`, query params, the `obs-id` header, or the JSON body), and sets `owner` to the
-caller's own identity -- so `permission='vault-access'` is really just "are you logged in", with
-`vault_id`/`owner` conveniently resolved onto `request.context` for the view to use.
+(`matchdict`, query params, the `obs-id` header, or the JSON body). For the vault's own owner it
+grants both `'vault-access'` (everything) and `'publish-access'`; for an accepted Site
+collaborator acting on someone else's vault, it grants only `'publish-access'` — which is all
+that `publish_list`/`publish_upload`/`publish_remove`/`publish_download` require, while every
+other `VaultContext`-scoped route still demands `'vault-access'` and stays out of a
+collaborator's reach.
 
 ## Language
 
@@ -158,9 +174,8 @@ uv run python scripts/compile_locale.py
 ```
 
 Server plugins (see "Server plugins" below) are expected to honor this same negotiated
-language — once a plugin actually gets invoked (no publish-renderer integration exists yet),
-its entry point will receive the request's resolved `lang`, and it should localize anything it
-renders accordingly rather than hardcoding a language.
+language: their entry point receives the request's resolved `lang`, and should localize
+anything it renders accordingly rather than hardcoding a language.
 
 ## What it does
 
@@ -168,15 +183,21 @@ renders accordingly rather than hardcoding a language.
 - `/ws` — the sync protocol: one persistent WebSocket connection per vault carries file delta,
   push/pull, and version history (list/download/restore), plus a live push whenever another
   device changes the vault. See "Sync protocol" below.
-- `/api/*` (HTTP, Pyramid) — publish (upload/list/remove/download), publish sharing (invite by
-  email, accept via invite code), version history REST mirrors, user accounts, device management,
-  and the admin dashboard.
-- `/publish/{username}/{vault}/...` — the actual published site, rendering markdown on the fly
-  (wikilinks resolved, YAML frontmatter stripped). A `publish.css` at the vault root is
-  auto-loaded on every page, same as real Obsidian Publish — see
+- `/api/*` (HTTP, Pyramid) — publish (upload/list/remove/download), vault sharing (invite/list/
+  remove/leave, see "Vault identity" above), version history REST mirrors, user accounts, device
+  management, and the admin dashboard.
+- `/publish/{username}/{vault}/...` — the actual published site: wikilinks are resolved and
+  YAML frontmatter stripped server-side either way, but the markdown-to-HTML rendering itself is
+  client-side (`static/publish_render.js`, matching real Obsidian Publish's own architecture)
+  *unless* the vault has enabled server plugins, in which case that one vault's pages stay
+  fully server-rendered instead (see "Server plugins" below). A `publish.css` at the vault root
+  is auto-loaded on every page, same as real Obsidian Publish — see
   [`docs/PUBLISH_CSS.md`](docs/PUBLISH_CSS.md) for the overridable variables/classes.
   `publish.js` works the same way but only activates once a custom domain is configured (see
   [`docs/PUBLISH_JS.md`](docs/PUBLISH_JS.md)).
+- `/publish/share/*` — Site collaboration: inviting/listing/removing collaborators on one
+  published site (invite by email, accept via invite code), and listing sites you've been
+  invited to collaborate on. Distinct from vault sharing above — see "Vault identity".
 - `/mcp` — an MCP (Model Context Protocol) server over Streamable HTTP, giving AI clients
   read/write access to a synced vault (see "MCP" below).
 
@@ -338,6 +359,12 @@ owner has entered for it, if the plugin optionally declares a `CONFIG_FIELDS` sc
 labeled form fields, not a raw JSON textarea, without pumice-server ever learning what they mean.
 Enabling and configuring both happen self-service, per vault (not per account), from the vault
 owner's **Publish** tab — the same way Obsidian itself scopes plugins per vault.
+
+Enabling any plugin on a vault also switches that vault's published pages back to fully
+server-side rendering (instead of the normal client-side rendering via
+`static/publish_render.js`) — a plugin transforms the already wikilink-resolved markdown before
+it reaches Python-Markdown, and giving plugins that server-side input shape matters more right
+now than having every vault render the same way.
 
 Each plugin's result is cached (survives restarts, warmed eagerly on upload, self-healing after a
 transient failure) so a page view never has to redo expensive work — see

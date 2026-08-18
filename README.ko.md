@@ -122,22 +122,38 @@ vault의 진짜 식별자는 `(owner_username, vault_id)` 쌍이지, `vault_id` 
 스코프됩니다. `get_history_by_id()`도 `owner_username`을 받기 때문에, 히스토리 행을 vault/계정
 경계를 넘어 ID만으로 가져올 수 없습니다.
 
+다른 계정이 내 vault에 접근할 수 있게 해주는 기능이 두 가지 있는데, 범위가 서로 다릅니다:
+
+- **Vault 공유** (`/api/vault/share/invite|list|remove|leave`, `/api/vault/shared-with-me`) —
+  소유자가 다른 계정을 초대해 하나의 vault에 대해 완전한 동기화 권한을 줍니다(소유자 본인의
+  옵시디언 클라이언트가 가진 것과 동일). 초대받은 계정은 클라이언트의 `sharedVaultOwner` 설정으로
+  자신의 로컬 vault를 그쪽으로 향하게 합니다.
+- **사이트 협업** (`/publish/share/invite|list|remove|accept|mine`) — 소유자가 다른 계정을
+  초대해 *퍼블리시된 사이트 하나*에 대한 게재/게재 취소 권한만 주고, 밑에 있는 vault 자체에
+  대한 동기화 권한은 전혀 주지 않습니다. 실제 옵시디언 퍼블리시 자체의 협업자 권한
+  (`obsidianmd/obsidian-help`의 "Collaborate on a Publish site.md" 문서로 확인)을 그대로
+  모델링했습니다: 협업자는 파일을 게재/게재 취소할 수 있지만 사이트 옵션/비밀번호를 건드리거나
+  다른 협업자를 관리할 수 없습니다.
+
 ## 권한 검사(Authorization)
 
 권한 검사는 뷰마다 임시방편으로 짜여진 `if`문이 아니라 실제 Pyramid ACL입니다. `DeviceTokenSecurityPolicy`
 (`web.py`)가 `extract_token()`으로 호출자의 신원을 확인하고, 모든 뷰는 `@view_config`에
-`permission='authenticated' | 'admin' | 'vault-access'`를 선언하며 Pyramid가 뷰 본문이 실행되기 전에
-이를 강제합니다 (거부되면 `forbidden_view`로 바로 넘어가며, 예전에 수동으로 나누던 401 대 403 구분을
-그대로 재현합니다: 신원 자체가 없으면 401, 신원은 있지만 여기 접근 권한이 없으면 403). 기본
-권한값은 `'authenticated'`입니다 — 새 라우트는 뷰가 명시적으로 `permission=NO_PERMISSION_REQUIRED`로
-빠지지 않는 한 기본적으로 비공개이며, 이는 예전 tween이 수동으로 관리하던 "공개 경로 목록" 방식과
-정반대입니다.
+`permission='authenticated' | 'admin' | 'vault-access' | 'publish-access'`를 선언하며 Pyramid가
+뷰 본문이 실행되기 전에 이를 강제합니다 (거부되면 `forbidden_view`로 바로 넘어가며, 예전에 수동으로
+나누던 401 대 403 구분을 그대로 재현합니다: 신원 자체가 없으면 401, 신원은 있지만 여기 접근 권한이
+없으면 403). 기본 권한값은 `'authenticated'`입니다 — 새 라우트는 뷰가 명시적으로
+`permission=NO_PERMISSION_REQUIRED`로 빠지지 않는 한 기본적으로 비공개이며, 이는 예전 tween이
+수동으로 관리하던 "공개 경로 목록" 방식과 정반대입니다.
 
 Vault 범위의 라우트(퍼블리시, 버전 히스토리, 관리자의 vault별 파일 조회)는 라우트의 `factory=`로
 `VaultContext`를 사용합니다: 해당 엔드포인트의 호출 관례에 따라(`matchdict`, 쿼리 파라미터, `obs-id`
-헤더, 또는 JSON 본문 중 어디서든) `vault_id`를 알아내고, `owner`는 호출자 본인의 신원으로
-설정합니다 -- 그래서 `permission='vault-access'`는 사실상 "로그인했는지" 정도만 확인하는 셈이고,
-`vault_id`/`owner`는 뷰가 쓰기 편하도록 `request.context`에 미리 정리되어 있습니다.
+헤더, 또는 JSON 본문 중 어디서든) `vault_id`를 알아냅니다. vault 본인 소유자에게는
+`'vault-access'`(전체 권한)와 `'publish-access'`를 모두 부여하고, 다른 사람의 vault에서 활동하는
+승인된 사이트 협업자에게는 `'publish-access'`만 부여합니다 — 이건
+`publish_list`/`publish_upload`/`publish_remove`/`publish_download`가 요구하는 전부이고, 그 외
+`VaultContext` 범위의 다른 모든 라우트는 여전히 `'vault-access'`를 요구하므로 협업자의 손이
+닿지 않습니다.
 
 ## 언어
 
@@ -159,10 +175,9 @@ Vault 범위의 라우트(퍼블리시, 버전 히스토리, 관리자의 vault�
 uv run python scripts/compile_locale.py
 ```
 
-서버 플러그인("서버 플러그인" 절 참고)도 이 협상된 언어를 그대로 따라야 합니다 — 아직 플러그인을
-실제로 호출하는 코드는 없지만(퍼블리시 렌더러 연동이 아직 없음), 나중에 플러그인의 entry point가
-호출될 때는 요청에서 결정된 `lang`을 함께 받게 될 것이고, 렌더링하는 내용이 있다면 언어를
-하드코딩하지 않고 이에 맞춰 현지화해야 합니다.
+서버 플러그인("서버 플러그인" 절 참고)도 이 협상된 언어를 그대로 따라야 합니다: 플러그인의
+entry point는 요청에서 결정된 `lang`을 받으며, 렌더링하는 내용이 있다면 언어를 하드코딩하지
+않고 이에 맞춰 현지화해야 합니다.
 
 ## 하는 일
 
@@ -170,14 +185,20 @@ uv run python scripts/compile_locale.py
 - `/ws` — 동기화 프로토콜: vault마다 유지되는 하나의 상시 연결 WebSocket이 파일 델타·업/다운로드·
   버전 히스토리(목록/다운로드/복구)를 모두 처리하고, 다른 기기가 vault를 바꾸면 즉시 push도
   보냅니다. 아래 "동기화 프로토콜" 참고.
-- `/api/*` (HTTP, Pyramid) — 퍼블리시(업로드/목록/삭제/다운로드), 퍼블리시 공유(이메일로 초대, 초대
-  코드로 수락), 버전 히스토리 REST 미러, 사용자 계정, 디바이스 관리, 관리자 대시보드.
-- `/publish/{username}/{vault}/...` — 실제로 퍼블리시된 사이트, 마크다운을 즉석에서 렌더링
-  (위키링크 해석, YAML 프런트매터 제거). 볼트 루트에 `publish.css`가 있으면 모든 페이지에
+- `/api/*` (HTTP, Pyramid) — 퍼블리시(업로드/목록/삭제/다운로드), Vault 공유(초대/목록/삭제/탈퇴,
+  위 "Vault 식별자" 참고), 버전 히스토리 REST 미러, 사용자 계정, 디바이스 관리, 관리자 대시보드.
+- `/publish/{username}/{vault}/...` — 실제로 퍼블리시된 사이트: 위키링크 해석과 YAML 프런트매터
+  제거는 어느 쪽이든 서버에서 하지만, 마크다운→HTML 렌더링 자체는 클라이언트 쪽에서
+  일어납니다(`static/publish_render.js`, 실제 옵시디언 퍼블리시와 동일한 방식) — *단*, 해당
+  vault에 서버 플러그인이 활성화돼 있으면 그 vault의 페이지만 완전 서버 렌더링을 그대로
+  유지합니다(아래 "서버 플러그인" 참고). 볼트 루트에 `publish.css`가 있으면 모든 페이지에
   자동으로 로드됩니다(실제 옵시디언 퍼블리시와 동일) — 재정의 가능한 변수/클래스는
   [`docs/PUBLISH_CSS.ko.md`](docs/PUBLISH_CSS.ko.md) 참고. `publish.js`도 방식은 같지만
   커스텀 도메인이 설정돼 있어야만 활성화됩니다([`docs/PUBLISH_JS.ko.md`](docs/PUBLISH_JS.ko.md)
   참고).
+- `/publish/share/*` — 사이트 협업: 퍼블리시된 사이트 하나에 대한 협업자 초대/목록/삭제
+  (이메일로 초대, 초대 코드로 수락), 그리고 내가 협업자로 초대받은 사이트 목록. 위 "Vault
+  공유"와는 다른 기능입니다 — "Vault 식별자" 참고.
 - `/mcp` — Streamable HTTP 기반 MCP(Model Context Protocol) 서버로, AI 클라이언트에게 동기화된
   vault에 대한 읽기/쓰기 접근을 제공합니다 (아래 "MCP" 참고).
 
@@ -336,6 +357,12 @@ vault 소유자가 입력해둔 vault별 설정을 담고 있습니다 — 실�
 텍스트박스가 아니며, pumice-server는 그 의미를 전혀 모른 채로 렌더링만 합니다. 활성화와 설정
 둘 다 셀프 서비스이고, 계정이 아니라 vault별로(vault 소유자의 **퍼블리시** 탭에서) 이뤄집니다 —
 옵시디언 자체가 플러그인을 vault마다 범위 정하는 것과 같은 방식입니다.
+
+vault에 플러그인을 하나라도 활성화하면 그 vault의 퍼블리시 페이지는 (평소의
+`static/publish_render.js` 기반 클라이언트 렌더링 대신) 완전 서버 사이드 렌더링으로 다시
+전환됩니다 — 플러그인은 이미 위키링크가 해석된 마크다운을 파이썬 마크다운에 전달되기 전에
+변환하는데, 지금은 모든 vault를 똑같은 방식으로 렌더링하는 것보다 플러그인에 이 서버 사이드
+입력 형태를 그대로 주는 게 더 중요하기 때문입니다.
 
 각 플러그인의 결과는 캐싱됩니다(재시작해도 유지, 업로드 시점에 미리 예열, 일시적 실패 후
 자가 치유) — 그래서 페이지 조회가 비싼 작업을 매번 반복하지 않습니다. 전체 계약, 이 캐싱
