@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-10-07
+
+### Fixed
+
+- Queries that compared boolean columns with `IS 0` / `IS 1` (`is_(False)`,
+  `is_(True)`) failed on CUBRID with a syntax error, which made every upload
+  that needed a content-hash lookup fail. They now use `== false()` /
+  `== true()`.
+
 ## [0.2.9] - 2026-08-15
 
 ### Added

@@ -10,7 +10,7 @@ from typing import Callable, Dict, Any, Optional
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Index, inspect,
     BigInteger, Integer, String, Boolean, Text,
-    select, insert, update, delete, func,
+    select, insert, update, delete, func, true, false,
 )
 from sqlalchemy.pool import StaticPool
 
@@ -818,7 +818,7 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                     self._file_metadata.c.owner_username == owner_username,
                     self._file_metadata.c.vault_id == vault_id,
                     self._file_metadata.c.content_hash == content_hash,
-                    self._file_metadata.c.is_deleted.is_(False),
+                    self._file_metadata.c.is_deleted == false(),
                 )
             ).fetchone()
             return self._row_to_meta(row) if row else None
@@ -1180,7 +1180,7 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 select(func.sum(self._file_metadata.c.size_bytes)).where(
                     self._file_metadata.c.owner_username == owner_username,
                     self._file_metadata.c.vault_id == vault_id,
-                    self._file_metadata.c.is_deleted.is_(False),
+                    self._file_metadata.c.is_deleted == false(),
                 )
             ).scalar()
             return int(total) if total is not None else 0
@@ -1190,7 +1190,7 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
             total = conn.execute(
                 select(func.sum(self._file_metadata.c.size_bytes)).where(
                     self._file_metadata.c.owner_username == owner_username,
-                    self._file_metadata.c.is_deleted.is_(False),
+                    self._file_metadata.c.is_deleted == false(),
                 )
             ).scalar()
             return int(total) if total is not None else 0
@@ -1221,7 +1221,7 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 select(self._file_metadata.c.path).where(
                     self._file_metadata.c.owner_username == owner_username,
                     self._file_metadata.c.vault_id == vault_id,
-                    self._file_metadata.c.is_deleted.is_(False),
+                    self._file_metadata.c.is_deleted == false(),
                 )
             ).fetchall()
             now_ms = int(time.time() * 1000)
@@ -1359,7 +1359,7 @@ class SqlAlchemyMetadataRepository(MetadataRepository):
                 select(self._vault_shares.c.email).where(
                     self._vault_shares.c.owner_username == owner_username,
                     self._vault_shares.c.vault_id == vault_id,
-                    self._vault_shares.c.accepted.is_(True),
+                    self._vault_shares.c.accepted == true(),
                 )
             ).fetchall()
             usernames = []
