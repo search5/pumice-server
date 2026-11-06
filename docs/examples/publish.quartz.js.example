@@ -1,0 +1,42 @@
+/* Quartz-renderer version of publish.js.example. Same vault-root convention, still only active once
+   the site has a custom domain configured. See docs/QUARTZ_MIGRATION.ko.md.
+
+   The big difference from the pumice renderer: Quartz is a single-page app. After the first load,
+   clicking an internal link swaps the page body WITHOUT re-running this script, so per-page work
+   must be (re)done on the `nav` event, and anything it adds to the page body disappears on the
+   next navigation unless it is added again. Page-level (outside <article>) elements persist. */
+
+console.log("[publish.js quartz example] loaded");
+
+// 1. Page-independent: runs once, survives SPA navigation.
+var badge = document.createElement("div");
+badge.textContent = "⚡ Custom publish.js active";
+badge.style.cssText =
+  "position:fixed;bottom:12px;right:12px;background:#0969da;color:#fff;" +
+  "padding:6px 12px;border-radius:6px;font:13px sans-serif;z-index:999;";
+document.body.appendChild(badge);
+
+// 2. Per-page: runs for the first page AND after every SPA navigation.
+function onEveryPage() {
+  var article = document.querySelector("article"); // also available as #pumice-note-root (compat shim)
+  if (!article || article.querySelector(".publish-js-note")) return;
+  var note = document.createElement("p");
+  note.className = "publish-js-note";
+  note.textContent = "This paragraph was appended by publish.js on slug: " + document.body.dataset.slug;
+  note.style.cssText = "margin-top:24px;padding:12px;border-left:3px solid #0969da;color:#57606a;";
+  article.appendChild(note);
+}
+onEveryPage(); // DOM is already parsed (the script is `defer`)
+document.addEventListener("nav", onEveryPage); // fired by Quartz after each SPA navigation
+
+// 3. Replacement for PumicePublishRenderer.buildGraph()/searchNotes(): the whole site index is a
+//    plain JSON file -- { slug: { slug, filePath, title, links[], tags[], content } }.
+//    `data-basepath` on <body> is the site's base path ("" on a custom domain's root).
+var base = document.body.dataset.basepath || "";
+fetch(base + "/static/contentIndex.json")
+  .then(function (r) { return r.json(); })
+  .then(function (index) {
+    var slug = document.body.dataset.slug;
+    var backlinks = Object.keys(index).filter(function (s) { return (index[s].links || []).indexOf(slug) !== -1; });
+    console.log("[publish.js quartz example] notes:", Object.keys(index).length, "backlinks of", slug + ":", backlinks);
+  });

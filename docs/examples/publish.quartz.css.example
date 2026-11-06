@@ -1,0 +1,46 @@
+/* Quartz-renderer version of publish.css.example ("warm editorial" look).
+   Same vault-root convention: drop a file named exactly publish.css at the vault root.
+   See docs/QUARTZ_MIGRATION.ko.md for the pumice -> Quartz selector/variable mapping.
+
+   publish.css is injected as the LAST stylesheet in <head>, and Quartz's own rules live inside
+   `@layer quartz-base`, so plain rules here win without !important. */
+
+/* 1. Theme variables. The seven pumice variables that have a Quartz counterpart
+      (--accent-blue, --wiki-link, --heading-color, ...) are mapped automatically, so the
+      original `:root { --accent-blue: ... }` block keeps working as-is. Quartz-native names
+      can also be used directly: */
+:root,
+:root[saved-theme="light"],
+:root[saved-theme="dark"] {
+  --secondary: #c2410c;   /* links, active items, graph's current node (was --accent-blue) */
+  --tertiary: #c2410c;    /* hover / wikilink accent (was --wiki-link) */
+  --dark: #7c2d12;        /* headings (was --heading-color) */
+}
+
+/* 2. Serif headings. (.site-title -> .page-title, .markdown-body hN -> article hN) */
+.page-title,
+article h1,
+article h2,
+article h3 {
+  font-family: Georgia, "Times New Roman", serif;
+}
+
+/* 3. Wider left sidebar. (.pumice-nav-sidebar { flex-basis } -> the page grid's first column) */
+@media (min-width: 801px) {
+  #quartz-body {
+    grid-template-columns: 360px auto 320px;
+  }
+}
+
+/* 4. Square-ish graph box with a heavier border. (.pumice-graph-mini -> .graph-outer) */
+.graph > .graph-outer {
+  border-radius: 2px;
+  border-width: 2px;
+}
+
+/* 5. Circular theme-toggle button. (.pumice-icon-button -> .darkmode) */
+.darkmode {
+  border-radius: 50%;
+}
+
+/* .vault-badge has no Quartz counterpart -- the page title already shows the site name. */
