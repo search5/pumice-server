@@ -7,7 +7,7 @@
 **기존 렌더러를 볼트별로 선택할 수 있는 Quartz 5 렌더러를 pumice-server에 추가했습니다.** 켜지 않은 볼트는 기존 코드 경로 그대로입니다.
 요청하신 운영 기능(사이트 비밀번호, 커스텀 도메인과 리다이렉트, permalink·alias·slug, 협업자 권한, `publish.css`/`publish.js`, 서버 플러그인)과
 `publish_options` 15개는 모두 Quartz 경로에서 동작하도록 옮겼습니다. 다만 **일부는 기존과 동작이 다르고(§4), 몇 가지는 확인하지 못했습니다(§6).**
-기존 테스트 710개를 포함해 **전체 774개가 통과**합니다.
+기존 테스트 710개를 포함해 **전체 778개가 통과**합니다.
 
 ## 2. 무엇을 했나
 
@@ -80,6 +80,7 @@
 - 비밀번호는 평문 저장이고 무차별 대입 방어(레이트리밋)가 없습니다.
 - 증분 빌드가 없어 노트 하나만 바꿔도 전체를 다시 빌드합니다(1,000개 약 25초).
 - `defaultTheme`가 `light`/`dark`일 때 방문자가 토글하지 않은 상태에서 OS 테마가 바뀌면 Quartz 스크립트가 테마를 덮어쓸 수 있습니다.
+- Quartz 빌드는 외부 `node` 프로세스로 실행됩니다(셸 없이 인자 리스트로 호출). 이 프로세스는 서버의 환경변수를 물려받지 않고 `PATH`, `LANG`, `TZ` 등 최소한만 받으며, `HOME`과 `TMPDIR`은 임시 작업 디렉터리입니다. 비밀값(`ADMIN_PASSWORD`, `DB_PASSWORD` 등)은 전달되지 않습니다. 다만 Quartz와 npm 플러그인이 서버와 같은 OS 사용자·같은 파일시스템에서 실행되므로 `/data`(DB 파일 포함)를 읽을 수는 있습니다(컨테이너 분리나 별도 빌드 워커가 필요하면 후속 과제).
 - 원시 HTML(`<script>` 등)이 같은 오리진에서 실행됩니다. 기존 렌더러에도 sanitize가 없어 동일 수준입니다.
 - Quartz 5는 신생 버전이라 설정·플러그인 표면이 바뀔 수 있습니다. 그래서 커밋 SHA로 고정했습니다.
 
@@ -92,9 +93,9 @@
 
 ## 8. 코드 위치와 테스트
 - `src/pumice_server/quartz_renderer.py`(순수 로직), `src/pumice_server/web.py`(훅, 서빙, `/api/renderer`), `Dockerfile`, `.env.example`
-- `tests/test_quartz_renderer.py` 64개. Quartz 체크아웃과 `node`가 없으면 그 의존 테스트는 건너뜁니다.
+- `tests/test_quartz_renderer.py` 68개. Quartz 체크아웃과 `node`가 없으면 그 의존 테스트는 건너뜁니다.
 
 ```bash
-PUMICE_QUARTZ_DIR=/path/to/quartz uv run --frozen pytest          # 전체 (774개)
+PUMICE_QUARTZ_DIR=/path/to/quartz uv run --frozen pytest          # 전체 (778개)
 uv run --frozen pytest tests/test_quartz_renderer.py              # Quartz 없이 (의존 테스트는 스킵)
 ```

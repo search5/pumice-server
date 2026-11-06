@@ -947,3 +947,63 @@ def test_switch_to_quartz_and_back_end_to_end_through_the_api(tmp_path):
     _, back = api({"renderer": "default"})
     assert back["renderer"] == "default"
     assert isinstance(render(repo, tmp_path, "alice", "vault1", "a.md"), dict)          # rolled back instantly
+
+
+# ─── the Quartz child process must not inherit the server's secrets ─────────────────────────────
+
+SECRET_ENV = {
+    "ADMIN_PASSWORD": "admin-pw-leak", "DB_PASSWORD": "db-pw-leak", "PLUGIN_CONFIG_ENCRYPTION_KEY": "key-leak",
+    "PUBLISH_PASSWORD_SECRET": "cookie-secret-leak", "AWS_SECRET_ACCESS_KEY": "aws-leak", "SOME_API_TOKEN": "token-leak",
+}
+
+
+def test_build_env_passes_only_the_allowlist_and_points_home_and_tmp_at_the_workspace(tmp_path, monkeypatch):
+    for k, v in SECRET_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("LANG", "ko_KR.UTF-8")
+    env = quartz_renderer.build_env(str(tmp_path))
+    assert set(env) <= {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "HOME", "TMPDIR"}
+    assert env["HOME"] == str(tmp_path) and env["TMPDIR"] == str(tmp_path) and env["LANG"] == "ko_KR.UTF-8"
+    assert not (set(SECRET_ENV) & set(env)) and not any(v in SECRET_ENV.values() for v in env.values())
+
+
+def test_build_env_always_has_a_path_even_when_the_server_has_none(tmp_path, monkeypatch):
+    monkeypatch.delenv("PATH", raising=False)
+    assert quartz_renderer.build_env(str(tmp_path))["PATH"]
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node is required")
+def test_a_real_node_process_started_with_build_env_cannot_see_the_servers_secrets(tmp_path, monkeypatch):
+    import subprocess
+    for k, v in SECRET_ENV.items():
+        monkeypatch.setenv(k, v)
+    probe = "console.log(JSON.stringify(Object.keys(process.env)))"
+    out = subprocess.run([shutil.which("node"), "-e", probe], capture_output=True, text=True, env=quartz_renderer.build_env(str(tmp_path)))
+    seen = set(json.loads(out.stdout))
+    assert not (seen & set(SECRET_ENV)), seen                     # the secrets exist in the server process but not here
+    leaky = subprocess.run([shutil.which("node"), "-e", probe], capture_output=True, text=True)  # control: inheriting WOULD leak
+    assert set(SECRET_ENV) <= set(json.loads(leaky.stdout))
+
+
+def test_build_site_hands_the_restricted_env_to_the_subprocess(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(cmd=cmd, **kwargs)
+        raise RuntimeError("stop before touching Quartz")
+
+    for k, v in SECRET_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(quartz_renderer.subprocess, "run", fake_run)
+    template = tmp_path / "tpl"
+    template.mkdir()
+    (template / "quartz.config.default.yaml").write_text("configuration: {}\nplugins: []\n")
+    os.symlink(tmp_path, template / "node_modules")
+    pub = tmp_path / "pub"
+    pub.mkdir()
+    (pub / "a.md").write_text("# a")
+    with pytest.raises(RuntimeError, match="stop before"):
+        quartz_renderer.build_site(str(pub), str(tmp_path / "out"), template_dir=str(template), base_url="x", page_title="t")
+    assert isinstance(captured["cmd"], list) and "shell" not in captured          # argv list, never a shell string
+    assert not (set(SECRET_ENV) & set(captured["env"]))
+    assert captured["env"]["HOME"] == captured["cwd"].rsplit("/q", 1)[0]          # HOME is the throwaway workspace

@@ -196,6 +196,22 @@ def synthetic_index_markdown(title: str, md_paths: list) -> str:
     return f'---\ntitle: "{safe_title}"\nunlisted: true\n---\n{items}\n'
 
 
+# The only environment variables the Quartz child process gets. Quartz and its npm plugins are
+# third-party code, so the server's own environment -- ADMIN_PASSWORD, DB_*, PLUGIN_CONFIG_ENCRYPTION_KEY,
+# PUBLISH_PASSWORD_SECRET, ... -- is deliberately NOT inherited.
+_CHILD_ENV_PASSTHROUGH = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+
+
+def build_env(workspace: str) -> dict:
+    """Minimal environment for the `node` build process. HOME and TMPDIR point into the throwaway
+    workspace, so nothing the build writes outside it survives and nothing is read from the server user's home."""
+    env = {k: os.environ[k] for k in _CHILD_ENV_PASSTHROUGH if k in os.environ}
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    env["HOME"] = workspace
+    env["TMPDIR"] = workspace
+    return env
+
+
 _PRECONNECT_RE = re.compile(r'<link\s+rel="preconnect"\s+href="https://[^"]*"[^>]*/?>')
 
 
@@ -265,7 +281,7 @@ def build_site(
 
         proc = subprocess.run(
             [node, "quartz/bootstrap-cli.mjs", "build", "-d", "content", "-o", "out"],
-            cwd=q, capture_output=True, text=True, timeout=timeout,
+            cwd=q, capture_output=True, text=True, timeout=timeout, env=build_env(workspace),
         )
         if proc.returncode != 0:
             raise QuartzBuildError(f"quartz build failed ({proc.returncode}): {(proc.stderr or proc.stdout)[-2000:]}")
