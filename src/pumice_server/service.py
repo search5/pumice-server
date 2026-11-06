@@ -5,11 +5,14 @@ import time
 import hashlib
 import logging
 import secrets
+import threading
+from contextlib import nullcontext
 from typing import Dict, Optional
 from urllib.parse import unquote
 
 from . import wire_types
 from .change_notifier import diff_changed_files
+from .config_merge import is_server_merged_path, merge_config_bytes
 from .history_policy import is_history_excluded_path
 from .repository import MetadataRepository
 from .status_codes import StatusCode
@@ -34,6 +37,7 @@ def _backup_file(src_path: str, dst_path: str) -> None:
     except OSError:
         shutil.copy2(src_path, dst_path)
 
+MERGE_BASE_RETENTION_SECONDS = 180 * 24 * 3600  # see _save_merge_base
 DEFAULT_MAX_FILE_SIZE_BYTES = 2 * 1024 ** 3  # 2 GiB -- see max_file_size_bytes below
 
 
@@ -401,21 +405,120 @@ class SyncServiceServicer:
             conflicts=[]
         )
 
+    # ── server-side merge of bookmarks.json / community-plugins.json ─────────────────────────────
+    # A push for one of these files that names the version it was based on (`base_hash`) is merged
+    # against whatever the server holds now instead of overwriting it -- see config_merge.py.
+
+    _merge_locks: Dict[tuple, threading.Lock] = {}
+    _merge_locks_guard = threading.Lock()
+
+    @classmethod
+    def _merge_lock(cls, owner_username: str, vault_id: str, rel_path: str) -> threading.Lock:
+        with cls._merge_locks_guard:
+            return cls._merge_locks.setdefault((owner_username, vault_id, rel_path), threading.Lock())
+
+    def _merge_base_dir(self, owner_username: str, vault_id: str, rel_path: str) -> str:
+        key = hashlib.sha256(rel_path.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(self.data_dir, "merge_bases", owner_username, vault_id, key)
+
+    def _save_merge_base(self, owner_username: str, vault_id: str, rel_path: str,
+                         data: bytes, content_hash: str) -> None:
+        """Keeps a copy of every version written for a merged path, keyed by content hash, because
+        bookmarks.json is excluded from history (history_policy) yet a 3-way merge needs the exact
+        version a device last synced. Small files; the newest 50 versions are always kept, and older
+        ones only after MERGE_BASE_RETENTION_SECONDS -- a device that was offline for a weekend (or
+        a month) must still find its base, otherwise its deletions would be read as "never had it"
+        and come back."""
+        try:
+            base_dir = self._merge_base_dir(owner_username, vault_id, rel_path)
+            os.makedirs(base_dir, exist_ok=True)
+            target = os.path.join(base_dir, content_hash)
+            if not os.path.exists(target):
+                with open(target, "wb") as f:
+                    f.write(data)
+            versions = sorted((os.path.join(base_dir, n) for n in os.listdir(base_dir)), key=os.path.getmtime)
+            cutoff = time.time() - MERGE_BASE_RETENTION_SECONDS
+            for old in versions[:-50]:
+                if os.path.getmtime(old) < cutoff:
+                    os.remove(old)
+        except Exception as e:
+            logger.error(f"Failed to save merge base for {rel_path}: {e}")
+
+    def _load_merge_base(self, owner_username: str, vault_id: str, rel_path: str,
+                         base_hash: str) -> Optional[bytes]:
+        if not base_hash or base_hash == "0" or "/" in base_hash or ".." in base_hash:
+            return None
+        try:
+            with open(os.path.join(self._merge_base_dir(owner_username, vault_id, rel_path), base_hash), "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def _merge_with_server_version(self, owner_username: str, vault_id: str, rel_path: str, data: bytes,
+                                   calculated_hash: str, modified_at_ms: int, base_hash: str):
+        """Returns (data, hash, modified_at_ms) to actually store. Unchanged when the push is a
+        fast-forward (server still has the base), already identical, or can't be merged."""
+        old_meta = self.repository.load_one(owner_username, vault_id, rel_path)
+        if not old_meta or old_meta.get("is_deleted") or not old_meta.get("content_hash"):
+            return data, calculated_hash, modified_at_ms
+        try:
+            with open(os.path.join(self._get_vault_path(owner_username, vault_id), rel_path), "rb") as f:
+                theirs = f.read()
+        except OSError:
+            return data, calculated_hash, modified_at_ms
+        # The version the server holds right now may predate merge-base recording (written before
+        # this feature existed). Keep it before it is replaced, so devices that last synced it still
+        # have a base later -- including on the fast-forward path below.
+        self._save_merge_base(owner_username, vault_id, rel_path, theirs, old_meta["content_hash"])
+        if old_meta["content_hash"] in (base_hash, calculated_hash):
+            return data, calculated_hash, modified_at_ms
+        base = self._load_merge_base(owner_username, vault_id, rel_path, base_hash)
+        if base is None and base_hash != "0":
+            logger.warning(
+                f"Merge base {base_hash[:12]} for {rel_path} is gone; merging without deletion semantics"
+            )
+        merged = merge_config_bytes(base, data, theirs)
+        if merged is None or merged == data:
+            return data, calculated_hash, modified_at_ms
+        # The uploading device records what it sent (not the merge) as its synced version until it
+        # downloads the merge, so that exact upload must stay resolvable as a base too -- otherwise a
+        # further edit made before that download would be merged without deletion semantics.
+        self._save_merge_base(owner_username, vault_id, rel_path, data, calculated_hash)
+        # Newer than both inputs, so the uploading device (whose copy is now behind) and every
+        # other device pick the merged result up through the ordinary "server is newer" download.
+        return merged, hashlib.sha256(merged).hexdigest(), max(modified_at_ms, old_meta["modified_at_ms"]) + 1
+
     def finalize_pushed_file(self, owner_username: str, vault_id: str, rel_path: str, data: bytes,
                               declared_size: int, modified_at_ms: int, declared_hash: str,
-                              device_name: str, user_name: str):
+                              device_name: str, user_name: str, base_hash: str = ""):
         """PR6 of #14_옵시디언싱크_정렬_구현계획.md: finalizes one push_req's binary frame (the
         dedup-miss case -- see finalize_deduped_file for the hit case). Per-file, not batched --
         looks up just this one path via repository.load_one() rather than a pre-loaded
         whole-vault cache, since there's no longer a batch boundary to amortize that load
         against (the old UploadFiles/_finalize_uploaded_file batch flow this replaced is gone --
-        see llm-wiki/'s PR6 writeup)."""
+        see llm-wiki/'s PR6 writeup).
+
+        `base_hash` (optional, only sent for bookmarks.json / community-plugins.json): the content
+        hash the uploading device last synced ("0" = none). When the server's current version
+        differs from it, the two are merged instead of the older one being overwritten."""
         calculated_hash = hashlib.sha256(data).hexdigest()
         if declared_hash and calculated_hash != declared_hash:
             return False, "Header/eof content hash mismatch"
         if len(data) != declared_size:
             return False, f"Size mismatch: declared {declared_size}, got {len(data)}"
 
+        merging = bool(base_hash) and is_server_merged_path(rel_path)
+        with (self._merge_lock(owner_username, vault_id, rel_path) if merging else nullcontext()):
+            if merging:
+                data, calculated_hash, modified_at_ms = self._merge_with_server_version(
+                    owner_username, vault_id, rel_path, data, calculated_hash, modified_at_ms, base_hash,
+                )
+            return self._write_pushed_file(
+                owner_username, vault_id, rel_path, data, modified_at_ms, calculated_hash, device_name, user_name,
+            )
+
+    def _write_pushed_file(self, owner_username: str, vault_id: str, rel_path: str, data: bytes,
+                           modified_at_ms: int, calculated_hash: str, device_name: str, user_name: str):
         vault_path = self._get_vault_path(owner_username, vault_id)
         current_file_path = os.path.join(vault_path, rel_path)
         temp_path = current_file_path + f".tmp-{secrets.token_hex(4)}"
@@ -441,6 +544,8 @@ class SyncServiceServicer:
             os.rename(temp_path, current_file_path)
             mtime_sec = modified_at_ms / 1000.0
             os.utime(current_file_path, (mtime_sec, mtime_sec))
+            if is_server_merged_path(rel_path):
+                self._save_merge_base(owner_username, vault_id, rel_path, data, calculated_hash)
 
             meta = {
                 "path": rel_path,
@@ -499,6 +604,9 @@ class SyncServiceServicer:
         _backup_file(source_path, dest_path)
         mtime_sec = modified_at_ms / 1000.0
         os.utime(dest_path, (mtime_sec, mtime_sec))
+        if is_server_merged_path(rel_path):
+            with open(dest_path, "rb") as f:
+                self._save_merge_base(owner_username, vault_id, rel_path, f.read(), source_meta["content_hash"])
 
         meta = {
             "path": rel_path,

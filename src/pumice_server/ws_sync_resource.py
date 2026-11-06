@@ -392,6 +392,8 @@ class SyncWsSession:
         content_hash = payload.get("contentHash", "")
         size_bytes = payload.get("sizeBytes", 0)
         modified_at_ms = payload.get("modifiedAtMs", 0)
+        # Only bookmarks.json / community-plugins.json pushes carry this (see config_merge.py).
+        base_hash = payload.get("baseHash", "")
         try:
             # perFileMax (see #11_websocket_동기화_프로토콜_설계.md's re-analysis), advertised in
             # init_ok -- rejected before any dedup lookup or disk work, same as the now-removed
@@ -400,7 +402,9 @@ class SyncWsSession:
             if size_bytes > self.servicer.max_file_size_bytes:
                 self._send({"op": "push_ack", "payload": {"ok": False, "needData": False, "error": "File too large"}})
                 return
-            dedup_source = await asyncio.to_thread(
+            # A push that must be merged server-side never takes the dedup shortcut: the bytes
+            # that actually get stored may differ from the declared hash.
+            dedup_source = None if base_hash else await asyncio.to_thread(
                 self.repository.find_live_file_by_content_hash, self.owner_username, vault_id, content_hash
             )
             if dedup_source is not None and dedup_source["path"] != rel_path:
@@ -415,7 +419,7 @@ class SyncWsSession:
                 data = await self._push_data_future
                 ok, err = await asyncio.to_thread(
                     self.servicer.finalize_pushed_file, self.owner_username, vault_id, rel_path,
-                    data, size_bytes, modified_at_ms, content_hash, self.device_name, self.user_name,
+                    data, size_bytes, modified_at_ms, content_hash, self.device_name, self.user_name, base_hash,
                 )
                 self._send({"op": "push_ack", "payload": {"ok": ok, "needData": True, "error": err}})
         except Exception as e:

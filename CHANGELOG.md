@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-11-06
+
+### Changed
+
+- `bookmarks.json` and `community-plugins.json` are now merged on the server
+  (3-way, using the `baseHash` the client sends with `push_req`) instead of the
+  later upload overwriting the earlier one. The merged version is broadcast to
+  every connected device, including the uploader. Deletions are preserved
+  (merge bases are kept for 180 days); a device without a known base merges as
+  a union. Clients that do not send `baseHash` keep the old overwrite behavior.
+
 ## [0.2.10] - 2026-10-07
 
 ### Fixed
