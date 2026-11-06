@@ -555,8 +555,9 @@ class RecordingScheduler:
     def __init__(self):
         self.calls = []
 
-    def notify(self, key, payload=None):
+    def notify(self, key, payload=None, **kw):
         self.calls.append(key)
+        self.last_kw = kw
 
 
 def _upload_as(repo, tmp_path, scheduler, *, owner, vault_id, identity):
@@ -741,3 +742,208 @@ def test_publish_css_adapter_only_touches_mapped_variables():
     assert "--accent-blue:#111;--secondary:#111" in out
     assert "--code-bg:#222" in out and "--code-bg:#222;--" not in out  # unmapped variable untouched
     assert ".pumice-x{color:red}" in out  # structural selectors are passed through unchanged (they just match nothing)
+
+
+# ─── production wiring: status, recovery, renderer switch API, fallback, limits ─────────────────
+
+from test_publish_views import render  # noqa: E402
+
+
+def _quartz_vault(tmp_path, owner="alice", vault="v", *, built=False, state=None, renderer="quartz"):
+    quartz_renderer.set_vault_renderer(str(tmp_path), owner, vault, renderer)
+    if built:
+        out = Path(quartz_renderer.site_out_dir(str(tmp_path), owner, vault)) / "static"
+        out.mkdir(parents=True)
+        (out / "contentIndex.json").write_text("{}")
+    if state:
+        quartz_renderer.write_status(str(tmp_path), owner, vault, state)
+
+
+def test_status_roundtrip_and_default(tmp_path):
+    assert quartz_renderer.read_status(str(tmp_path), "alice", "v") == {"state": None}
+    quartz_renderer.write_status(str(tmp_path), "alice", "v", "failed", error="boom")
+    got = quartz_renderer.read_status(str(tmp_path), "alice", "v")
+    assert got["state"] == "failed" and got["error"] == "boom" and got["updated_at"] > 0
+
+
+def test_recover_candidates_picks_only_vaults_that_need_a_build(tmp_path):
+    _quartz_vault(tmp_path, vault="never-built")                              # no site yet
+    _quartz_vault(tmp_path, vault="fine", built=True, state="ok")             # nothing to do
+    _quartz_vault(tmp_path, vault="failed-before", built=True, state="failed")  # old site still serves; not retried blindly
+    _quartz_vault(tmp_path, vault="interrupted", built=True, state="building")  # process died mid-build
+    _quartz_vault(tmp_path, vault="queued", built=True, state="pending")
+    _quartz_vault(tmp_path, vault="legacy", renderer=None)                    # not a Quartz vault
+    got = quartz_renderer.recover_candidates(str(tmp_path))
+    assert sorted(v for _, v in got) == ["interrupted", "never-built", "queued"]
+
+
+def test_recover_quartz_sites_queues_immediately_and_marks_pending(tmp_path, monkeypatch):
+    _quartz_vault(tmp_path, vault="a")
+    _quartz_vault(tmp_path, vault="b", built=True, state="ok")
+    monkeypatch.setattr(web, "_quartz_available", lambda s: True)
+    sched = RecordingScheduler()
+    settings = {"data_dir": str(tmp_path), "repository": object(), "_quartz_scheduler": sched}
+    assert web.recover_quartz_sites(settings) == [("alice", "a")]
+    assert sched.calls == [("alice", "a")] and sched.last_kw == {"immediate": True}
+    assert quartz_renderer.read_status(str(tmp_path), "alice", "a")["state"] == "pending"
+
+
+def test_recover_does_nothing_when_quartz_is_not_installed(tmp_path, monkeypatch):
+    _quartz_vault(tmp_path, vault="a")
+    monkeypatch.setattr(web, "_quartz_available", lambda s: False)
+    sched = RecordingScheduler()
+    assert web.recover_quartz_sites({"data_dir": str(tmp_path), "repository": object(), "_quartz_scheduler": sched}) == []
+    assert sched.calls == []
+
+
+def test_quartz_setting_precedence(monkeypatch):
+    monkeypatch.setenv("X_ENV", "from-env")
+    assert web._quartz_setting({"k": "from-settings"}, "k", "X_ENV", "d") == "from-settings"
+    assert web._quartz_setting({}, "k", "X_ENV", "d") == "from-env"
+    assert web._quartz_setting({"k": ""}, "k", "X_ENV", "d") == "from-env"
+    monkeypatch.delenv("X_ENV")
+    assert web._quartz_setting({}, "k", "X_ENV", "d") == "d"
+
+
+def _renderer_call(repo, tmp_path, sched, method="GET", body=None, available=True, monkeypatch=None):
+    if monkeypatch:
+        monkeypatch.setattr(web, "_quartz_available", lambda s: available)
+    req = FakeRequest(repo, tmp_path, owner="alice", vault_id="vault1", json_body=body or {}, method=method)
+    req.registry.settings["_quartz_scheduler"] = sched
+    return web.publish_renderer_view(req)
+
+
+def test_renderer_api_reports_the_default_state(tmp_path, monkeypatch):
+    repo = SqlAlchemyMetadataRepository("sqlite:///:memory:")
+    repo.init_db()
+    got = _renderer_call(repo, tmp_path, RecordingScheduler(), monkeypatch=monkeypatch, available=True)
+    assert got == {"renderer": "default", "quartz_available": True, "site_ready": False, "build": {"state": None}}
+
+
+def test_renderer_api_rejects_bad_input_and_an_unavailable_quartz(tmp_path, monkeypatch):
+    repo = SqlAlchemyMetadataRepository("sqlite:///:memory:")
+    repo.init_db()
+    assert _renderer_call(repo, tmp_path, RecordingScheduler(), "POST", {"renderer": "nope"}, monkeypatch=monkeypatch).status_code == 400
+    sched = RecordingScheduler()
+    resp = _renderer_call(repo, tmp_path, sched, "POST", {"renderer": "quartz"}, available=False, monkeypatch=monkeypatch)
+    assert resp.status_code == 409 and sched.calls == []
+    assert not quartz_renderer.vault_uses_quartz(str(tmp_path), "alice", "vault1")  # nothing was switched
+
+
+def test_renderer_api_switches_to_quartz_queues_a_build_and_switches_back(tmp_path, monkeypatch):
+    repo = SqlAlchemyMetadataRepository("sqlite:///:memory:")
+    repo.init_db()
+    sched = RecordingScheduler()
+    got = _renderer_call(repo, tmp_path, sched, "POST", {"renderer": "quartz"}, monkeypatch=monkeypatch)
+    assert got["renderer"] == "quartz" and got["build"]["state"] == "pending" and got["site_ready"] is False
+    assert sched.calls == [("alice", "vault1")] and sched.last_kw == {"immediate": True}
+    back = _renderer_call(repo, tmp_path, sched, "POST", {"renderer": "default"}, monkeypatch=monkeypatch)
+    assert back["renderer"] == "default" and len(sched.calls) == 1  # switching back never builds
+
+
+def test_default_renderer_keeps_serving_until_the_first_quartz_build_exists(tmp_path):
+    repo = SqlAlchemyMetadataRepository("sqlite:///:memory:")
+    repo.init_db()
+    upload(repo, tmp_path, "alice", "vault1", "a.md", b"# A body")
+    quartz_renderer.set_vault_renderer(str(tmp_path), "alice", "vault1", "quartz")  # switched, nothing built yet
+    result = render(repo, tmp_path, "alice", "vault1", "a.md")
+    assert isinstance(result, dict) and "A body" in result["content"]  # legacy page, no downtime
+
+
+def test_a_protected_vault_is_never_served_unprotected_while_quartz_is_not_built(tmp_path):
+    repo = SqlAlchemyMetadataRepository("sqlite:///:memory:")
+    repo.init_db()
+    upload(repo, tmp_path, "alice", "vault1", "a.md", b"# secret body")
+    quartz_renderer.set_vault_renderer(str(tmp_path), "alice", "vault1", "quartz")
+    web.save_publish_meta(str(tmp_path), "alice", "vault1", "passwords.json", [{"name": "t", "pw": "pw"}])
+    req = QReq(repo, tmp_path, matchdict={"username": "alice", "vault_id": "vault1", "path": "a.md"})
+    req.registry.settings["publish_password_secret"] = "s"
+    resp = web.publish_view(req)
+    assert resp.status_code == 401 and b"secret body" not in resp.body       # login page, not the note
+    cookie = quartz_renderer.make_cookie("s", "alice", "vault1", [{"name": "t", "pw": "pw"}])
+    req2 = QReq(repo, tmp_path, matchdict={"username": "alice", "vault_id": "vault1", "path": "a.md"},
+                cookies={quartz_renderer.cookie_name("alice", "vault1"): cookie})
+    req2.registry.settings["publish_password_secret"] = "s"
+    assert web.publish_view(req2).status_code == 503                          # authenticated, but nothing built yet
+
+
+def test_failed_build_is_recorded_with_the_error_and_leaves_the_old_site(tmp_path):
+    repo = SqlAlchemyMetadataRepository("sqlite:///:memory:")
+    repo.init_db()
+    upload(repo, tmp_path, "alice", "v", "a.md", b"# A")
+    _quartz_vault(tmp_path, vault="v", built=True, state="ok")
+    settings = {"data_dir": str(tmp_path), "quartz_dir": str(tmp_path / "missing-checkout")}
+    with pytest.raises(Exception):
+        web._run_quartz_build_job(("alice", "v"), {"repository": repo, "settings": settings})
+    status = quartz_renderer.read_status(str(tmp_path), "alice", "v")
+    assert status["state"] == "failed" and status["error"] and status["finished_at"] >= status["started_at"]
+    assert (Path(quartz_renderer.site_out_dir(str(tmp_path), "alice", "v")) / "static" / "contentIndex.json").exists()
+
+
+def test_a_change_that_arrives_mid_build_keeps_the_vault_pending(tmp_path, monkeypatch):
+    def build_that_gets_a_newer_change(key, payload):
+        time.sleep(0.01)
+        quartz_renderer.write_status(str(tmp_path), "alice", "v", "pending", requested_at=int(time.time() * 1000) + 5)
+        return {"seconds": 1}
+
+    monkeypatch.setattr(web, "_build_quartz_site", build_that_gets_a_newer_change)
+    web._run_quartz_build_job(("alice", "v"), {"repository": None, "settings": {"data_dir": str(tmp_path)}})
+    assert quartz_renderer.read_status(str(tmp_path), "alice", "v")["state"] == "pending"  # not overwritten by "ok"
+
+
+def test_scheduler_never_exceeds_the_concurrent_build_limit():
+    lock, active, peak = threading.Lock(), [0], [0]
+
+    def build(key, payload):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.15)
+        with lock:
+            active[0] -= 1
+
+    sched = quartz_renderer.BuildScheduler(build, debounce_seconds=0.01, max_concurrent=2)
+    for i in range(6):
+        sched.notify((f"u{i}", "v"))
+    assert sched.wait_idle(15)
+    assert peak[0] == 2  # six vaults at once, never more than two builds running
+
+
+def test_scheduler_immediate_skips_the_debounce():
+    started = threading.Event()
+    sched = quartz_renderer.BuildScheduler(lambda k, p: started.set(), debounce_seconds=30)
+    sched.notify(("a", "v"), immediate=True)
+    assert started.wait(5)  # would take 30s with the debounce
+
+
+@needs_quartz
+def test_a_successful_real_build_records_ok_with_timing(site):
+    status = quartz_renderer.read_status(str(site.data_dir), "alice", "vault1")
+    assert status["state"] == "ok" and status["seconds"] > 0 and status["finished_at"] >= status["started_at"]
+
+
+@needs_quartz
+def test_switch_to_quartz_and_back_end_to_end_through_the_api(tmp_path):
+    repo = SqlAlchemyMetadataRepository("sqlite:///:memory:")
+    repo.init_db()
+    upload(repo, tmp_path, "alice", "vault1", "a.md", b"# A body")
+    settings = {"data_dir": str(tmp_path), "quartz_dir": QUARTZ_DIR}
+
+    def api(body=None, method="POST"):
+        req = FakeRequest(repo, tmp_path, owner="alice", vault_id="vault1", json_body=body or {}, method=method)
+        req.registry.settings.update(settings)
+        return req, web.publish_renderer_view(req)
+
+    req, got = api({"renderer": "quartz"})
+    assert got["renderer"] == "quartz" and got["build"]["state"] in ("pending", "building")
+    assert isinstance(render(repo, tmp_path, "alice", "vault1", "a.md"), dict)          # legacy serves during the build
+    assert req.registry.settings["_quartz_scheduler"].wait_idle(180)
+    ready = web.publish_renderer_view(FakeRequest(repo, tmp_path, owner="alice", vault_id="vault1", method="GET"))
+    assert ready["site_ready"] is True and ready["build"]["state"] == "ok"
+    page = web.publish_view(QReq(repo, tmp_path, matchdict={"username": "alice", "vault_id": "vault1", "path": "a"}))
+    assert not isinstance(page, dict) and page.status_code == 200 and b"quartz-root" in page.body  # now Quartz answers
+    page = web.publish_view(QReq(repo, tmp_path, matchdict={"username": "alice", "vault_id": "vault1", "path": "a.md"}))
+    assert page.status_code == 302 and page.location.endswith("/a")
+    _, back = api({"renderer": "default"})
+    assert back["renderer"] == "default"
+    assert isinstance(render(repo, tmp_path, "alice", "vault1", "a.md"), dict)          # rolled back instantly
