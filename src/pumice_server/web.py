@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import os
+import shutil
 import uuid
 import html as html_module
 from typing import Optional
@@ -19,6 +20,7 @@ from .plugin_loader import load_plugin_autofill_paths, load_plugin_config_fields
 from .plugin_config_crypto import PluginConfigEncryptionError, decrypt_json, encrypt_json
 from .plugin_resolve_disk_cache import make_disk_cache
 from .metadata_cache import extract_metadata_cache_entry
+from . import quartz_renderer
 from .plugin_autofill import read_vault_files, sanitize_autofill_suggestions
 from . import oauth_server
 
@@ -1002,6 +1004,9 @@ def publish_upload_view(request):
 
         _update_metadata_cache_entry(data_dir, username, vault_id, path, dest_file_path)
         _warm_plugin_resolve_cache(request, username, vault_id, dest_file_path, data_dir)
+        # `username` is the vault OWNER (request.context.owner), also when the caller is an
+        # accepted site collaborator -- the rebuild must target the owner's vault.
+        _schedule_quartz_rebuild(request, username, vault_id)
 
         return {"ok": True}
     except Exception as e:
@@ -1073,6 +1078,7 @@ def publish_remove_view(request):
         # content that no longer exists (see 22_aliases_리다이렉트_및_파비콘_자동감지.md).
         request.repository.set_published_file_aliases(request.context.owner, vault_id, path, [])
         _remove_metadata_cache_entry(data_dir, username, vault_id, path)
+        _schedule_quartz_rebuild(request, username, vault_id)
         logger.info(f"Published file removed: vault={vault_id}, path={path}")
 
         return {"ok": True}
@@ -1203,6 +1209,242 @@ def _search_note_bodies(cache: dict, query: str, limit: int = _SEARCH_RESULT_LIM
     ]
 
 
+def _quartz_setting(settings: dict, key: str, env: str, default=None):
+    """Quartz renderer configuration: an explicit settings entry wins, then the environment (which is
+    how a deployed server is configured -- create_pyramid_app only receives repository/data_dir)."""
+    value = settings.get(key)
+    if value not in (None, ""):
+        return value
+    return os.environ.get(env, default)
+
+def _quartz_site_built(data_dir: str, owner: str, vault_id: str) -> bool:
+    return os.path.isfile(os.path.join(quartz_renderer.site_out_dir(data_dir, owner, vault_id), "static", "contentIndex.json"))
+
+def _quartz_available(settings: dict) -> bool:
+    template_dir = _quartz_setting(settings, "quartz_dir", quartz_renderer.QUARTZ_DIR_ENV)
+    return bool(template_dir and os.path.isdir(template_dir) and shutil.which("node"))
+
+def _get_quartz_scheduler(settings: dict):
+    scheduler = settings.get("_quartz_scheduler")
+    if scheduler is None:
+        scheduler = quartz_renderer.BuildScheduler(
+            _run_quartz_build_job,
+            debounce_seconds=float(_quartz_setting(settings, "quartz_debounce_seconds", "PUMICE_QUARTZ_DEBOUNCE_SECONDS", 3.0)),
+            max_concurrent=int(_quartz_setting(settings, "quartz_max_concurrent_builds", "PUMICE_QUARTZ_MAX_CONCURRENT_BUILDS", 2)),
+        )
+        settings["_quartz_scheduler"] = scheduler
+    return scheduler
+
+def _queue_quartz_build(settings: dict, repository, owner: str, vault_id: str, *, immediate: bool = False) -> None:
+    """Records the vault as 'pending' on disk first, so a restart before the build finishes still
+    rebuilds it (see recover_quartz_sites), then hands it to the scheduler."""
+    data_dir = settings.get("data_dir")
+    quartz_renderer.write_status(data_dir, owner, vault_id, "pending", requested_at=int(time.time() * 1000))
+    _get_quartz_scheduler(settings).notify((owner, vault_id), {"repository": repository, "settings": settings}, immediate=immediate)
+
+def _schedule_quartz_rebuild(request, owner: str, vault_id: str) -> None:
+    """Never allowed to fail an upload/remove -- the publish itself already succeeded."""
+    try:
+        settings = request.registry.settings
+        if not quartz_renderer.vault_uses_quartz(settings.get("data_dir"), owner, vault_id):
+            return
+        _queue_quartz_build(settings, request.repository, owner, vault_id)
+    except Exception as e:
+        logger.error(f"Failed to schedule Quartz rebuild for vault '{vault_id}': {e}")
+
+def recover_quartz_sites(settings: dict) -> list:
+    """Called once at startup: rebuild every Quartz vault that has no built site yet or whose last
+    build was cut off by a restart. Returns the (owner, vault_id) pairs it queued."""
+    data_dir = settings.get("data_dir")
+    candidates = quartz_renderer.recover_candidates(data_dir)
+    if not candidates:
+        return []
+    if not _quartz_available(settings):
+        logger.error(
+            f"{len(candidates)} vault(s) use the Quartz renderer but it is not available "
+            f"(set {quartz_renderer.QUARTZ_DIR_ENV} to a Quartz checkout and install node) -- they will answer 503 until it is."
+        )
+        return []
+    for owner, vault_id in candidates:
+        _queue_quartz_build(settings, settings["repository"], owner, vault_id, immediate=True)
+    logger.info(f"Queued {len(candidates)} Quartz build(s) after startup: {candidates}")
+    return candidates
+
+def _run_quartz_build_job(key: tuple, payload: dict) -> None:
+    """Scheduler entry point: builds the vault and records the outcome (visible via GET /api/renderer)."""
+    owner, vault_id = key
+    data_dir = payload["settings"].get("data_dir")
+    started = int(time.time() * 1000)
+    quartz_renderer.write_status(data_dir, owner, vault_id, "building", started_at=started)
+    try:
+        result = _build_quartz_site(key, payload)
+    except Exception as e:
+        quartz_renderer.write_status(data_dir, owner, vault_id, "failed", started_at=started,
+                                     finished_at=int(time.time() * 1000), error=str(e)[-1500:])
+        raise
+    current = quartz_renderer.read_status(data_dir, owner, vault_id)
+    if current.get("state") == "pending" and current.get("requested_at", 0) > started:
+        return  # a newer change arrived mid-build: the scheduler re-runs, and a restart must still see "pending"
+    quartz_renderer.write_status(data_dir, owner, vault_id, "ok", started_at=started,
+                                 finished_at=int(time.time() * 1000), seconds=result.get("seconds", 0))
+
+def _build_quartz_site(key: tuple, payload: dict) -> dict:
+    from types import SimpleNamespace
+    owner, vault_id = key
+    repository, settings = payload["repository"], payload["settings"]
+    data_dir = settings.get("data_dir")
+    out_dir = quartz_renderer.site_out_dir(data_dir, owner, vault_id)
+    published_base = os.path.join(data_dir, "published", owner, vault_id)
+    if not os.path.isdir(published_base) or not any(files for _, _, files in os.walk(published_base)):
+        shutil.rmtree(out_dir, ignore_errors=True)  # everything unpublished -> take the site down
+        return {"seconds": 0}
+    template_dir = _quartz_setting(settings, "quartz_dir", quartz_renderer.QUARTZ_DIR_ENV)
+    if not template_dir:
+        raise RuntimeError(f"Quartz checkout not configured (settings 'quartz_dir' or env {quartz_renderer.QUARTZ_DIR_ENV})")
+    domain = repository.get_custom_domain(owner, vault_id)
+    public_host = _quartz_setting(settings, "public_host", "PUMICE_PUBLIC_HOST")
+    if not domain and not public_host:
+        logger.warning("PUMICE_PUBLIC_HOST is not set: canonical URLs, sitemap and RSS of Quartz sites will say 'localhost'")
+    base_url = domain["hostname"] if domain else f"{public_host or 'localhost'}/publish/{quote(owner, safe='')}/{quote(vault_id, safe='')}"
+
+    transform = None
+    enabled_plugin_ids = [p["plugin_id"] for p in repository.list_enabled_plugins(owner, vault_id)]
+    if enabled_plugin_ids:
+        plugin_configs = _load_decrypted_plugin_configs(SimpleNamespace(repository=repository), owner, vault_id, enabled_plugin_ids)
+        cache_get, cache_set = make_disk_cache(data_dir)
+        def transform(rel_path, body):
+            # Contract parity (docs/PLUGIN_DEVELOPMENT.md): a plugin is handed frontmatter-free
+            # markdown whose wikilinks are ALREADY resolved, exactly like the existing renderer.
+            # url_prefix="" keeps the resolved links relative so Quartz can still resolve them
+            # (graph/backlink edges survive). Only a note the plugin actually changed uses the
+            # resolved form; every other note keeps Quartz-native wikilink handling.
+            resolved = parse_wikilinks(body, "", None)
+            out = run_enabled_plugins(
+                resolved, enabled_plugin_ids, owner_username=owner, vault_id=vault_id, plugin_configs=plugin_configs,
+                cache_get=cache_get, cache_set=cache_set,
+            )
+            return body if out == resolved else out
+    result = quartz_renderer.build_site(
+        published_base, out_dir, template_dir=template_dir, base_url=base_url, page_title=vault_id, transform_md=transform,
+        site_options=_load_site_options(data_dir, owner, vault_id),
+        timeout=int(_quartz_setting(settings, "quartz_build_timeout", "PUMICE_QUARTZ_BUILD_TIMEOUT", 600)),
+    )
+    logger.info(f"Quartz build finished: vault={vault_id} owner={owner} in {result['seconds']}s")
+    return result
+
+def _serve_quartz_page(request, username: str, vault_id: str, path: str, url_prefix: str, is_custom_domain: bool):
+    from pyramid.httpexceptions import HTTPSeeOther
+    from urllib.parse import urlparse
+    import mimetypes
+
+    settings = request.registry.settings
+    data_dir = settings.get("data_dir")
+
+    # Site password gate. NOTE: the existing renderer never enforces passwords.json at all (the
+    # /api/password endpoint only stores/lists them) -- this gate is new behaviour, not parity.
+    passwords = load_publish_meta(data_dir, username, vault_id, "passwords.json", [])
+    if passwords:
+        secret = settings.get("publish_password_secret") or os.environ.get("PUBLISH_PASSWORD_SECRET")
+        if not secret:
+            return Response("Password protection is not configured", status=503, content_type="text/plain")
+        cname = quartz_renderer.cookie_name(username, vault_id)
+        if not quartz_renderer.cookie_valid(secret, username, vault_id, passwords, request.cookies.get(cname)):
+            if request.method == "POST":
+                if quartz_renderer.password_matches(passwords, request.params.get("password", "")):
+                    resp = HTTPSeeOther(location=f"{url_prefix}{quote(path.strip('/'), safe='/')}")
+                    resp.set_cookie(
+                        cname, quartz_renderer.make_cookie(secret, username, vault_id, passwords),
+                        max_age=quartz_renderer.COOKIE_TTL_SECONDS, path=urlparse(url_prefix).path or "/",
+                        httponly=True, samesite="Lax", secure=(request.scheme == "https"),
+                    )
+                    return resp
+                return Response(quartz_renderer.login_page_html(error=True), status=401, content_type="text/html", charset="utf-8")
+            return Response(quartz_renderer.login_page_html(error=False), status=401, content_type="text/html", charset="utf-8")
+
+    out_dir = quartz_renderer.site_out_dir(data_dir, username, vault_id)
+    if not os.path.isfile(os.path.join(out_dir, "static", "contentIndex.json")):
+        return Response("Site is being built", status=503, content_type="text/plain", headers={"Retry-After": "10"})
+
+    index = quartz_renderer.load_site_index(out_dir)
+    options = _load_site_options(data_dir, username, vault_id)
+    kind, value = quartz_renderer.resolve(
+        out_dir, index, path,
+        by_permalink=lambda p: (request.repository.get_published_file_by_permalink(username, vault_id, p) or {}).get("path"),
+        by_alias=lambda p: request.repository.get_published_file_by_alias(username, vault_id, p),
+        index_file=options["indexFile"] or None,
+    )
+    if kind == "redirect":
+        target = f"{url_prefix}{quote(value, safe='/')}"
+        if request.query_string:
+            target += f"?{request.query_string}"
+        return HTTPFound(location=target)
+    if kind == "forbidden":
+        return Response("Forbidden", status=403)
+
+    status = 200
+    if kind == "notfound":
+        value, status = os.path.join(out_dir, "404.html"), 404
+        if not os.path.isfile(value):
+            return Response(f"Page not found: {path}", status=404)
+
+    with open(value, "rb") as f:
+        body = f.read()
+    headers = {"X-Robots-Tag": "noindex"} if options["noindex"] else {}
+    if value.endswith(".html"):
+        css_href = quartz_renderer.root_asset_href(url_prefix, "publish.css") if os.path.isfile(os.path.join(out_dir, "publish.css")) else None
+        js_href = (
+            quartz_renderer.root_asset_href(url_prefix, "publish.js")
+            if is_custom_domain and os.path.isfile(os.path.join(out_dir, "publish.js")) else None
+        )
+        published_files = request.repository.get_published_files(username, vault_id)
+        published_paths = [f["path"] for f in published_files]
+
+        # Site options (see quartz_renderer's "per-request site options"). Defaults mirror the
+        # existing renderer's, not Quartz's.
+        extra = [
+            quartz_renderer.options_css(options, quartz_renderer.resolve_asset_href(index, options["logo"], url_prefix)),
+            quartz_renderer.theme_script(options["defaultTheme"]),
+        ]
+        if options["showNavigation"]:
+            order_keys, hidden_keys = quartz_renderer.navigation_keys(
+                index, published_paths, options["navigationOrdering"], options["navigationHiddenItems"],
+            )
+            extra.append(quartz_renderer.nav_script(order_keys, hidden_keys))
+        if is_custom_domain:  # like publish.js, analytics only runs on a custom domain
+            extra.append(quartz_renderer.ga_snippet(options["googleAnalytics"]))
+        if options["noindex"]:
+            extra.append('<meta name="robots" content="noindex">')
+        favicons = []
+        for icon in _build_favicon_links(published_files, url_prefix):
+            real = index.files_lower.get(unquote(icon["href"][len(url_prefix):]).lower())
+            if real:
+                favicons.append({**icon, "href": f"{url_prefix}{quote(real, safe='/')}"})
+        extra.append(quartz_renderer.favicon_links_html(favicons))
+
+        text = quartz_renderer.inject_head(
+            body.decode("utf-8"), css_href=css_href, js_href=js_href,
+            preload={"url_prefix": url_prefix, "path": path.strip("/")}, extra_head="".join(extra),
+        )
+        if status == 200:  # a note's own description/image front matter overrides Quartz's generated meta
+            rel = os.path.relpath(value, out_dir).replace(os.sep, "/")
+            slug = rel[: -len(".html")]
+            slug = slug[: -len("/index")] if slug.endswith("/index") else slug
+            own = next((f for f in published_files if f["path"] == index.slug_to_file.get(slug)), {})
+            if own.get("description"):
+                for key in ("description", "og:description", "twitter:description"):
+                    text = quartz_renderer.set_meta(text, key, own["description"])
+            image = quartz_renderer.resolve_asset_href(index, own.get("image"), url_prefix)
+            if image:
+                for key in ("og:image", "og:image:url", "twitter:image"):
+                    text = quartz_renderer.set_meta(text, key, image)
+        resp = Response(text.encode("utf-8"), status=status, content_type="text/html", charset="utf-8")
+        resp.headers.update(headers)  # (passing headers= to the constructor would override content_type)
+        return resp
+    content_type = mimetypes.guess_type(value)[0] or "application/octet-stream"
+    resp = Response(body, status=status, content_type=content_type)
+    resp.headers.update(headers)
+    return resp
+
 def _render_publish_page(request, username: str, vault_id: str, path: str, via_custom_domain_route: bool):
     lang = detect_lang(request)
     url_prefix, is_custom_domain, domain = _resolve_publish_url_prefix(request.repository, username, vault_id)
@@ -1222,6 +1464,15 @@ def _render_publish_page(request, username: str, vault_id: str, path: str, via_c
 
     data_dir = request.registry.settings.get("data_dir")
     published_base = os.path.abspath(os.path.join(data_dir, "published", username, vault_id))
+
+    # Per-vault opt-in Quartz renderer (see quartz_renderer.py / docs/QUARTZ_RENDERER.ko.md).
+    # Placed AFTER the custom-domain 301 above so that behaviour is inherited unchanged. Until the
+    # first Quartz build exists the default renderer below keeps serving (no downtime when a vault is
+    # switched) -- except a vault with site passwords, which must never be served unprotected.
+    if quartz_renderer.vault_uses_quartz(data_dir, username, vault_id):
+        has_passwords = bool(load_publish_meta(data_dir, username, vault_id, "passwords.json", []))
+        if _quartz_site_built(data_dir, username, vault_id) or has_passwords:
+            return _serve_quartz_page(request, username, vault_id, path, url_prefix, is_custom_domain)
 
     # Real Obsidian Publish's client-side renderer (see 27_실제_퍼블리시_사이트_아키텍처_조사.md/
     # 28_실제_아키텍처_전환_Phase1_노트본문.md, pumice repo) fetches a whole-vault metadata cache
@@ -1705,6 +1956,46 @@ def _build_navigation_tree(published_files: list, ordering: list, hidden: list, 
             entries.append({"type": "folder", "display": name, "children": children})
     return entries
 
+@view_config(route_name='publish_renderer', renderer='json', permission='vault-access')
+def publish_renderer_view(request):
+    """`GET /api/renderer` -> which renderer serves this vault's published site, plus the Quartz build
+    status. `POST /api/renderer {"renderer": "quartz" | "default"}` switches it (vault owner only,
+    same permission as the other site-settings endpoints). Switching to "quartz" queues a build
+    immediately (posting "quartz" again forces a rebuild). Until the first build succeeds the default
+    renderer keeps serving (no downtime), except for a vault that has site passwords, which answers
+    503 rather than being served unprotected. Switching back to "default" is instant; the built
+    output is kept so switching again is cheap. See docs/QUARTZ_RENDERER.ko.md."""
+    try:
+        owner = request.context.owner
+        vault_id = request.context.vault_id
+        settings = request.registry.settings
+        data_dir = settings.get("data_dir")
+        if request.method == "POST":
+            target = (request.json_body or {}).get("renderer")
+            if target not in ("quartz", "default"):
+                return Response(body=json.dumps({"error": "renderer must be 'quartz' or 'default'"}).encode("utf-8"),
+                                status=400, content_type="application/json")
+            if target == "quartz":
+                if not _quartz_available(settings):
+                    return Response(body=json.dumps({"error": "The Quartz renderer is not available on this server"}).encode("utf-8"),
+                                    status=409, content_type="application/json")
+                quartz_renderer.set_vault_renderer(data_dir, owner, vault_id, "quartz")
+                _queue_quartz_build(settings, request.repository, owner, vault_id, immediate=True)
+                logger.info(f"User '{owner}' switched vault '{vault_id}' to the Quartz renderer")
+            else:
+                quartz_renderer.set_vault_renderer(data_dir, owner, vault_id, None)
+                logger.info(f"User '{owner}' switched vault '{vault_id}' back to the default renderer")
+        uses_quartz = quartz_renderer.vault_uses_quartz(data_dir, owner, vault_id)
+        return {
+            "renderer": "quartz" if uses_quartz else "default",
+            "quartz_available": _quartz_available(settings),
+            "site_ready": _quartz_site_built(data_dir, owner, vault_id),
+            "build": quartz_renderer.read_status(data_dir, owner, vault_id),
+        }
+    except Exception as e:
+        logger.error(f"HTTP publish_renderer failed: {e}")
+        return Response(body=json.dumps({"error": str(e)}).encode("utf-8"), status=500, content_type="application/json")
+
 @view_config(route_name='publish_options', renderer='json', permission='vault-access')
 def publish_options_view(request):
     try:
@@ -1713,9 +2004,15 @@ def publish_options_view(request):
         data_dir = request.registry.settings.get("data_dir")
         incoming = request.json_body.get("options")
         if isinstance(incoming, dict):
+            before = _load_site_options(data_dir, owner, vault_id)
             current = load_publish_meta(data_dir, owner, vault_id, "options.json", {})
             current.update({k: v for k, v in incoming.items() if k in _SITE_OPTIONS_DEFAULTS})
             save_publish_meta(data_dir, owner, vault_id, "options.json", current)
+            # Only the few options that are baked in at build time need a rebuild; the rest are
+            # applied per request by the Quartz renderer.
+            after = _load_site_options(data_dir, owner, vault_id)
+            if any(before[k] != after[k] for k in quartz_renderer.BUILD_TIME_OPTION_KEYS):
+                _schedule_quartz_rebuild(request, owner, vault_id)
         return {"options": _load_site_options(data_dir, owner, vault_id)}
     except Exception as e:
         logger.error(f"HTTP publish_options failed: {e}")
@@ -2192,6 +2489,7 @@ def publish_plugin_enable_view(request):
 
         request.repository.enable_plugin(owner, vault_id, plugin_id, int(time.time() * 1000))
         logger.info(f"User '{owner}' enabled plugin '{plugin_id}' for vault '{vault_id}'")
+        _schedule_quartz_rebuild(request, owner, vault_id)
         return {"ok": True}
     except Exception as e:
         logger.error(f"Failed to enable plugin: {e}")
@@ -2209,6 +2507,7 @@ def publish_plugin_disable_view(request):
 
         request.repository.disable_plugin(owner, vault_id, plugin_id)
         logger.info(f"User '{owner}' disabled plugin '{plugin_id}' for vault '{vault_id}'")
+        _schedule_quartz_rebuild(request, owner, vault_id)
         return {"ok": True}
     except Exception as e:
         logger.error(f"Failed to disable plugin: {e}")
@@ -2254,6 +2553,7 @@ def publish_plugin_config_save_view(request):
         blob = encrypt_json(merged)
         request.repository.set_plugin_config_entry(owner, vault_id, plugin_id, entry_id, blob, int(time.time() * 1000))
         logger.info(f"User '{owner}' saved config entry '{entry_id}' for plugin '{plugin_id}' on vault '{vault_id}'")
+        _schedule_quartz_rebuild(request, owner, vault_id)
         return {"ok": True}
     except PluginConfigEncryptionError as e:
         return Response(status=500, body=json.dumps({"error": str(e)}).encode("utf-8"), content_type="application/json")
@@ -2274,6 +2574,7 @@ def publish_plugin_config_delete_view(request):
 
         request.repository.delete_plugin_config_entry(owner, vault_id, plugin_id, entry_id)
         logger.info(f"User '{owner}' deleted config entry '{entry_id}' for plugin '{plugin_id}' on vault '{vault_id}'")
+        _schedule_quartz_rebuild(request, owner, vault_id)
         return {"ok": True}
     except Exception as e:
         logger.error(f"Failed to delete plugin config entry: {e}")
@@ -2532,6 +2833,7 @@ def create_pyramid_app(repository, data_dir):
     config.add_route('publish_site', '/api/site')
     config.add_route('publish_customurl', '/api/customurl', factory=VaultContext)
     config.add_route('publish_options', '/api/options', factory=VaultContext)
+    config.add_route('publish_renderer', '/api/renderer', factory=VaultContext)
     config.add_route('publish_slug', '/api/slug', factory=VaultContext)
     config.add_route('publish_password', '/api/password', factory=VaultContext)
     config.add_route('publish_plugins', '/api/publish/plugins', factory=VaultContext)
@@ -2552,4 +2854,9 @@ def create_pyramid_app(repository, data_dir):
     config.scan(__name__)
     
     logger.info("Pyramid Web Application successfully created and configured.")
-    return config.make_wsgi_app()
+    app = config.make_wsgi_app()
+    try:
+        recover_quartz_sites(app.registry.settings)
+    except Exception:
+        logger.exception("Quartz startup recovery failed (sites are rebuilt on their next change instead)")
+    return app
