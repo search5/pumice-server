@@ -370,6 +370,18 @@ vault에 플러그인을 하나라도 활성화하면 그 vault의 퍼블리시 
 [`docs/PLUGIN_DEVELOPMENT.ko.md`](docs/PLUGIN_DEVELOPMENT.ko.md)를 참고하세요 — 플러그인을
 만들기 전에 꼭 읽어야 합니다. `pumice-plugin-immich`가 같이 읽기 좋은 완전한 실제 예시입니다.
 
+## Quartz 퍼블리시 렌더러 (선택, 볼트별)
+
+볼트의 발행 노트를 [Quartz 5](https://github.com/jackyzha0/quartz)로 정적 빌드해 같은 URL에서 서빙하는 두 번째 퍼블리시 렌더러입니다.
+옵트인하지 않은 볼트는 기존 렌더러를 그대로 씁니다. 위키링크, permalink·alias, 커스텀 도메인, 사이트 옵션, `publish.css`/`publish.js`,
+서버 플러그인을 옮겨 왔고, 몇 가지는 동작이 다릅니다(permalink는 제자리 렌더링 대신 이동, `.pumice-*` CSS 선택자 미적용, 플러그인은 빌드 때 실행).
+또 사이트 비밀번호를 실제로 검사합니다(기존 렌더러는 저장만 하고 검사하지 않음).
+
+Docker 이미지에는 Node와 커밋으로 고정한 Quartz가 들어 있습니다. `POST /api/renderer`(`{"renderer": "quartz" | "default"}`, 즉시 롤백 가능)로
+볼트를 전환하고 `GET /api/renderer`로 빌드 상태를 봅니다. `PUMICE_PUBLIC_HOST`(비밀번호가 있는 볼트는 `PUBLISH_PASSWORD_SECRET`도)를 설정하세요 —
+`.env.example` 참고. 자세한 내용은 [`docs/QUARTZ_RENDERER.ko.md`](docs/QUARTZ_RENDERER.ko.md),
+[`docs/QUARTZ_RENDERER_REPORT.ko.md`](docs/QUARTZ_RENDERER_REPORT.ko.md)를 보세요.
+
 ## 후원
 
 이 프로젝트를 후원하고 싶으시면 search5@gmail.com으로 연락해주세요. 후원해주시면 개발에 더 많은

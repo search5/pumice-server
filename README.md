@@ -373,6 +373,22 @@ behavior's implications for how you write `resolve()`, config, testing, and a ch
 required reading before building one. `pumice-plugin-immich` is a complete real-world example to
 read alongside it.
 
+## Quartz publish renderer (optional, per vault)
+
+A second publish renderer that builds a vault's published notes with [Quartz 5](https://github.com/jackyzha0/quartz)
+into a static site and serves it at the same URLs. Vaults that don't opt in keep using the built-in
+renderer unchanged. It carries over wikilinks, permalinks/aliases, custom domains, site options,
+`publish.css`/`publish.js` and server plugins -- with a few behavior differences (permalinks redirect
+instead of rendering in place, `.pumice-*` CSS selectors don't apply, plugins run at build time) and
+site passwords that are actually enforced (the built-in renderer stores them but never checks them).
+
+The Docker image bundles Node and a pinned Quartz. Switch a vault with `POST /api/renderer`
+(`{"renderer": "quartz" | "default"}`; instant rollback) and watch the build with `GET /api/renderer`.
+Set `PUMICE_PUBLIC_HOST` (and `PUBLISH_PASSWORD_SECRET` for password-protected vaults) -- see
+`.env.example`. Details, caveats and the verification report (in Korean):
+[`docs/QUARTZ_RENDERER.ko.md`](docs/QUARTZ_RENDERER.ko.md),
+[`docs/QUARTZ_RENDERER_REPORT.ko.md`](docs/QUARTZ_RENDERER_REPORT.ko.md).
+
 ## Support
 
 If you'd like to sponsor this project, reach out at search5@gmail.com. Sponsorships make a real

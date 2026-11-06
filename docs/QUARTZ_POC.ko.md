@@ -1,6 +1,6 @@
 # Quartz 렌더러 PoC 검토 문서
 
-작성일 2026-11-06 · 브랜치 `poc/quartz-renderer` (워크트리 `../pumice-server-quartz-poc`, 미커밋)
+작성일 2026-11-06 · 개념 증명(PoC) 검증 기록 · 최종 보고는 [QUARTZ_RENDERER_REPORT.ko.md](QUARTZ_RENDERER_REPORT.ko.md), 코드는 브랜치 `feature/quartz-renderer`
 
 ## 1. 요약
 
